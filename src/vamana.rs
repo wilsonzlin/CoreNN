@@ -9,24 +9,27 @@ use std::collections::VecDeque;
 use std::iter::zip;
 
 // More than 4B is unlikely to scale well on a single shard. Using u32 instead of u64 allows us to use fast RoaringBitmaps everywhere.
-type Id = u32;
-type Metric<P> = fn(&P, &P) -> f64;
+pub type Id = u32;
+pub type Metric<P> = fn(&P, &P) -> f64;
 
-struct PointDist {
-  id: Id,
-  dist: f64,
+pub struct PointDist {
+  pub id: Id,
+  pub dist: f64,
 }
 
 // A metric implementation of the Euclidean distance.
-fn metric_euclidean<const N: usize>(a: &[f64; N], b: &[f64; N]) -> f64 {
-  zip(a, b).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()
+pub fn metric_euclidean<const N: usize>(a: &[f32; N], b: &[f32; N]) -> f64 {
+  zip(a, b)
+    .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+    .sum::<f64>()
+    .sqrt()
 }
 
 // A metric implementation of the cosine similarity.
-fn metric_cosine<const N: usize>(a: &[f64; N], b: &[f64; N]) -> f64 {
-  let dot = zip(a, b).map(|(a, b)| a * b).sum::<f64>();
-  let norm_a = a.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
-  let norm_b = b.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
+pub fn metric_cosine<const N: usize>(a: &[f32; N], b: &[f32; N]) -> f64 {
+  let dot = zip(a, b).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>();
+  let norm_a = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+  let norm_b = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
   1.0 - dot / (norm_a * norm_b)
 }
 
@@ -142,6 +145,8 @@ fn greedy_search<P>(
       }
     };
   }
+  // We may have exceeded k due to pushing both a and b in the last match arm.
+  closest.truncate(k);
   (closest, all_visited)
 }
 
@@ -192,14 +197,14 @@ fn robust_prune<P>(
 #[derive(Clone)]
 pub struct VamanaParams {
   // The `R` parameter in the DiskANN paper, section 2.3: the initial number of randomly chosen out-neighbors for each point. The paper recommends at least log(N), where N is the number of points.
-  init_neighbors: usize,
+  pub init_neighbors: usize,
   // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
-  medoid_sample_size: usize,
-  beam_width: usize,
+  pub medoid_sample_size: usize,
+  pub beam_width: usize,
   // Corresponds to `α` in the DiskANN paper. Must be at least 1.
-  distance_threshold: f64,
+  pub distance_threshold: f64,
   // Corresponds to `R` in the DiskANN paper.
-  degree_bound: usize,
+  pub degree_bound: usize,
 }
 
 pub struct Vamana<P: Clone> {
@@ -256,8 +261,9 @@ impl<P: Clone> Vamana<P> {
     }
   }
 
-  pub fn index(&mut self) {
+  fn index_pass(&mut self, distance_threshold_override: Option<f64>) {
     let params = &self.params;
+    let dist_thresh = distance_threshold_override.unwrap_or(params.distance_threshold);
 
     // Iterate points in random order.
     let mut ids_rand = self.id_to_point.keys().copied().collect_vec();
@@ -278,7 +284,7 @@ impl<P: Clone> Vamana<P> {
         self.metric,
         id,
         visited,
-        params.distance_threshold,
+        dist_thresh,
         params.degree_bound,
       );
       // We will update the graph, so to satisfy Rust, we must clone now. (As a human, I can say that `j` should never equal `id` so this would be safe without cloning, but the compiler doesn't know.)
@@ -297,12 +303,18 @@ impl<P: Clone> Vamana<P> {
             self.metric,
             j,
             candidates,
-            params.distance_threshold,
+            dist_thresh,
             params.degree_bound,
           );
         }
       }
     }
+  }
+
+  pub fn index(&mut self) {
+    // The paper recommends two passes: one with a distance threshold of 1, and one with the user provided distance threshold.
+    self.index_pass(Some(1.0));
+    self.index_pass(None);
   }
 
   pub fn query(&self, query: &P, k: usize) -> Vec<PointDist> {
@@ -316,5 +328,88 @@ impl<P: Clone> Vamana<P> {
       self.params.beam_width,
     )
     .0
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::metric_euclidean;
+  use super::Vamana;
+  use super::VamanaParams;
+  use croaring::Bitmap;
+  use itertools::Itertools;
+  use ordered_float::OrderedFloat;
+  use rand::thread_rng;
+  use rand::Rng;
+
+  #[test]
+  fn test_vamana() {
+    let mut rng = thread_rng();
+    let metric = metric_euclidean;
+    let min = 0.0f32;
+    let max = 10.0f32;
+    let n = 200u32;
+    let r = 10;
+    let ids = (0..n).collect_vec();
+    let k = 10;
+    let beam_width = k * 2;
+    let points = (0..n)
+      .map(|_| [rng.gen_range(min..max), rng.gen_range(min..max)])
+      .collect_vec();
+
+    let mut vamana = Vamana::new(&ids, &points, metric, VamanaParams {
+      beam_width,
+      degree_bound: r,
+      distance_threshold: 1.1,
+      init_neighbors: r,
+      medoid_sample_size: 10_000,
+    });
+    vamana.index();
+
+    // First, test ANN of every point.
+    let mut correct = 0;
+    for a in ids.iter().cloned() {
+      let a_pt = &points[a as usize];
+      let truth = ids
+        .iter()
+        .cloned()
+        .filter(|&b| b != a)
+        .sorted_unstable_by_key(|&b| OrderedFloat(metric(a_pt, &points[b as usize])))
+        .take(k)
+        .collect::<Bitmap>();
+      let approx = vamana
+        .query(a_pt, k)
+        .into_iter()
+        .map(|pd| pd.id)
+        .collect::<Bitmap>();
+      correct += approx.and(&truth).cardinality();
+    }
+    println!(
+      "[Pairwise] Correct: {}/{} ({:.2}%)",
+      correct,
+      k * n as usize,
+      correct as f64 / (k * n as usize) as f64
+    );
+
+    // Second, test ANN of a query.
+    let query = [rng.gen_range(min..max), rng.gen_range(min..max)];
+    let truth = ids
+      .iter()
+      .cloned()
+      .sorted_unstable_by_key(|&id| OrderedFloat(metric(&query, &points[id as usize])))
+      .take(k)
+      .collect::<Bitmap>();
+    let approx = vamana
+      .query(&query, k)
+      .into_iter()
+      .map(|pd| pd.id)
+      .collect::<Bitmap>();
+    let correct = approx.and(&truth).cardinality();
+    println!(
+      "[Query] Correct: {}/{} ({:.2}%)",
+      correct,
+      k,
+      correct as f64 / k as f64
+    );
   }
 }
