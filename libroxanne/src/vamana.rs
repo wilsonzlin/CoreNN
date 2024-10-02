@@ -97,6 +97,7 @@ impl<P: Clone> Vamana<P> {
     // We need both to reach up to `k` as in the worst case all `k` are in exactly one of them.
     // We also need `all_visited` as `l_visited` truncates to `k`, but we also want all visited points in the end.
     // L = l_visited + l_unvisited
+    // TODO This is incorrect, as the stopping condition is when the combined L size equals `beam_width`, not just L\V. This means we may be doing way more traversals and stopping way later than necessary.
     let mut l_unvisited = BeamQueue::new(beam_width); // L \ V
     let mut l_visited = BeamQueue::new(beam_width); // V
     let mut all_visited = Bitmap::new();
