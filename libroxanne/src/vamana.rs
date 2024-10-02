@@ -13,14 +13,12 @@ use std::iter::zip;
 
 #[derive(Clone)]
 pub struct VamanaParams {
-  // The `R` parameter in the DiskANN paper, section 2.3: the initial number of randomly chosen out-neighbors for each point. The paper recommends at least log(N), where N is the number of points.
-  pub init_neighbors: usize,
   // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
   pub medoid_sample_size: usize,
   pub beam_width: usize,
   // Corresponds to `α` in the DiskANN paper. Must be at least 1.
   pub distance_threshold: f64,
-  // Corresponds to `R` in the DiskANN paper.
+  // Corresponds to `R` in the DiskANN paper. The paper recommends at least log(N), where N is the number of points.
   pub degree_bound: usize,
 }
 
@@ -43,12 +41,13 @@ impl<P: Clone> Vamana<P> {
       .map(|(id, p)| (*id, p.clone()))
       .collect::<AHashMap<_, _>>();
 
+    // Initialise to R-regular graph with random edges.
     let adj_list = ids
       .iter()
       .map(|&id| {
         let mut rng = thread_rng();
         let neighbors = ids
-          .choose_multiple(&mut rng, params.init_neighbors)
+          .choose_multiple(&mut rng, params.degree_bound)
           .copied()
           .collect();
         (id, neighbors)
@@ -241,7 +240,7 @@ mod tests {
   use std::fs::File;
 
   #[test]
-  fn test_vamana() {
+  fn test_vamana_2d() {
     let mut rng = thread_rng();
     let metric = metric_euclidean;
     // Let's plot points such that it fits comfortably spread across a widescreen display, useful for when we visualise this.
@@ -265,7 +264,6 @@ mod tests {
       beam_width,
       degree_bound: r,
       distance_threshold: 1.1,
-      init_neighbors: r,
       medoid_sample_size: 10_000,
     });
     vamana.index();
@@ -358,5 +356,89 @@ mod tests {
       },
     )
     .unwrap();
+  }
+
+  #[test]
+  fn test_vamana_512d() {
+    let mut rng = thread_rng();
+    let metric = metric_euclidean;
+    let range = -10.0f32..10.0f32;
+    const DIM: usize = 512;
+    let n = 1000u32;
+    let r = 12;
+    let ids = (0..n).collect_vec();
+    let k = 15;
+    let beam_width = k * 2;
+
+    macro_rules! gen_vec {
+      () => {{
+        let mut vec = [0.0f32; DIM];
+        for i in 0..DIM {
+          vec[i] = rng.gen_range(range.clone());
+        }
+        vec
+      }};
+    }
+
+    let points = (0..n).map(|_| gen_vec!()).collect_vec();
+    println!("Generated points");
+
+    let mut vamana = Vamana::new(&ids, &points, metric, VamanaParams {
+      beam_width,
+      degree_bound: r,
+      distance_threshold: 1.1,
+      medoid_sample_size: 1000,
+    });
+    println!("Initialised");
+    vamana.index();
+    println!("Indexed");
+
+    // First, test ANN of every point.
+    let mut correct = 0;
+    for a in ids.iter().cloned() {
+      let a_pt = &points[a as usize];
+      let truth = ids
+        .iter()
+        .cloned()
+        .filter(|&b| b != a)
+        .sorted_unstable_by_key(|&b| OrderedFloat(metric(a_pt, &points[b as usize])))
+        .take(k)
+        .collect::<Bitmap>();
+      let approx = vamana
+        .query(a_pt, k + 1) // +1 because the query point itself should be in the result.
+        .into_iter()
+        .map(|pd| pd.id)
+        .filter(|&b| b != a)
+        .take(k)
+        .collect::<Bitmap>();
+      correct += approx.and(&truth).cardinality();
+    }
+    println!(
+      "[Pairwise] Correct: {}/{} ({:.2}%)",
+      correct,
+      k * n as usize,
+      correct as f64 / (k * n as usize) as f64 * 100.0
+    );
+
+    // Second, test ANN of a query.
+    let query = gen_vec!();
+    let truth = ids
+      .iter()
+      .cloned()
+      .sorted_unstable_by_key(|&id| OrderedFloat(metric(&query, &points[id as usize])))
+      .take(k)
+      .collect::<Bitmap>();
+    let approx = vamana
+      .query(&query, k)
+      .into_iter()
+      .map(|pd| pd.id)
+      .collect::<Bitmap>();
+    let correct = approx.and(&truth).cardinality();
+    println!(
+      "[Query] Correct: {}/{} ({:.2}%)",
+      correct,
+      k,
+      correct as f64 / k as f64 * 100.0
+    );
   }
 }
