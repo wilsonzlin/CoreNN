@@ -11,13 +11,13 @@ use serde::Deserialize;
 use serde::Serialize;
 
 #[derive(Serialize, Deserialize)]
-pub struct ProductQuantizer {
+pub struct ProductQuantizer<T: linfa::Float> {
   dims: usize,
-  subspace_codebooks: Vec<KMeans<f32, L2Dist>>,
+  subspace_codebooks: Vec<KMeans<T, L2Dist>>,
 }
 
-impl ProductQuantizer {
-  pub fn train(mat: Array2<f32>, subspaces: usize) -> Self {
+impl<T: linfa::Float> ProductQuantizer<T> {
+  pub fn train(mat: Array2<T>, subspaces: usize) -> Self {
     let dims = mat.shape()[1];
     assert_eq!(dims % subspaces, 0);
     let subdims = dims / subspaces;
@@ -35,7 +35,7 @@ impl ProductQuantizer {
     }
   }
 
-  pub fn encode(&self, mat: Array2<f32>) -> Array2<u8> {
+  pub fn encode(&self, mat: Array2<T>) -> Array2<u8> {
     assert_eq!(mat.shape()[1], self.dims);
     let n = mat.shape()[0];
     let subspaces = self.subspace_codebooks.len();
@@ -53,12 +53,12 @@ impl ProductQuantizer {
     codes
   }
 
-  pub fn decode(&self, codes: &Array2<u8>) -> Array2<f32> {
+  pub fn decode(&self, codes: &Array2<u8>) -> Array2<T> {
     let n = codes.shape()[0];
     let subspaces = self.subspace_codebooks.len();
     let subdims = self.dims / subspaces;
     assert_eq!(codes.shape()[1], subspaces);
-    let mut mat = Array2::<f32>::zeros((n, self.dims));
+    let mut mat = Array2::<T>::zeros((n, self.dims));
     for (i, codebook) in self.subspace_codebooks.iter().enumerate() {
       let dec = codes
         .column(i)

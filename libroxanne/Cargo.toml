@@ -11,11 +11,13 @@ linfa = "0.7.0"
 linfa-clustering = { version = "0.7.0", features = ["serde"] }
 linfa-nn = "0.7.0"
 ndarray = "0.15" # linfa uses 0.15.
+ndarray-linalg = "0.15.0" # linfa uses 0.15.
 num-traits = "0.2.19"
 ordered-float = "4.3.0"
-rand = "0.8.5"
+rand = "0.8"
 rayon = "1.10.0"
 serde = { version = "1.0.210", features = ["derive"] }
 
 [dev-dependencies]
+ndarray-rand = "0.14.0" # Version 0.15 depends on ndarray 0.16 which we cannot use (see above).
 serde_json = "1.0.128"

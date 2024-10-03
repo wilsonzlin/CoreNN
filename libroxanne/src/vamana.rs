@@ -5,11 +5,13 @@ use crate::common::PointDist;
 use ahash::AHashMap;
 use croaring::Bitmap;
 use itertools::Itertools;
+use ndarray::Array1;
+use ndarray::ArrayView1;
+use ndarray_linalg::Scalar;
 use ordered_float::OrderedFloat;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::VecDeque;
-use std::iter::zip;
 
 #[derive(Clone)]
 pub struct VamanaParams {
@@ -22,24 +24,21 @@ pub struct VamanaParams {
   pub degree_bound: usize,
 }
 
-pub struct Vamana<P: Clone> {
+pub struct Vamana<T: Scalar> {
   adj_list: AHashMap<Id, Bitmap>,
-  id_to_point: AHashMap<Id, P>,
-  metric: fn(&P, &P) -> f64,
+  id_to_point: AHashMap<Id, Array1<T>>,
+  metric: Metric<T>,
   medoid: Id,
   params: VamanaParams,
 }
 
-impl<P: Clone> Vamana<P> {
-  pub fn new(ids: &[Id], points: &[P], metric: Metric<P>, params: VamanaParams) -> Self {
-    assert_eq!(
-      ids.len(),
-      points.len(),
-      "ID count and point count do not equal"
-    );
-    let id_to_point = zip(ids, points)
-      .map(|(id, p)| (*id, p.clone()))
-      .collect::<AHashMap<_, _>>();
+impl<T: Scalar> Vamana<T> {
+  pub fn new(
+    id_to_point: AHashMap<Id, Array1<T>>,
+    metric: Metric<T>,
+    params: VamanaParams,
+  ) -> Self {
+    let ids = id_to_point.keys().copied().collect_vec();
 
     // Initialise to R-regular graph with random edges.
     let adj_list = ids
@@ -55,18 +54,24 @@ impl<P: Clone> Vamana<P> {
       .collect();
 
     // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
-    let medoid = ids
-      .choose_multiple(&mut thread_rng(), params.medoid_sample_size)
-      .copied()
-      .min_by_key(|id| {
-        OrderedFloat(
-          points
-            .iter()
-            .map(|p| metric(&id_to_point[&id], p))
-            .sum::<f64>(),
-        )
-      })
-      .unwrap();
+    let medoid = {
+      let sample_ids = ids
+        .choose_multiple(&mut thread_rng(), params.medoid_sample_size)
+        .copied()
+        .collect_vec();
+      let sample_points = sample_ids
+        .iter()
+        .map(|id| id_to_point[id].view())
+        .collect_vec();
+      ids
+        .iter()
+        .copied()
+        .min_by_key(|id| {
+          let p = id_to_point[id].view();
+          OrderedFloat(sample_points.iter().map(|op| metric(&p, op)).sum::<f64>())
+        })
+        .unwrap()
+    };
 
     Self {
       adj_list,
@@ -83,7 +88,7 @@ impl<P: Clone> Vamana<P> {
     // This corresponds to `s` in the paper.
     start: Id,
     // This corresponds to `x_q` in the paper.
-    query: &P,
+    query: &ArrayView1<T>,
     k: usize,
     // Must be greater than `k` (according to paper). This corresponds to `L` in the paper.
     beam_width: usize,
@@ -102,7 +107,7 @@ impl<P: Clone> Vamana<P> {
     let mut all_visited = Bitmap::new();
     l_unvisited.push(PointDist {
       id: start,
-      dist: (self.metric)(&self.id_to_point[&start], query),
+      dist: (self.metric)(&self.id_to_point[&start].view(), query),
     });
     while let Some(p_star) = l_unvisited.pop() {
       // Move to visited section.
@@ -113,7 +118,7 @@ impl<P: Clone> Vamana<P> {
         if !all_visited.contains(neighbor) {
           l_unvisited.push(PointDist {
             id: neighbor,
-            dist: (self.metric)(&self.id_to_point[&neighbor], query),
+            dist: (self.metric)(&self.id_to_point[&neighbor].view(), query),
           });
         }
       }
@@ -163,7 +168,10 @@ impl<P: Clone> Vamana<P> {
       .filter(|&id| id != point)
       .map(|id| PointDist {
         id,
-        dist: (self.metric)(&self.id_to_point[&id], &self.id_to_point[&point]),
+        dist: (self.metric)(
+          &self.id_to_point[&id].view(),
+          &self.id_to_point[&point].view(),
+        ),
       })
       .sorted_unstable_by_key(|s| OrderedFloat(s.dist))
       .collect::<VecDeque<_>>();
@@ -177,7 +185,10 @@ impl<P: Clone> Vamana<P> {
         break;
       }
       candidates.retain(|s| {
-        let dist_to_p_star = (self.metric)(&self.id_to_point[&s.id], &self.id_to_point[&p_star]);
+        let dist_to_p_star = (self.metric)(
+          &self.id_to_point[&s.id].view(),
+          &self.id_to_point[&p_star].view(),
+        );
         distance_threshold * dist_to_p_star > s.dist
       });
     }
@@ -192,7 +203,7 @@ impl<P: Clone> Vamana<P> {
     for id in ids_rand {
       let (_closest, visited) = self.greedy_search(
         self.medoid,
-        &self.id_to_point[&id],
+        &self.id_to_point[&id].view(),
         1,
         self.params.beam_width,
       );
@@ -219,7 +230,7 @@ impl<P: Clone> Vamana<P> {
     self.index_pass(None);
   }
 
-  pub fn query(&self, query: &P, k: usize) -> Vec<PointDist> {
+  pub fn query(&self, query: &ArrayView1<T>, k: usize) -> Vec<PointDist> {
     self
       .greedy_search(self.medoid, query, k, self.params.beam_width)
       .0
@@ -231,13 +242,20 @@ mod tests {
   use super::Vamana;
   use super::VamanaParams;
   use crate::common::metric_euclidean;
+  use ahash::AHashMap;
   use croaring::Bitmap;
   use itertools::Itertools;
+  use ndarray::array;
+  use ndarray::Array;
+  use ndarray::Array1;
+  use ndarray_rand::RandomExt;
   use ordered_float::OrderedFloat;
+  use rand::distributions::Uniform;
   use rand::thread_rng;
   use rand::Rng;
   use serde::Serialize;
   use std::fs::File;
+  use std::iter::zip;
 
   #[test]
   fn test_vamana_2d() {
@@ -253,14 +271,15 @@ mod tests {
     let beam_width = k * 2;
     let points = (0..n)
       .map(|_| {
-        [
+        array![
           rng.gen_range(x_range.clone()),
           rng.gen_range(y_range.clone()),
         ]
       })
       .collect_vec();
+    let id_to_point = zip(ids.clone(), points.clone()).collect::<AHashMap<_, _>>();
 
-    let mut vamana = Vamana::new(&ids, &points, metric, VamanaParams {
+    let mut vamana = Vamana::new(id_to_point, metric, VamanaParams {
       beam_width,
       degree_bound: r,
       distance_threshold: 1.1,
@@ -276,11 +295,11 @@ mod tests {
         .iter()
         .cloned()
         .filter(|&b| b != a)
-        .sorted_unstable_by_key(|&b| OrderedFloat(metric(a_pt, &points[b as usize])))
+        .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b as usize].view())))
         .take(k)
         .collect::<Bitmap>();
       let approx = vamana
-        .query(a_pt, k + 1) // +1 because the query point itself should be in the result.
+        .query(&a_pt.view(), k + 1) // +1 because the query point itself should be in the result.
         .into_iter()
         .map(|pd| pd.id)
         .filter(|&b| b != a)
@@ -296,15 +315,17 @@ mod tests {
     );
 
     // Second, test ANN of a query.
-    let query = [rng.gen_range(x_range), rng.gen_range(y_range)];
+    let query = array![rng.gen_range(x_range), rng.gen_range(y_range)];
     let truth = ids
       .iter()
       .cloned()
-      .sorted_unstable_by_key(|&id| OrderedFloat(metric(&query, &points[id as usize])))
+      .sorted_unstable_by_key(|&id| {
+        OrderedFloat(metric(&query.view(), &points[id as usize].view()))
+      })
       .take(k)
       .collect::<Bitmap>();
     let approx = vamana
-      .query(&query, k)
+      .query(&query.view(), k)
       .into_iter()
       .map(|pd| pd.id)
       .collect::<Bitmap>();
@@ -319,17 +340,17 @@ mod tests {
     #[derive(Serialize)]
     struct DataNode {
       id: u32,
-      point: [f32; 2],
+      point: Array1<f32>,
       neighbors: Vec<u32>,
       knn: Vec<u32>,
     }
     let nodes = ids
       .iter()
       .map(|&id| {
-        let point = points[id as usize];
+        let point = points[id as usize].clone();
         let neighbors = vamana.adj_list[&id].iter().collect();
         let knn = vamana
-          .query(&point, k)
+          .query(&point.view(), k)
           .into_iter()
           .map(|pd| pd.id)
           .collect();
@@ -360,9 +381,7 @@ mod tests {
 
   #[test]
   fn test_vamana_512d() {
-    let mut rng = thread_rng();
     let metric = metric_euclidean;
-    let range = -10.0f32..10.0f32;
     const DIM: usize = 512;
     let n = 1000u32;
     let r = 12;
@@ -370,20 +389,15 @@ mod tests {
     let k = 15;
     let beam_width = k * 2;
 
-    macro_rules! gen_vec {
-      () => {{
-        let mut vec = [0.0f32; DIM];
-        for i in 0..DIM {
-          vec[i] = rng.gen_range(range.clone());
-        }
-        vec
-      }};
+    fn gen_vec() -> Array1<f32> {
+      Array::random((DIM,), Uniform::new(-10.0f32, 10.0f32))
     }
 
-    let points = (0..n).map(|_| gen_vec!()).collect_vec();
+    let points = (0..n).map(|_| gen_vec()).collect_vec();
+    let id_to_point = zip(ids.clone(), points.clone()).collect::<AHashMap<_, _>>();
     println!("Generated points");
 
-    let mut vamana = Vamana::new(&ids, &points, metric, VamanaParams {
+    let mut vamana = Vamana::new(id_to_point, metric, VamanaParams {
       beam_width,
       degree_bound: r,
       distance_threshold: 1.1,
@@ -401,11 +415,11 @@ mod tests {
         .iter()
         .cloned()
         .filter(|&b| b != a)
-        .sorted_unstable_by_key(|&b| OrderedFloat(metric(a_pt, &points[b as usize])))
+        .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b as usize].view())))
         .take(k)
         .collect::<Bitmap>();
       let approx = vamana
-        .query(a_pt, k + 1) // +1 because the query point itself should be in the result.
+        .query(&a_pt.view(), k + 1) // +1 because the query point itself should be in the result.
         .into_iter()
         .map(|pd| pd.id)
         .filter(|&b| b != a)
@@ -421,15 +435,17 @@ mod tests {
     );
 
     // Second, test ANN of a query.
-    let query = gen_vec!();
+    let query = gen_vec();
     let truth = ids
       .iter()
       .cloned()
-      .sorted_unstable_by_key(|&id| OrderedFloat(metric(&query, &points[id as usize])))
+      .sorted_unstable_by_key(|&id| {
+        OrderedFloat(metric(&query.view(), &points[id as usize].view()))
+      })
       .take(k)
       .collect::<Bitmap>();
     let approx = vamana
-      .query(&query, k)
+      .query(&query.view(), k)
       .into_iter()
       .map(|pd| pd.id)
       .collect::<Bitmap>();

@@ -1,8 +1,9 @@
-use std::iter::zip;
+use ndarray::ArrayView1;
+use ndarray_linalg::Scalar;
 
 // More than 4B is unlikely to scale well on a single shard. Using u32 instead of u64 allows us to use fast RoaringBitmaps everywhere.
 pub type Id = u32;
-pub type Metric<P> = fn(&P, &P) -> f64;
+pub type Metric<T> = fn(&ArrayView1<T>, &ArrayView1<T>) -> f64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PointDist {
@@ -11,17 +12,25 @@ pub struct PointDist {
 }
 
 // A metric implementation of the Euclidean distance.
-pub fn metric_euclidean<const N: usize>(a: &[f32; N], b: &[f32; N]) -> f64 {
-  zip(a, b)
-    .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
-    .sum::<f64>()
-    .sqrt()
+pub fn metric_euclidean<T: Scalar>(a: &ArrayView1<T>, b: &ArrayView1<T>) -> f64 {
+  let diff = a - b;
+  let squared_diff = &diff * &diff;
+  let sum_squared_diff = squared_diff.sum();
+  sum_squared_diff.to_f64().unwrap().sqrt()
 }
 
-// A metric implementation of the cosine similarity.
-pub fn metric_cosine<const N: usize>(a: &[f32; N], b: &[f32; N]) -> f64 {
-  let dot = zip(a, b).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>();
-  let norm_a = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-  let norm_b = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-  1.0 - dot / (norm_a * norm_b)
+// A metric implementation of the cosine distance (NOT similarity).
+pub fn metric_cosine<T: Scalar>(a: &ArrayView1<T>, b: &ArrayView1<T>) -> f64 {
+  let dot_product = a.dot(b).to_f64().unwrap();
+
+  let a_norm = a.dot(a).to_f64().unwrap();
+  let b_norm = b.dot(b).to_f64().unwrap();
+
+  let denominator = (a_norm * b_norm).sqrt();
+
+  if denominator == 0.0 {
+    1.0
+  } else {
+    1.0 - dot_product / denominator
+  }
 }
