@@ -2,8 +2,9 @@ use crate::beamqueue::BeamQueue;
 use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PointDist;
-use ahash::AHashMap;
+use arbitrary_lock::ArbitraryLock;
 use croaring::Bitmap;
+use dashmap::DashMap;
 use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::ArrayView1;
@@ -11,7 +12,112 @@ use ndarray_linalg::Scalar;
 use ordered_float::OrderedFloat;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use rand::Rng;
+use rayon::iter::IntoParallelIterator;
+use rayon::iter::ParallelIterator;
 use std::collections::VecDeque;
+
+// Return owned values:
+// - We use DashMap for in-memory, so we can't return a ref while holding a lock in the map entry.
+// - From disk, we copy the bytes.
+pub trait VamanaDatastore<T: Scalar + Send + Sync>: Sync {
+  fn get_point(&self, id: Id) -> Option<Array1<T>>;
+  fn set_point(&self, id: Id, point: Array1<T>);
+  fn get_out_neighbors(&self, id: Id) -> Option<Vec<Id>>;
+  fn set_out_neighbors(&self, id: Id, neighbors: Vec<Id>);
+}
+
+#[derive(Default)]
+pub struct InMemoryVamana<T: Scalar + Send + Sync> {
+  adj_list: DashMap<Id, Vec<Id>>,
+  id_to_point: DashMap<Id, Array1<T>>,
+}
+
+impl<T: Scalar + Send + Sync> VamanaDatastore<T> for InMemoryVamana<T> {
+  fn get_point(&self, id: Id) -> Option<Array1<T>> {
+    self.id_to_point.get(&id).map(|e| e.clone())
+  }
+
+  fn set_point(&self, id: Id, point: Array1<T>) {
+    self.id_to_point.insert(id, point);
+  }
+
+  fn get_out_neighbors(&self, id: Id) -> Option<Vec<Id>> {
+    self.adj_list.get(&id).map(|e| e.clone())
+  }
+
+  fn set_out_neighbors(&self, id: Id, neighbors: Vec<Id>) {
+    self.adj_list.insert(id, neighbors);
+  }
+}
+
+impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
+  pub fn init(
+    dataset: Vec<(Id, Array1<T>)>,
+    metric: Metric<T>,
+    params: VamanaParams,
+  ) -> Vamana<T, Self> {
+    // Initialise to R-regular graph with random edges.
+    let adj_list = dataset
+      .iter()
+      .map(|(id, _)| {
+        let mut rng = thread_rng();
+        let neighbors = dataset
+          .choose_multiple(&mut rng, params.degree_bound + 1) // Choose +1 in case we pick self.
+          .map(|e| e.0)
+          .filter(|oid| id != oid)
+          .take(params.degree_bound)
+          .collect_vec();
+        (*id, neighbors)
+      })
+      .collect();
+
+    // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
+    let medoid = {
+      let mut rng = thread_rng();
+      let sample_nos = (0..params.medoid_sample_size)
+        .map(|_| rng.gen_range(0..dataset.len()))
+        .collect_vec();
+      let idx = sample_nos
+        .iter()
+        .copied()
+        .min_by_key(|&i| {
+          let p = dataset[i].1.view();
+          OrderedFloat(
+            sample_nos
+              .iter()
+              .map(|&j| metric(&p, &dataset[j].1.view()))
+              .sum::<f64>(),
+          )
+        })
+        .unwrap();
+      dataset[idx].0
+    };
+
+    // Iterate points in random order.
+    // Build before `id_to_point` as that will take ownership.
+    let mut insert_order = dataset.iter().map(|e| e.0).collect_vec();
+    insert_order.shuffle(&mut thread_rng());
+
+    let id_to_point = dataset.into_iter().collect();
+
+    let graph = Vamana::new(
+      Self {
+        adj_list,
+        id_to_point,
+      },
+      medoid,
+      metric,
+      params,
+    );
+
+    insert_order.into_par_iter().for_each(|id| {
+      graph._insert(id, None);
+    });
+
+    graph
+  }
+}
 
 #[derive(Clone)]
 pub struct VamanaParams {
@@ -24,65 +130,27 @@ pub struct VamanaParams {
   pub degree_bound: usize,
 }
 
-pub struct Vamana<T: Scalar> {
-  adj_list: AHashMap<Id, Bitmap>,
-  id_to_point: AHashMap<Id, Array1<T>>,
+pub struct Vamana<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
+  ds: DS,
+  update_locker: ArbitraryLock<Id, parking_lot::Mutex<()>>,
   metric: Metric<T>,
   medoid: Id,
   params: VamanaParams,
 }
 
-impl<T: Scalar> Vamana<T> {
-  pub fn new(
-    id_to_point: AHashMap<Id, Array1<T>>,
-    metric: Metric<T>,
-    params: VamanaParams,
-  ) -> Self {
-    let ids = id_to_point.keys().copied().collect_vec();
-
-    // Initialise to R-regular graph with random edges.
-    let adj_list = ids
-      .iter()
-      .map(|&id| {
-        let mut rng = thread_rng();
-        let neighbors = ids
-          .choose_multiple(&mut rng, params.degree_bound)
-          .copied()
-          .collect();
-        (id, neighbors)
-      })
-      .collect();
-
-    // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
-    let medoid = {
-      let sample_ids = ids
-        .choose_multiple(&mut thread_rng(), params.medoid_sample_size)
-        .copied()
-        .collect_vec();
-      let sample_points = sample_ids
-        .iter()
-        .map(|id| id_to_point[id].view())
-        .collect_vec();
-      ids
-        .iter()
-        .copied()
-        .min_by_key(|id| {
-          let p = id_to_point[id].view();
-          OrderedFloat(sample_points.iter().map(|op| metric(&p, op)).sum::<f64>())
-        })
-        .unwrap()
-    };
-
+impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
+  pub fn new(ds: DS, medoid: Id, metric: Metric<T>, params: VamanaParams) -> Self {
     Self {
-      adj_list,
-      id_to_point,
-      medoid,
+      ds,
       metric,
+      medoid,
       params,
+      update_locker: ArbitraryLock::new(),
     }
   }
 
   // DiskANN paper, Algorithm 1: GreedySearch.
+  // Returns a pair: (closest points, visited node IDs).
   fn greedy_search(
     &self,
     // This corresponds to `s` in the paper.
@@ -107,18 +175,26 @@ impl<T: Scalar> Vamana<T> {
     let mut all_visited = Bitmap::new();
     l_unvisited.push(PointDist {
       id: start,
-      dist: (self.metric)(&self.id_to_point[&start].view(), query),
+      dist: (self.metric)(&self.ds.get_point(start).unwrap().view(), query),
     });
     while let Some(p_star) = l_unvisited.pop() {
       // Move to visited section.
       l_visited.push(p_star);
       all_visited.add(p_star.id);
-      for neighbor in self.adj_list[&p_star.id].iter() {
+      for neighbor in self
+        .ds
+        .get_out_neighbors(p_star.id)
+        .unwrap_or_default()
+        .into_iter()
+      {
         // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
         if !all_visited.contains(neighbor) {
+          let Some(neighbor_point) = self.ds.get_point(neighbor) else {
+            continue;
+          };
           l_unvisited.push(PointDist {
             id: neighbor,
-            dist: (self.metric)(&self.id_to_point[&neighbor].view(), query),
+            dist: (self.metric)(&neighbor_point.view(), query),
           });
         }
       }
@@ -146,88 +222,98 @@ impl<T: Scalar> Vamana<T> {
     (closest, all_visited)
   }
 
-  // DiskANN paper, Algorithm 2: RobustPrune.
-  fn robust_prune(
-    &mut self,
-    point: Id,
-    // This corresponds to `V` in the paper.
-    candidates: Bitmap,
-    // Must be >= 1. This corresponds to `α` in the paper.
-    distance_threshold: f64,
-    // This corresponds to `R` in the paper.
-    degree_bound: usize,
-  ) {
-    assert!(
-      distance_threshold >= 1.0,
-      "distance threshold must be at least 1"
-    );
+  /// WARNING: `candidates` must not contain the point itself.
+  fn compute_robust_pruned(&self, point: &ArrayView1<T>, candidates: Vec<Id>) -> Vec<Id> {
+    let dist_thresh = self.params.distance_threshold;
+    let degree_bound = self.params.degree_bound;
 
     let mut candidates = candidates
-      .or(&self.adj_list[&point])
-      .iter()
-      .filter(|&id| id != point)
-      .map(|id| PointDist {
-        id,
-        dist: (self.metric)(
-          &self.id_to_point[&id].view(),
-          &self.id_to_point[&point].view(),
-        ),
+      .into_par_iter()
+      .filter_map(|id| self.ds.get_point(id).map(|p| (id, p)))
+      .map(|(id, other_point)| {
+        let dist = (self.metric)(&other_point.view(), point);
+        (PointDist { id, dist }, other_point)
       })
-      .sorted_unstable_by_key(|s| OrderedFloat(s.dist))
-      .collect::<VecDeque<_>>();
+      .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|s| OrderedFloat(s.0.dist));
+    let mut candidates = candidates.into_iter().collect::<VecDeque<_>>();
 
-    let point_neighbors = self.adj_list.get_mut(&point).unwrap();
-    point_neighbors.clear();
+    let mut new_neighbors = Vec::new();
     // Even though the algorithm in the paper doesn't actually pop, the later pruning of the candidates at the end of the loop guarantees it will always be removed because d(p*, p') will always be zero for itself (p* == p').
-    while let Some(PointDist { id: p_star, .. }) = candidates.pop_front() {
-      point_neighbors.add(p_star);
-      if point_neighbors.cardinality() as usize == degree_bound {
+    while let Some((PointDist { id: p_star, .. }, p_star_point)) = candidates.pop_front() {
+      new_neighbors.push(p_star);
+      if new_neighbors.len() == degree_bound {
         break;
       }
       candidates.retain(|s| {
-        let dist_to_p_star = (self.metric)(
-          &self.id_to_point[&s.id].view(),
-          &self.id_to_point[&p_star].view(),
-        );
-        distance_threshold * dist_to_p_star > s.dist
+        let dist_to_p_star = (self.metric)(&s.1.view(), &p_star_point.view());
+        dist_thresh * dist_to_p_star > s.0.dist
       });
     }
+    new_neighbors
   }
 
-  fn index_pass(&mut self, distance_threshold_override: Option<f64>) {
-    let dist_thresh = distance_threshold_override.unwrap_or(self.params.distance_threshold);
+  // The sole purpose of having this separate internal method is the `point_or_is_initialization` parameter, which should only be None from internal use.
+  fn _insert(&self, id: Id, point_or_is_initialization: Option<Array1<T>>) {
+    // Lock even before RobustPrune, as we don't want a concurrent insert/delete to the same ID while we're processing it (e.g. setting/deleting the point entry in the DB itself).
+    let locker = self.update_locker.get(id);
+    let _lock = locker.lock();
 
-    // Iterate points in random order.
-    let mut ids_rand = self.id_to_point.keys().copied().collect_vec();
-    ids_rand.shuffle(&mut thread_rng());
-    for id in ids_rand {
-      let (_closest, visited) = self.greedy_search(
-        self.medoid,
-        &self.id_to_point[&id].view(),
-        1,
-        self.params.beam_width,
-      );
-      self.robust_prune(id, visited, dist_thresh, self.params.degree_bound);
-      // We will update the graph, so to satisfy Rust, we must clone now. (As a human, I can say that `j` should never equal `id` so this would be safe without cloning, but the compiler doesn't know.)
-      for j in self.adj_list[&id].clone().iter() {
-        // It's safe to always add `id` and save a clone + add, even though this differs from Algorithm 3 in the paper.
-        // - In the first branch, `robust_prune` will immediately clear the neighbors.
-        // - In the second branch, we will always add `id`.
-        let j_neighbors = self.adj_list.get_mut(&j).unwrap();
-        j_neighbors.add(id);
-        if j_neighbors.cardinality() as usize > self.params.degree_bound {
-          // Clone now instead of as inline arg so that we can drop the mut borrow to adj_list now and therefore mut borrow it in the first arg to robust_prune.
-          let candidates = j_neighbors.clone();
-          self.robust_prune(j, candidates, dist_thresh, self.params.degree_bound);
-        }
+    let point = match point_or_is_initialization.clone() {
+      Some(p) => p,
+      None => self.ds.get_point(id).unwrap(),
+    };
+
+    // TODO Delete if already exists.
+
+    // Initial GreedySearch.
+    let (_closest, mut candidates) =
+      self.greedy_search(self.medoid, &point.view(), 1, self.params.beam_width);
+
+    // RobustPrune.
+    // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
+    // Normally, we don't have any existing out-neighbors to add to `candidates`, but on initialization we do (initial R-regular random graph + changes from previous point initializations). Note that it's not safe to fetch the neighbors outside the lock (e.g. pass it into this function) as it may be changed with a crucial edge that we must preserve.
+    if point_or_is_initialization.is_none() {
+      for n in self.ds.get_out_neighbors(id).unwrap() {
+        candidates.add(n);
       }
     }
+    // RobustPrune requires that the point itself is never in the candidate set. This should never happen, but let's be safe.
+    candidates.remove(id);
+    let new_neighbors = self.compute_robust_pruned(&point.view(), candidates.iter().collect());
+
+    // Update neighbors.
+    for &j in new_neighbors.iter() {
+      // This should never deadlock, as our current point that we're inserting (the outer lock) should not be reachable right now.
+      let locker = self.update_locker.get(j);
+      let _lock = locker.lock();
+      let Some(mut j_neighbors) = self.ds.get_out_neighbors(j) else {
+        // Race condition: node has disappeared since.
+        continue;
+      };
+      if j_neighbors.as_slice().contains(&id) {
+        // No change necessary.
+        continue;
+      }
+      j_neighbors.push(id);
+      if j_neighbors.len() > self.params.degree_bound {
+        // It must exist because we acquired the lock and checked it existed.
+        let j_point = self.ds.get_point(j).unwrap();
+        j_neighbors = self.compute_robust_pruned(&j_point.view(), j_neighbors);
+      }
+      // Don't batch these outside loop at end, as then we'll hold too many locks for too long and also may cause deadlocks.
+      self.ds.set_out_neighbors(j, j_neighbors);
+    }
+
+    // If we are initializing, we don't need to set the point.
+    if let Some(point) = point_or_is_initialization {
+      self.ds.set_point(id, point);
+    }
+    self.ds.set_out_neighbors(id, new_neighbors);
   }
 
-  pub fn index(&mut self) {
-    // The paper recommends two passes: one with a distance threshold of 1, and one with the user provided distance threshold.
-    self.index_pass(Some(1.0));
-    self.index_pass(None);
+  pub fn insert(&self, id: Id, point: Array1<T>) {
+    self._insert(id, Some(point))
   }
 
   pub fn query(&self, query: &ArrayView1<T>, k: usize) -> Vec<PointDist> {

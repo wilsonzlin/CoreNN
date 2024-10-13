@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 ahash = "0.8.11"
+arbitrary-lock = "0.1.1"
 croaring = "2.1.0"
+dashmap = "6.1.0"
 itertools = "0.13.0"
 linfa = "0.7.0"
 linfa-clustering = { version = "0.7.0", features = ["serde"] }
@@ -14,6 +16,7 @@ ndarray = "0.15" # linfa uses 0.15.
 ndarray-linalg = "0.15.0" # linfa uses 0.15.
 num-traits = "0.2.19"
 ordered-float = "4.3.0"
+parking_lot = "0.12.3"
 rand = "0.8"
 rayon = "1.10.0"
 serde = { version = "1.0.210", features = ["derive"] }
