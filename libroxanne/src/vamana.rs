@@ -14,6 +14,7 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rand::Rng;
 use rayon::iter::IntoParallelIterator;
+use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use std::collections::VecDeque;
 
@@ -58,19 +59,28 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     params: VamanaParams,
   ) -> Vamana<T, Self> {
     // Initialise to R-regular graph with random edges.
-    let adj_list = dataset
-      .iter()
-      .map(|(id, _)| {
-        let mut rng = thread_rng();
-        let neighbors = dataset
-          .choose_multiple(&mut rng, params.degree_bound + 1) // Choose +1 in case we pick self.
-          .map(|e| e.0)
-          .filter(|oid| id != oid)
-          .take(params.degree_bound)
-          .collect_vec();
-        (*id, neighbors)
-      })
-      .collect();
+    #[cfg(feature = "verbose")]
+    let progress = std::sync::atomic::AtomicUsize::new(0);
+    let adj_list = DashMap::new();
+    dataset.par_iter().for_each(|(id, _)| {
+      #[cfg(feature = "verbose")]
+      {
+        let p = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if p % 100000 == 0 {
+          println!("Build random graph: {}/{}", p, dataset.len());
+        }
+      }
+      let mut rng = thread_rng();
+      let neighbors = dataset
+        .choose_multiple(&mut rng, params.degree_bound + 1) // Choose +1 in case we pick self.
+        .map(|e| e.0)
+        .filter(|oid| id != oid)
+        .take(params.degree_bound)
+        .collect_vec();
+      adj_list.insert(*id, neighbors);
+    });
+    #[cfg(feature = "verbose")]
+    println!("Build random graph: complete");
 
     // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
     let medoid = {
@@ -78,8 +88,10 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
       let sample_nos = (0..params.medoid_sample_size)
         .map(|_| rng.gen_range(0..dataset.len()))
         .collect_vec();
+      #[cfg(feature = "verbose")]
+      println!("Calculate medoid: using {} points", sample_nos.len());
       let idx = sample_nos
-        .iter()
+        .par_iter()
         .copied()
         .min_by_key(|&i| {
           let p = dataset[i].1.view();
@@ -93,6 +105,8 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
         .unwrap();
       dataset[idx].0
     };
+    #[cfg(feature = "verbose")]
+    println!("Calculate medoid: complete");
 
     // Iterate points in random order.
     // Build before `id_to_point` as that will take ownership.
@@ -111,9 +125,24 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
       params,
     );
 
+    #[cfg(feature = "verbose")]
+    let (progress, n) = {
+      let n = insert_order.len();
+      println!("Insert vectors: starting {} points", n);
+      (std::sync::atomic::AtomicUsize::new(0), n)
+    };
     insert_order.into_par_iter().for_each(|id| {
       graph._insert(id, None);
+      #[cfg(feature = "verbose")]
+      {
+        let p = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if p % 10000 == 0 {
+          println!("Insert vectors: {}/{}", p, n);
+        }
+      }
     });
+    #[cfg(feature = "verbose")]
+    println!("Insert vectors: complete");
 
     graph
   }
