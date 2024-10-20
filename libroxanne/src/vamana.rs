@@ -1,7 +1,7 @@
-use crate::beamqueue::BeamQueue;
 use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PointDist;
+use crate::queue::BoundedDistinctQueue;
 use ahash::AHashSet;
 use dashmap::DashMap;
 use itertools::Itertools;
@@ -116,7 +116,8 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
 pub struct VamanaParams {
   // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
   pub medoid_sample_size: usize,
-  pub beam_width: usize,
+  // Must be greater than `k` (according to paper). This corresponds to `L` in the paper.
+  pub search_list_cap: usize,
   // Corresponds to `α` in the DiskANN paper. Must be at least 1.
   pub distance_threshold: f64,
   // Corresponds to `R` in the DiskANN paper. The paper recommends at least log(N), where N is the number of points.
@@ -147,15 +148,17 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   // Returns a pair: (closest points, visited node IDs).
   fn greedy_search(
     &self,
-    // This corresponds to `s` in the paper.
-    start: Id,
     // This corresponds to `x_q` in the paper.
     query: &ArrayView1<T>,
     k: usize,
-    // Must be greater than `k` (according to paper). This corresponds to `L` in the paper.
-    beam_width: usize,
   ) -> (Vec<PointDist>, AHashSet<Id>) {
-    assert!(beam_width > k, "beam width must be greater than k");
+    // This corresponds to `s` in the paper.
+    let start = self.medoid;
+    let search_list_cap = self.params.search_list_cap;
+    assert!(
+      search_list_cap > k,
+      "search list capacity must be greater than k"
+    );
 
     // It's too inefficient to calculate L\V repeatedly.
     // Since we need both L (return value) and L\V (each iteration), we split L into V and ¬V.
@@ -164,8 +167,8 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     // We also need `all_visited` as `l_visited` truncates to `k`, but we also want all visited points in the end.
     // L = l_visited + l_unvisited
     // TODO This is incorrect, as the stopping condition is when the combined L size equals `beam_width`, not just L\V. This means we may be doing way more traversals and stopping way later than necessary.
-    let mut l_unvisited = BeamQueue::new(beam_width); // L \ V
-    let mut l_visited = BeamQueue::new(beam_width); // V
+    let mut l_unvisited = BoundedDistinctQueue::new(search_list_cap); // L \ V
+    let mut l_visited = BoundedDistinctQueue::new(search_list_cap); // V
     let mut all_visited = AHashSet::new();
     l_unvisited.push(PointDist {
       id: start,
@@ -271,8 +274,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         // TODO Delete if already exists.
 
         // Initial GreedySearch.
-        let (_closest, mut candidates) =
-          self.greedy_search(self.medoid, &point.view(), 1, self.params.beam_width);
+        let mut candidates = self.greedy_search(&point.view(), 1).1;
 
         // RobustPrune.
         // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
@@ -316,26 +318,22 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   pub fn insert(&self, mut points: Vec<(Id, Array1<T>)>) {
     points.shuffle(&mut thread_rng());
     let ids = points.iter().map(|(id, _)| *id).collect_vec();
-    points.into_par_iter().for_each(|(id, point)| {
-      self.ds.set_point(id, point);
-    });
+    points
+      .into_par_iter()
+      .for_each(|(id, point)| self.ds.set_point(id, point));
     self.optimize(&ids);
   }
 
   pub fn query(&self, query: &ArrayView1<T>, k: usize) -> Vec<PointDist> {
-    self
-      .greedy_search(self.medoid, query, k, self.params.beam_width)
-      .0
+    self.greedy_search(query, k).0
   }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::Vamana;
   use super::VamanaParams;
   use crate::common::metric_euclidean;
   use crate::vamana::InMemoryVamana;
-  use ahash::AHashMap;
   use ahash::AHashSet;
   use itertools::Itertools;
   use ndarray::array;
@@ -346,8 +344,6 @@ mod tests {
   use rand::distributions::Uniform;
   use rand::thread_rng;
   use rand::Rng;
-  use rayon::iter::IntoParallelRefIterator;
-  use rayon::iter::ParallelIterator;
   use serde::Serialize;
   use std::fs::File;
   use std::iter::zip;
@@ -363,7 +359,7 @@ mod tests {
     let r = 10;
     let ids = (0..n).collect_vec();
     let k = 10;
-    let beam_width = k * 2;
+    let search_list_cap = k * 2;
     let points = (0..n)
       .map(|_| {
         array![
@@ -375,11 +371,11 @@ mod tests {
     let dataset = zip(ids.clone(), points.clone()).collect_vec();
 
     let vamana = InMemoryVamana::init(dataset, metric, VamanaParams {
-      beam_width,
       degree_bound: r,
       distance_threshold: 1.1,
       insert_batch_size: 64,
       medoid_sample_size: 10_000,
+      search_list_cap,
     });
     println!("Indexed");
 
@@ -490,7 +486,7 @@ mod tests {
     let r = 12;
     let ids = (0..n).collect_vec();
     let k = 15;
-    let beam_width = k * 2;
+    let search_list_cap = k * 2;
 
     fn gen_vec() -> Array1<f32> {
       Array::random((DIM,), Uniform::new(-10.0f32, 10.0f32))
@@ -501,11 +497,11 @@ mod tests {
     println!("Generated points");
 
     let vamana = InMemoryVamana::init(dataset, metric, VamanaParams {
-      beam_width,
       degree_bound: r,
       distance_threshold: 1.1,
       insert_batch_size: 64,
       medoid_sample_size: 1000,
+      search_list_cap,
     });
     println!("Indexed");
 

@@ -7,19 +7,23 @@ use std::collections::VecDeque;
 // Instead, we'll use a sorted array for O(1) argmin.
 // We don't use a BinaryHeap as a priority queue does not allow for efficient truncation, which we do at each iteration. A Vec may be slower in theory to insert, but `k` is often small enough that it's actually faster in reality due to cache locality.
 // This will also ensure there are no duplicates. (Important, as the algorithm in the DiskANN paper specifies that this is a set.)
-pub struct BeamQueue {
+pub struct BoundedDistinctQueue {
   queue: VecDeque<PointDist>,
   set: AHashSet<Id>,
   k: usize,
 }
 
-impl BeamQueue {
+impl BoundedDistinctQueue {
   pub fn new(k: usize) -> Self {
     Self {
       queue: VecDeque::new(),
       set: AHashSet::new(),
       k,
     }
+  }
+
+  pub fn len(&self) -> usize {
+    self.queue.len()
   }
 
   pub fn push(&mut self, state: PointDist) {

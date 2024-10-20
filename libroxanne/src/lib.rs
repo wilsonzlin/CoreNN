@@ -1,9 +1,9 @@
 use num_traits::Num;
 use std::mem::size_of;
 
-pub mod beamqueue;
 pub mod common;
 pub mod pq;
+pub mod queue;
 pub mod vamana;
 
 pub struct RoxanneDbParams {
