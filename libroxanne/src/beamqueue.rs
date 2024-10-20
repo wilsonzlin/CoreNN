@@ -1,5 +1,6 @@
+use crate::common::Id;
 use crate::common::PointDist;
-use croaring::Bitmap;
+use ahash::AHashSet;
 use std::collections::VecDeque;
 
 // It's too inefficient to calculate argmin(dist(P, query)) repeatedly.
@@ -8,7 +9,7 @@ use std::collections::VecDeque;
 // This will also ensure there are no duplicates. (Important, as the algorithm in the DiskANN paper specifies that this is a set.)
 pub struct BeamQueue {
   queue: VecDeque<PointDist>,
-  set: Bitmap,
+  set: AHashSet<Id>,
   k: usize,
 }
 
@@ -16,16 +17,16 @@ impl BeamQueue {
   pub fn new(k: usize) -> Self {
     Self {
       queue: VecDeque::new(),
-      set: Bitmap::new(),
+      set: AHashSet::new(),
       k,
     }
   }
 
   pub fn push(&mut self, state: PointDist) {
     debug_assert!(self.queue.len() <= self.k);
-    debug_assert!(self.queue.len() == self.set.cardinality() as usize);
+    debug_assert!(self.queue.len() == self.set.len());
     // Do not insert if already exists.
-    if self.set.contains(state.id) {
+    if self.set.contains(&state.id) {
       return;
     }
     let pos = match self
@@ -39,18 +40,18 @@ impl BeamQueue {
     if pos >= self.k {
       return;
     }
-    self.set.add(state.id);
+    self.set.insert(state.id);
     self.queue.insert(pos, state);
     if self.queue.len() > self.k {
       let PointDist { id, .. } = self.queue.pop_back().unwrap();
-      self.set.remove(id);
+      self.set.remove(&id);
     }
   }
 
   pub fn pop(&mut self) -> Option<PointDist> {
     let s = self.queue.pop_front();
     if let Some(s) = s.as_ref() {
-      self.set.remove(s.id);
+      self.set.remove(&s.id);
     }
     s
   }

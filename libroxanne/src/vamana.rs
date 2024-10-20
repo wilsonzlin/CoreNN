@@ -2,8 +2,7 @@ use crate::beamqueue::BeamQueue;
 use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PointDist;
-use arbitrary_lock::ArbitraryLock;
-use croaring::Bitmap;
+use ahash::AHashSet;
 use dashmap::DashMap;
 use itertools::Itertools;
 use ndarray::Array1;
@@ -15,6 +14,7 @@ use rand::thread_rng;
 use rand::Rng;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use std::collections::VecDeque;
 
@@ -24,13 +24,13 @@ use std::collections::VecDeque;
 pub trait VamanaDatastore<T: Scalar + Send + Sync>: Sync {
   fn get_point(&self, id: Id) -> Option<Array1<T>>;
   fn set_point(&self, id: Id, point: Array1<T>);
-  fn get_out_neighbors(&self, id: Id) -> Option<Vec<Id>>;
-  fn set_out_neighbors(&self, id: Id, neighbors: Vec<Id>);
+  fn get_out_neighbors(&self, id: Id) -> Option<AHashSet<Id>>;
+  fn set_out_neighbors(&self, id: Id, neighbors: AHashSet<Id>);
 }
 
 #[derive(Default)]
 pub struct InMemoryVamana<T: Scalar + Send + Sync> {
-  adj_list: DashMap<Id, Vec<Id>>,
+  adj_list: DashMap<Id, AHashSet<Id>>,
   id_to_point: DashMap<Id, Array1<T>>,
 }
 
@@ -43,11 +43,11 @@ impl<T: Scalar + Send + Sync> VamanaDatastore<T> for InMemoryVamana<T> {
     self.id_to_point.insert(id, point);
   }
 
-  fn get_out_neighbors(&self, id: Id) -> Option<Vec<Id>> {
+  fn get_out_neighbors(&self, id: Id) -> Option<AHashSet<Id>> {
     self.adj_list.get(&id).map(|e| e.clone())
   }
 
-  fn set_out_neighbors(&self, id: Id, neighbors: Vec<Id>) {
+  fn set_out_neighbors(&self, id: Id, neighbors: AHashSet<Id>) {
     self.adj_list.insert(id, neighbors);
   }
 }
@@ -59,28 +59,17 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     params: VamanaParams,
   ) -> Vamana<T, Self> {
     // Initialise to R-regular graph with random edges.
-    #[cfg(feature = "verbose")]
-    let progress = std::sync::atomic::AtomicUsize::new(0);
     let adj_list = DashMap::new();
     dataset.par_iter().for_each(|(id, _)| {
-      #[cfg(feature = "verbose")]
-      {
-        let p = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if p % 100000 == 0 {
-          println!("Build random graph: {}/{}", p, dataset.len());
-        }
-      }
       let mut rng = thread_rng();
       let neighbors = dataset
         .choose_multiple(&mut rng, params.degree_bound + 1) // Choose +1 in case we pick self.
         .map(|e| e.0)
         .filter(|oid| id != oid)
         .take(params.degree_bound)
-        .collect_vec();
+        .collect::<AHashSet<_>>();
       adj_list.insert(*id, neighbors);
     });
-    #[cfg(feature = "verbose")]
-    println!("Build random graph: complete");
 
     // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
     let medoid = {
@@ -88,8 +77,6 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
       let sample_nos = (0..params.medoid_sample_size)
         .map(|_| rng.gen_range(0..dataset.len()))
         .collect_vec();
-      #[cfg(feature = "verbose")]
-      println!("Calculate medoid: using {} points", sample_nos.len());
       let idx = sample_nos
         .par_iter()
         .copied()
@@ -105,14 +92,8 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
         .unwrap();
       dataset[idx].0
     };
-    #[cfg(feature = "verbose")]
-    println!("Calculate medoid: complete");
 
-    // Iterate points in random order.
-    // Build before `id_to_point` as that will take ownership.
-    let mut insert_order = dataset.iter().map(|e| e.0).collect_vec();
-    insert_order.shuffle(&mut thread_rng());
-
+    let ids = dataset.iter().map(|e| e.0).collect_vec();
     let id_to_point = dataset.into_iter().collect();
 
     let graph = Vamana::new(
@@ -125,24 +106,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
       params,
     );
 
-    #[cfg(feature = "verbose")]
-    let (progress, n) = {
-      let n = insert_order.len();
-      println!("Insert vectors: starting {} points", n);
-      (std::sync::atomic::AtomicUsize::new(0), n)
-    };
-    insert_order.into_par_iter().for_each(|id| {
-      graph._insert(id, None);
-      #[cfg(feature = "verbose")]
-      {
-        let p = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if p % 10000 == 0 {
-          println!("Insert vectors: {}/{}", p, n);
-        }
-      }
-    });
-    #[cfg(feature = "verbose")]
-    println!("Insert vectors: complete");
+    graph.optimize(&ids);
 
     graph
   }
@@ -157,13 +121,14 @@ pub struct VamanaParams {
   pub distance_threshold: f64,
   // Corresponds to `R` in the DiskANN paper. The paper recommends at least log(N), where N is the number of points.
   pub degree_bound: usize,
+  pub insert_batch_size: usize,
 }
 
 pub struct Vamana<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
   ds: DS,
-  update_locker: ArbitraryLock<Id, parking_lot::Mutex<()>>,
-  metric: Metric<T>,
   medoid: Id,
+  metric: Metric<T>,
+  mutex: parking_lot::Mutex<()>,
   params: VamanaParams,
 }
 
@@ -171,10 +136,10 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   pub fn new(ds: DS, medoid: Id, metric: Metric<T>, params: VamanaParams) -> Self {
     Self {
       ds,
-      metric,
       medoid,
+      metric,
+      mutex: parking_lot::Mutex::new(()),
       params,
-      update_locker: ArbitraryLock::new(),
     }
   }
 
@@ -189,7 +154,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     k: usize,
     // Must be greater than `k` (according to paper). This corresponds to `L` in the paper.
     beam_width: usize,
-  ) -> (Vec<PointDist>, Bitmap) {
+  ) -> (Vec<PointDist>, AHashSet<Id>) {
     assert!(beam_width > k, "beam width must be greater than k");
 
     // It's too inefficient to calculate L\V repeatedly.
@@ -201,7 +166,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     // TODO This is incorrect, as the stopping condition is when the combined L size equals `beam_width`, not just L\V. This means we may be doing way more traversals and stopping way later than necessary.
     let mut l_unvisited = BeamQueue::new(beam_width); // L \ V
     let mut l_visited = BeamQueue::new(beam_width); // V
-    let mut all_visited = Bitmap::new();
+    let mut all_visited = AHashSet::new();
     l_unvisited.push(PointDist {
       id: start,
       dist: (self.metric)(&self.ds.get_point(start).unwrap().view(), query),
@@ -209,7 +174,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     while let Some(p_star) = l_unvisited.pop() {
       // Move to visited section.
       l_visited.push(p_star);
-      all_visited.add(p_star.id);
+      all_visited.insert(p_star.id);
       for neighbor in self
         .ds
         .get_out_neighbors(p_star.id)
@@ -217,7 +182,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         .into_iter()
       {
         // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
-        if !all_visited.contains(neighbor) {
+        if !all_visited.contains(&neighbor) {
           let Some(neighbor_point) = self.ds.get_point(neighbor) else {
             continue;
           };
@@ -251,13 +216,19 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     (closest, all_visited)
   }
 
-  /// WARNING: `candidates` must not contain the point itself.
-  fn compute_robust_pruned(&self, point: &ArrayView1<T>, candidates: Vec<Id>) -> Vec<Id> {
+  /// WARNING: `candidate_ids` must not contain the point itself.
+  fn compute_robust_pruned(
+    &self,
+    point: &ArrayView1<T>,
+    candidate_ids: AHashSet<Id>,
+  ) -> AHashSet<Id> {
     let dist_thresh = self.params.distance_threshold;
     let degree_bound = self.params.degree_bound;
 
-    let mut candidates = candidates
-      .into_par_iter()
+    // TODO Why does `.into_par_iter()` instead of `.into_iter().par_bridge()` not work?
+    let mut candidates = candidate_ids
+      .into_iter()
+      .par_bridge()
       .filter_map(|id| self.ds.get_point(id).map(|p| (id, p)))
       .map(|(id, other_point)| {
         let dist = (self.metric)(&other_point.view(), point);
@@ -265,12 +236,12 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       })
       .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|s| OrderedFloat(s.0.dist));
-    let mut candidates = candidates.into_iter().collect::<VecDeque<_>>();
+    let mut candidates = VecDeque::from(candidates);
 
-    let mut new_neighbors = Vec::new();
+    let mut new_neighbors = AHashSet::new();
     // Even though the algorithm in the paper doesn't actually pop, the later pruning of the candidates at the end of the loop guarantees it will always be removed because d(p*, p') will always be zero for itself (p* == p').
     while let Some((PointDist { id: p_star, .. }, p_star_point)) = candidates.pop_front() {
-      new_neighbors.push(p_star);
+      assert!(new_neighbors.insert(p_star));
       if new_neighbors.len() == degree_bound {
         break;
       }
@@ -282,67 +253,73 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     new_neighbors
   }
 
-  // The sole purpose of having this separate internal method is the `point_or_is_initialization` parameter, which should only be None from internal use.
-  fn _insert(&self, id: Id, point_or_is_initialization: Option<Array1<T>>) {
-    // Lock even before RobustPrune, as we don't want a concurrent insert/delete to the same ID while we're processing it (e.g. setting/deleting the point entry in the DB itself).
-    let locker = self.update_locker.get(id);
-    let _lock = locker.lock();
-
-    let point = match point_or_is_initialization.clone() {
-      Some(p) => p,
-      None => self.ds.get_point(id).unwrap(),
-    };
-
-    // TODO Delete if already exists.
-
-    // Initial GreedySearch.
-    let (_closest, mut candidates) =
-      self.greedy_search(self.medoid, &point.view(), 1, self.params.beam_width);
-
-    // RobustPrune.
-    // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
-    // Normally, we don't have any existing out-neighbors to add to `candidates`, but on initialization we do (initial R-regular random graph + changes from previous point initializations). Note that it's not safe to fetch the neighbors outside the lock (e.g. pass it into this function) as it may be changed with a crucial edge that we must preserve.
-    if point_or_is_initialization.is_none() {
-      for n in self.ds.get_out_neighbors(id).unwrap() {
-        candidates.add(n);
+  // The point referenced by each ID should already be inserted into the DB.
+  // This is used when inserting, but also during initialization, so this is a separate function from `insert`.
+  // WARNING: The graph must be locked (or otherwise not be mutated) while this function is executing, but it is up to the caller's responsibility.
+  fn optimize(&self, ids: &[Id]) {
+    for batch in ids.chunks(self.params.insert_batch_size) {
+      #[derive(Default)]
+      struct Update {
+        replacement_base: Option<AHashSet<Id>>,
+        additional_edges: AHashSet<Id>,
       }
-    }
-    // RobustPrune requires that the point itself is never in the candidate set. This should never happen, but let's be safe.
-    candidates.remove(id);
-    let new_neighbors = self.compute_robust_pruned(&point.view(), candidates.iter().collect());
+      let updates = DashMap::<Id, Update>::new();
 
-    // Update neighbors.
-    for &j in new_neighbors.iter() {
-      // This should never deadlock, as our current point that we're inserting (the outer lock) should not be reachable right now.
-      let locker = self.update_locker.get(j);
-      let _lock = locker.lock();
-      let Some(mut j_neighbors) = self.ds.get_out_neighbors(j) else {
-        // Race condition: node has disappeared since.
-        continue;
-      };
-      if j_neighbors.as_slice().contains(&id) {
-        // No change necessary.
-        continue;
-      }
-      j_neighbors.push(id);
-      if j_neighbors.len() > self.params.degree_bound {
-        // It must exist because we acquired the lock and checked it existed.
-        let j_point = self.ds.get_point(j).unwrap();
-        j_neighbors = self.compute_robust_pruned(&j_point.view(), j_neighbors);
-      }
-      // Don't batch these outside loop at end, as then we'll hold too many locks for too long and also may cause deadlocks.
-      self.ds.set_out_neighbors(j, j_neighbors);
-    }
+      batch.into_par_iter().for_each(|&id| {
+        let point = self.ds.get_point(id).unwrap();
 
-    // If we are initializing, we don't need to set the point.
-    if let Some(point) = point_or_is_initialization {
-      self.ds.set_point(id, point);
+        // TODO Delete if already exists.
+
+        // Initial GreedySearch.
+        let (_closest, mut candidates) =
+          self.greedy_search(self.medoid, &point.view(), 1, self.params.beam_width);
+
+        // RobustPrune.
+        // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
+        // Normally, we don't have any existing out-neighbors to add to `candidates`, but on initialization we do (initial R-regular random graph + changes from previous point initializations). Note that it's not safe to fetch the neighbors outside the lock (e.g. pass it into this function) as it may be changed with a crucial edge that we must preserve.
+        for n in self.ds.get_out_neighbors(id).unwrap_or_default() {
+          candidates.insert(n);
+        }
+        // RobustPrune requires that the point itself is never in the candidate set.
+        candidates.remove(&id);
+        let new_neighbors = self.compute_robust_pruned(&point.view(), candidates);
+        for &j in new_neighbors.iter() {
+          updates.entry(j).or_default().additional_edges.insert(id);
+        }
+        updates.entry(id).or_default().replacement_base = Some(new_neighbors);
+      });
+
+      // Update dirty nodes in this batch.
+      updates.into_par_iter().for_each(
+        |(
+          id,
+          Update {
+            replacement_base,
+            additional_edges,
+          },
+        )| {
+          let mut new_neighbors =
+            replacement_base.unwrap_or_else(|| self.ds.get_out_neighbors(id).unwrap());
+          for j in additional_edges {
+            new_neighbors.insert(j);
+          }
+          if new_neighbors.len() > self.params.degree_bound {
+            let point = self.ds.get_point(id).unwrap();
+            new_neighbors = self.compute_robust_pruned(&point.view(), new_neighbors);
+          };
+          self.ds.set_out_neighbors(id, new_neighbors);
+        },
+      );
     }
-    self.ds.set_out_neighbors(id, new_neighbors);
   }
 
-  pub fn insert(&self, id: Id, point: Array1<T>) {
-    self._insert(id, Some(point))
+  pub fn insert(&self, mut points: Vec<(Id, Array1<T>)>) {
+    points.shuffle(&mut thread_rng());
+    let ids = points.iter().map(|(id, _)| *id).collect_vec();
+    points.into_par_iter().for_each(|(id, point)| {
+      self.ds.set_point(id, point);
+    });
+    self.optimize(&ids);
   }
 
   pub fn query(&self, query: &ArrayView1<T>, k: usize) -> Vec<PointDist> {
