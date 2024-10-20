@@ -80,11 +80,11 @@ fn main() {
   }
 
   let params = VamanaParams {
+    beam_width: (args.k as f64 * 1.33) as usize,
+    degree_bound: (vecs.len() as f64).ln() as usize,
+    distance_threshold: 1.1,
     insert_batch_size: 48,
     medoid_sample_size: 10_000,
-    beam_width: (args.k as f64 * 1.33) as usize,
-    distance_threshold: 1.1,
-    degree_bound: (vecs.len() as f64).ln() as usize,
   };
 
   let graph = InMemoryVamana::init(vecs, euclidian, params);

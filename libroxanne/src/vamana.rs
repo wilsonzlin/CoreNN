@@ -334,8 +334,9 @@ mod tests {
   use super::Vamana;
   use super::VamanaParams;
   use crate::common::metric_euclidean;
+  use crate::vamana::InMemoryVamana;
   use ahash::AHashMap;
-  use croaring::Bitmap;
+  use ahash::AHashSet;
   use itertools::Itertools;
   use ndarray::array;
   use ndarray::Array;
@@ -345,6 +346,8 @@ mod tests {
   use rand::distributions::Uniform;
   use rand::thread_rng;
   use rand::Rng;
+  use rayon::iter::IntoParallelRefIterator;
+  use rayon::iter::ParallelIterator;
   use serde::Serialize;
   use std::fs::File;
   use std::iter::zip;
@@ -369,15 +372,16 @@ mod tests {
         ]
       })
       .collect_vec();
-    let id_to_point = zip(ids.clone(), points.clone()).collect::<AHashMap<_, _>>();
+    let dataset = zip(ids.clone(), points.clone()).collect_vec();
 
-    let mut vamana = Vamana::new(id_to_point, metric, VamanaParams {
+    let vamana = InMemoryVamana::init(dataset, metric, VamanaParams {
       beam_width,
       degree_bound: r,
       distance_threshold: 1.1,
+      insert_batch_size: 64,
       medoid_sample_size: 10_000,
     });
-    vamana.index();
+    println!("Indexed");
 
     // First, test ANN of every point.
     let mut correct = 0;
@@ -389,15 +393,15 @@ mod tests {
         .filter(|&b| b != a)
         .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b as usize].view())))
         .take(k)
-        .collect::<Bitmap>();
+        .collect::<AHashSet<_>>();
       let approx = vamana
         .query(&a_pt.view(), k + 1) // +1 because the query point itself should be in the result.
         .into_iter()
         .map(|pd| pd.id)
         .filter(|&b| b != a)
         .take(k)
-        .collect::<Bitmap>();
-      correct += approx.and(&truth).cardinality();
+        .collect::<AHashSet<_>>();
+      correct += approx.intersection(&truth).count();
     }
     println!(
       "[Pairwise] Correct: {}/{} ({:.2}%)",
@@ -415,13 +419,13 @@ mod tests {
         OrderedFloat(metric(&query.view(), &points[id as usize].view()))
       })
       .take(k)
-      .collect::<Bitmap>();
+      .collect::<AHashSet<_>>();
     let approx = vamana
       .query(&query.view(), k)
       .into_iter()
       .map(|pd| pd.id)
-      .collect::<Bitmap>();
-    let correct = approx.and(&truth).cardinality();
+      .collect::<AHashSet<_>>();
+    let correct = approx.intersection(&truth).count();
     println!(
       "[Query] Correct: {}/{} ({:.2}%)",
       correct,
@@ -440,7 +444,14 @@ mod tests {
       .iter()
       .map(|&id| {
         let point = points[id as usize].clone();
-        let neighbors = vamana.adj_list[&id].iter().collect();
+        let neighbors = vamana
+          .ds
+          .adj_list
+          .get(&id)
+          .unwrap()
+          .iter()
+          .copied()
+          .collect();
         let knn = vamana
           .query(&point.view(), k)
           .into_iter()
@@ -486,17 +497,16 @@ mod tests {
     }
 
     let points = (0..n).map(|_| gen_vec()).collect_vec();
-    let id_to_point = zip(ids.clone(), points.clone()).collect::<AHashMap<_, _>>();
+    let dataset = zip(ids.clone(), points.clone()).collect_vec();
     println!("Generated points");
 
-    let mut vamana = Vamana::new(id_to_point, metric, VamanaParams {
+    let vamana = InMemoryVamana::init(dataset, metric, VamanaParams {
       beam_width,
       degree_bound: r,
       distance_threshold: 1.1,
+      insert_batch_size: 64,
       medoid_sample_size: 1000,
     });
-    println!("Initialised");
-    vamana.index();
     println!("Indexed");
 
     // First, test ANN of every point.
@@ -509,15 +519,15 @@ mod tests {
         .filter(|&b| b != a)
         .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b as usize].view())))
         .take(k)
-        .collect::<Bitmap>();
+        .collect::<AHashSet<_>>();
       let approx = vamana
         .query(&a_pt.view(), k + 1) // +1 because the query point itself should be in the result.
         .into_iter()
         .map(|pd| pd.id)
         .filter(|&b| b != a)
         .take(k)
-        .collect::<Bitmap>();
-      correct += approx.and(&truth).cardinality();
+        .collect::<AHashSet<_>>();
+      correct += approx.intersection(&truth).count();
     }
     println!(
       "[Pairwise] Correct: {}/{} ({:.2}%)",
@@ -535,13 +545,13 @@ mod tests {
         OrderedFloat(metric(&query.view(), &points[id as usize].view()))
       })
       .take(k)
-      .collect::<Bitmap>();
+      .collect::<AHashSet<_>>();
     let approx = vamana
       .query(&query.view(), k)
       .into_iter()
       .map(|pd| pd.id)
-      .collect::<Bitmap>();
-    let correct = approx.and(&truth).cardinality();
+      .collect::<AHashSet<_>>();
+    let correct = approx.intersection(&truth).count();
     println!(
       "[Query] Correct: {}/{} ({:.2}%)",
       correct,

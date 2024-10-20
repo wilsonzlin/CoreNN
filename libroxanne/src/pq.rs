@@ -76,7 +76,7 @@ impl<T: linfa::Float> ProductQuantizer<T> {
 #[cfg(test)]
 mod tests {
   use super::ProductQuantizer;
-  use croaring::Bitmap;
+  use ahash::AHashSet;
   use itertools::Itertools;
   use ndarray::Array;
   use ndarray::Array2;
@@ -125,7 +125,7 @@ mod tests {
       .fold(T::zero(), |acc, x| acc + x)
   }
 
-  fn top_k_per_row(matrix: &Array2<f32>, k: usize) -> Vec<Bitmap> {
+  fn top_k_per_row(matrix: &Array2<f32>, k: usize) -> Vec<AHashSet<usize>> {
     matrix
       .axis_iter(Axis(0))
       .map(|row| {
@@ -135,7 +135,7 @@ mod tests {
           .sorted_by_key(|(_, &x)| OrderedFloat(x))
           .take(k)
           .map(|(i, _)| i.try_into().unwrap())
-          .collect::<Bitmap>()
+          .collect::<AHashSet<_>>()
       })
       .collect()
   }
@@ -158,7 +158,7 @@ mod tests {
     let dists_pq = pairwise_euclidean_distance(&pq.decode(&mat_pq));
     let mut correct = 0;
     for (top, top_pq) in zip(top_k_per_row(&dists, k), top_k_per_row(&dists_pq, k)) {
-      correct += top.and_cardinality(&top_pq);
+      correct += top.intersection(&top_pq).count();
     }
     println!(
       "[PQ] Correct: {}/{} ({:.2}%)",
