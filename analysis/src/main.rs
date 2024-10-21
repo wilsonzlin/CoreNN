@@ -2,6 +2,7 @@ use ahash::AHashSet;
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use clap::Parser;
+use libroxanne::common::metric_euclidean;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::VamanaParams;
 use ndarray::Array1;
@@ -43,6 +44,9 @@ struct Args {
 
   #[arg(long, default_value_t = 64)]
   insert_batch_size: usize,
+
+  #[arg(long, default_value_t = 1.33)]
+  search_list_cap_mul: f64,
 }
 
 fn read_vectors<T: Copy + Default + Send, Reader: Fn(&[u8], &mut [T]) + Sync>(
@@ -83,21 +87,16 @@ fn main() {
   let qn = qs.len();
   assert_eq!(knns.len(), qn);
 
-  fn euclidian(a: &ArrayView1<f32>, b: &ArrayView1<f32>) -> f64 {
-    let diff = a.mapv(|x| x as f64) - b.mapv(|x| x as f64);
-    (&diff * &diff).sum().sqrt()
-  }
-
   let params = VamanaParams {
     beam_width: args.beam_width,
     degree_bound: (vecs.len() as f64).ln() as usize,
     distance_threshold: args.distance_threshold,
     insert_batch_size: args.insert_batch_size,
     medoid_sample_size: 10_000,
-    search_list_cap: (args.k as f64 * 1.33) as usize,
+    search_list_cap: (args.k as f64 * args.search_list_cap_mul) as usize,
   };
 
-  let graph = InMemoryVamana::init(vecs, euclidian, params);
+  let graph = InMemoryVamana::init(vecs, metric_euclidean, params);
 
   let correct: usize = qs
     .into_par_iter()

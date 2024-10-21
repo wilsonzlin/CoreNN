@@ -1,4 +1,4 @@
-use num_traits::Num;
+use ndarray_linalg::Scalar;
 use std::mem::size_of;
 
 pub mod common;
@@ -16,7 +16,7 @@ pub struct RoxanneDbParams {
 impl RoxanneDbParams {
   // memlimit: how much memory (in bytes) to allow the DB to use for indexing, and when the indexed DB is loaded in memory.
   // n: the maximum number of vectors this DB will ever have.
-  pub fn recommended<DType: Num>(memlimit: usize, n: usize, dims: usize) -> Self {
+  pub fn recommended<DType: Scalar>(memlimit: usize, n: usize, dims: usize) -> Self {
     let n_per_shard = memlimit / (dims * size_of::<DType>());
     Self {
       n_per_shard,

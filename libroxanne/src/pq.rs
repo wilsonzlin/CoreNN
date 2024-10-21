@@ -76,15 +76,14 @@ impl<T: linfa::Float> ProductQuantizer<T> {
 #[cfg(test)]
 mod tests {
   use super::ProductQuantizer;
+  use crate::common::metric_euclidean;
   use ahash::AHashSet;
   use itertools::Itertools;
   use ndarray::Array;
   use ndarray::Array2;
   use ndarray::ArrayView1;
   use ndarray::Axis;
-  use num_traits::Float;
-  use num_traits::One;
-  use num_traits::Zero;
+  use ndarray_linalg::Scalar;
   use ordered_float::OrderedFloat;
   use rand::distributions::Uniform;
   use rand::prelude::Distribution;
@@ -93,36 +92,23 @@ mod tests {
   use std::ops::AddAssign;
   use std::ops::Sub;
 
-  fn pairwise_euclidean_distance<T>(matrix: &Array2<T>) -> Array2<T>
-  where
-    T: Float + Zero + One + Sub<Output = T> + AddAssign + std::fmt::Debug,
-  {
+  fn pairwise_euclidean_distance(matrix: &Array2<f32>) -> Array2<f32> {
     let n = matrix.nrows();
     let mut distances = Array2::zeros((n, n));
 
     // Compute squared Euclidean distances
     for i in 0..n {
       for j in i + 1..n {
-        let squared_dist = squared_euclidean_distance(matrix.row(i), matrix.row(j));
+        let squared_dist = metric_euclidean(&matrix.row(i), &matrix.row(j)) as f32;
         distances[[i, j]] = squared_dist;
         distances[[j, i]] = squared_dist; // Distance matrix is symmetric
       }
     }
 
     // Take square root to get Euclidean distances
-    distances.mapv_inplace(T::sqrt);
+    distances.mapv_inplace(|x| x.sqrt());
 
     distances
-  }
-
-  fn squared_euclidean_distance<T>(a: ArrayView1<T>, b: ArrayView1<T>) -> T
-  where
-    T: Float + Zero + AddAssign,
-  {
-    a.iter()
-      .zip(b.iter())
-      .map(|(&x, &y)| (x - y) * (x - y))
-      .fold(T::zero(), |acc, x| acc + x)
   }
 
   fn top_k_per_row(matrix: &Array2<f32>, k: usize) -> Vec<AHashSet<usize>> {
@@ -146,12 +132,9 @@ mod tests {
     let dist = Uniform::new(-10.0f32, 10.0f32);
     let n = 1000;
     let mat = Array::from_shape_fn((n, 128), |_| dist.sample(&mut rng));
-    println!("Generated {:?}", mat.shape());
 
     let pq = ProductQuantizer::train(mat.clone(), 64);
-    println!("Trained");
     let mat_pq = pq.encode(mat.clone());
-    println!("Quantized to {:?}", mat_pq.shape());
 
     let k = 10;
     let dists = pairwise_euclidean_distance(&mat);

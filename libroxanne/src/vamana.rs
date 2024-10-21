@@ -1,7 +1,6 @@
 use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PointDist;
-use crate::queue::BoundedDistinctQueue;
 use ahash::AHashSet;
 use dashmap::DashMap;
 use dashmap::DashSet;
@@ -132,7 +131,6 @@ pub struct Vamana<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
   ds: DS,
   medoid: Id,
   metric: Metric<T>,
-  mutex: parking_lot::Mutex<()>,
   params: VamanaParams,
 }
 
@@ -142,7 +140,6 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       ds,
       medoid,
       metric,
-      mutex: parking_lot::Mutex::new(()),
       params,
     }
   }
@@ -171,7 +168,9 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       dist: (self.metric)(&self.ds.get_point(start).unwrap().view(), query),
     });
     while !l_unvisited.is_empty() {
-      let mut new_visited = (0..self.params.beam_width).filter_map(|_| l_unvisited.pop_front()).collect::<VecDeque<_>>();
+      let mut new_visited = (0..self.params.beam_width)
+        .filter_map(|_| l_unvisited.pop_front())
+        .collect::<VecDeque<_>>();
       let neighbors = DashSet::new();
       new_visited.par_iter().for_each(|p_star| {
         for j in self.ds.get_out_neighbors(p_star.id).unwrap_or_default() {
@@ -181,23 +180,30 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       // Move to visited section.
       all_visited.extend(new_visited.iter().map(|e| e.id));
       l_visited.append(&mut new_visited);
-      l_visited.make_contiguous().sort_unstable_by_key(|s| OrderedFloat(s.dist));
+      l_visited
+        .make_contiguous()
+        .sort_unstable_by_key(|s| OrderedFloat(s.dist));
 
-      let mut new_unvisited = neighbors.into_par_iter().filter_map(|neighbor| {
-        // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
-        if all_visited.contains(&neighbor) {
-          return None;
-        };
-        let Some(neighbor_point) = self.ds.get_point(neighbor) else {
-          return None;
-        };
-        Some(PointDist {
-          id: neighbor,
-          dist: (self.metric)(&neighbor_point.view(), query),
+      let mut new_unvisited = neighbors
+        .into_par_iter()
+        .filter_map(|neighbor| {
+          // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
+          if all_visited.contains(&neighbor) {
+            return None;
+          };
+          let Some(neighbor_point) = self.ds.get_point(neighbor) else {
+            return None;
+          };
+          Some(PointDist {
+            id: neighbor,
+            dist: (self.metric)(&neighbor_point.view(), query),
+          })
         })
-      }).collect::<VecDeque<_>>();
+        .collect::<VecDeque<_>>();
       l_unvisited.append(&mut new_unvisited);
-      l_unvisited.make_contiguous().sort_unstable_by_key(|s| OrderedFloat(s.dist));
+      l_unvisited
+        .make_contiguous()
+        .sort_unstable_by_key(|s| OrderedFloat(s.dist));
 
       while l_unvisited.len() + l_visited.len() > search_list_cap {
         let (Some(u), Some(v)) = (l_unvisited.back(), l_visited.back()) else {
@@ -385,13 +391,13 @@ mod tests {
     let dataset = zip(ids.clone(), points.clone()).collect_vec();
 
     let vamana = InMemoryVamana::init(dataset, metric, VamanaParams {
+      beam_width: 1,
       degree_bound: r,
       distance_threshold: 1.1,
       insert_batch_size: 64,
       medoid_sample_size: 10_000,
       search_list_cap,
     });
-    println!("Indexed");
 
     // First, test ANN of every point.
     let mut correct = 0;
@@ -414,7 +420,7 @@ mod tests {
       correct += approx.intersection(&truth).count();
     }
     println!(
-      "[Pairwise] Correct: {}/{} ({:.2}%)",
+      "[2D Pairwise] Correct: {}/{} ({:.2}%)",
       correct,
       k * n as usize,
       correct as f64 / (k * n as usize) as f64 * 100.0
@@ -437,7 +443,7 @@ mod tests {
       .collect::<AHashSet<_>>();
     let correct = approx.intersection(&truth).count();
     println!(
-      "[Query] Correct: {}/{} ({:.2}%)",
+      "[2D Query] Correct: {}/{} ({:.2}%)",
       correct,
       k,
       correct as f64 / k as f64 * 100.0
@@ -446,14 +452,14 @@ mod tests {
     #[derive(Serialize)]
     struct DataNode {
       id: u32,
-      point: Array1<f32>,
+      point: Vec<f32>,
       neighbors: Vec<u32>,
       knn: Vec<u32>,
     }
     let nodes = ids
       .iter()
       .map(|&id| {
-        let point = points[id as usize].clone();
+        let point = &points[id as usize];
         let neighbors = vamana
           .ds
           .adj_list
@@ -469,7 +475,7 @@ mod tests {
           .collect();
         DataNode {
           id,
-          point,
+          point: point.to_vec(),
           neighbors,
           knn,
         }
@@ -508,16 +514,15 @@ mod tests {
 
     let points = (0..n).map(|_| gen_vec()).collect_vec();
     let dataset = zip(ids.clone(), points.clone()).collect_vec();
-    println!("Generated points");
 
     let vamana = InMemoryVamana::init(dataset, metric, VamanaParams {
+      beam_width: 1,
       degree_bound: r,
       distance_threshold: 1.1,
       insert_batch_size: 64,
       medoid_sample_size: 1000,
       search_list_cap,
     });
-    println!("Indexed");
 
     // First, test ANN of every point.
     let mut correct = 0;
@@ -540,7 +545,7 @@ mod tests {
       correct += approx.intersection(&truth).count();
     }
     println!(
-      "[Pairwise] Correct: {}/{} ({:.2}%)",
+      "[512D Pairwise] Correct: {}/{} ({:.2}%)",
       correct,
       k * n as usize,
       correct as f64 / (k * n as usize) as f64 * 100.0
@@ -563,7 +568,7 @@ mod tests {
       .collect::<AHashSet<_>>();
     let correct = approx.intersection(&truth).count();
     println!(
-      "[Query] Correct: {}/{} ({:.2}%)",
+      "[512D Query] Correct: {}/{} ({:.2}%)",
       correct,
       k,
       correct as f64 / k as f64 * 100.0

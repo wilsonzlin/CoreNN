@@ -12,7 +12,6 @@ linfa-clustering = { version = "0.7.0", features = ["serde"] }
 linfa-nn = "0.7.0"
 ndarray = "0.15" # linfa uses 0.15.
 ndarray-linalg = "0.15.0" # linfa uses 0.15.
-num-traits = "0.2.19"
 ordered-float = "4.3.0"
 parking_lot = "0.12.3"
 rand = "0.8"
