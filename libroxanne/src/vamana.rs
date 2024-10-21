@@ -4,6 +4,7 @@ use crate::common::PointDist;
 use crate::queue::BoundedDistinctQueue;
 use ahash::AHashSet;
 use dashmap::DashMap;
+use dashmap::DashSet;
 use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::ArrayView1;
@@ -123,6 +124,8 @@ pub struct VamanaParams {
   // Corresponds to `R` in the DiskANN paper. The paper recommends at least log(N), where N is the number of points.
   pub degree_bound: usize,
   pub insert_batch_size: usize,
+  // Corresponds to W in the DiskANN paper, section 3.3 (DiskANN Beam Search).
+  pub beam_width: usize,
 }
 
 pub struct Vamana<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
@@ -146,13 +149,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
 
   // DiskANN paper, Algorithm 1: GreedySearch.
   // Returns a pair: (closest points, visited node IDs).
-  fn greedy_search(
-    &self,
-    // This corresponds to `x_q` in the paper.
-    query: &ArrayView1<T>,
-    k: usize,
-  ) -> (Vec<PointDist>, AHashSet<Id>) {
-    // This corresponds to `s` in the paper.
+  fn greedy_search(&self, query: &ArrayView1<T>, k: usize) -> (Vec<PointDist>, AHashSet<Id>) {
     let start = self.medoid;
     let search_list_cap = self.params.search_list_cap;
     assert!(
@@ -166,33 +163,50 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     // We need both to reach up to `k` as in the worst case all `k` are in exactly one of them.
     // We also need `all_visited` as `l_visited` truncates to `k`, but we also want all visited points in the end.
     // L = l_visited + l_unvisited
-    // TODO This is incorrect, as the stopping condition is when the combined L size equals `beam_width`, not just L\V. This means we may be doing way more traversals and stopping way later than necessary.
-    let mut l_unvisited = BoundedDistinctQueue::new(search_list_cap); // L \ V
-    let mut l_visited = BoundedDistinctQueue::new(search_list_cap); // V
+    let mut l_unvisited = VecDeque::<PointDist>::new(); // L \ V
+    let mut l_visited = VecDeque::<PointDist>::new(); // V
     let mut all_visited = AHashSet::new();
-    l_unvisited.push(PointDist {
+    l_unvisited.push_back(PointDist {
       id: start,
       dist: (self.metric)(&self.ds.get_point(start).unwrap().view(), query),
     });
-    while let Some(p_star) = l_unvisited.pop() {
+    while !l_unvisited.is_empty() {
+      let mut new_visited = (0..self.params.beam_width).filter_map(|_| l_unvisited.pop_front()).collect::<VecDeque<_>>();
+      let neighbors = DashSet::new();
+      new_visited.par_iter().for_each(|p_star| {
+        for j in self.ds.get_out_neighbors(p_star.id).unwrap_or_default() {
+          neighbors.insert(j);
+        }
+      });
       // Move to visited section.
-      l_visited.push(p_star);
-      all_visited.insert(p_star.id);
-      for neighbor in self
-        .ds
-        .get_out_neighbors(p_star.id)
-        .unwrap_or_default()
-        .into_iter()
-      {
+      all_visited.extend(new_visited.iter().map(|e| e.id));
+      l_visited.append(&mut new_visited);
+      l_visited.make_contiguous().sort_unstable_by_key(|s| OrderedFloat(s.dist));
+
+      let mut new_unvisited = neighbors.into_par_iter().filter_map(|neighbor| {
         // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
-        if !all_visited.contains(&neighbor) {
-          let Some(neighbor_point) = self.ds.get_point(neighbor) else {
-            continue;
-          };
-          l_unvisited.push(PointDist {
-            id: neighbor,
-            dist: (self.metric)(&neighbor_point.view(), query),
-          });
+        if all_visited.contains(&neighbor) {
+          return None;
+        };
+        let Some(neighbor_point) = self.ds.get_point(neighbor) else {
+          return None;
+        };
+        Some(PointDist {
+          id: neighbor,
+          dist: (self.metric)(&neighbor_point.view(), query),
+        })
+      }).collect::<VecDeque<_>>();
+      l_unvisited.append(&mut new_unvisited);
+      l_unvisited.make_contiguous().sort_unstable_by_key(|s| OrderedFloat(s.dist));
+
+      while l_unvisited.len() + l_visited.len() > search_list_cap {
+        let (Some(u), Some(v)) = (l_unvisited.back(), l_visited.back()) else {
+          break;
+        };
+        if u.dist >= v.dist {
+          l_unvisited.pop_back();
+        } else {
+          l_visited.pop_back();
         }
       }
     }
@@ -200,7 +214,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     // Find the k closest points from both l_visited + l_unvisited (= L).
     let mut closest = Vec::new();
     while closest.len() < k {
-      match (l_visited.pop(), l_unvisited.pop()) {
+      match (l_visited.pop_front(), l_unvisited.pop_front()) {
         (None, None) => break,
         (Some(v), None) | (None, Some(v)) => closest.push(v),
         (Some(a), Some(b)) => {
@@ -249,7 +263,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         break;
       }
       candidates.retain(|s| {
-        let dist_to_p_star = (self.metric)(&s.1.view(), &p_star_point.view());
+        let dist_to_p_star = (self.metric)(&p_star_point.view(), &s.1.view());
         dist_thresh * dist_to_p_star > s.0.dist
       });
     }

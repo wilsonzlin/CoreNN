@@ -34,6 +34,15 @@ struct Args {
 
   #[arg(long)]
   k: usize,
+
+  #[arg(long, default_value_t = 1)]
+  beam_width: usize,
+
+  #[arg(long, default_value_t = 1.1)]
+  distance_threshold: f64,
+
+  #[arg(long, default_value_t = 64)]
+  insert_batch_size: usize,
 }
 
 fn read_vectors<T: Copy + Default + Send, Reader: Fn(&[u8], &mut [T]) + Sync>(
@@ -80,9 +89,10 @@ fn main() {
   }
 
   let params = VamanaParams {
+    beam_width: args.beam_width,
     degree_bound: (vecs.len() as f64).ln() as usize,
-    distance_threshold: 1.1,
-    insert_batch_size: 64,
+    distance_threshold: args.distance_threshold,
+    insert_batch_size: args.insert_batch_size,
     medoid_sample_size: 10_000,
     search_list_cap: (args.k as f64 * 1.33) as usize,
   };
