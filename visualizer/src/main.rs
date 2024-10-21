@@ -36,7 +36,7 @@ fn main() {
 
   let events: Arc<parking_lot::Mutex<Vec<VamanaInstrumentationEvent<f32>>>> = Default::default();
 
-  let vamana = InMemoryVamana::init(
+  let vamana = InMemoryVamana::build_index(
     dataset,
     metric,
     VamanaParams {

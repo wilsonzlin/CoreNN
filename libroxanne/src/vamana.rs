@@ -16,6 +16,7 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
+use serde::Deserialize;
 use serde::Serialize;
 use std::collections::VecDeque;
 
@@ -90,7 +91,7 @@ impl<T: Scalar + Send + Sync> VamanaDatastore<T> for InMemoryVamana<T> {
 }
 
 impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
-  pub fn init(
+  pub fn build_index(
     dataset: Vec<(Id, Array1<T>)>,
     metric: Metric<T>,
     params: VamanaParams,
@@ -154,7 +155,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
   }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VamanaParams {
   // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
   pub medoid_sample_size: usize,
@@ -200,6 +201,10 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
 
   pub fn medoid(&self) -> Id {
     self.medoid
+  }
+
+  pub fn datastore(&self) -> &DS {
+    &self.ds
   }
 
   // DiskANN paper, Algorithm 1: GreedySearch.
@@ -471,7 +476,7 @@ mod tests {
     let points = (0..n).map(|_| gen_vec()).collect_vec();
     let dataset = zip(ids.clone(), points.clone()).collect_vec();
 
-    let vamana = InMemoryVamana::init(
+    let vamana = InMemoryVamana::build_index(
       dataset,
       metric,
       VamanaParams {

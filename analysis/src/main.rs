@@ -96,7 +96,7 @@ fn main() {
   };
   println!("Params: {params:?}");
 
-  let graph = InMemoryVamana::init(vecs, metric_euclidean, params, None);
+  let graph = InMemoryVamana::build_index(vecs, metric_euclidean, params, None);
   println!("Indexed");
 
   let correct: usize = qs
