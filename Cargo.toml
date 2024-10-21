@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "analysis",
   "libroxanne",
+  "visualizer",
 ]
 
 [profile.release]

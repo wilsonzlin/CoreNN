@@ -6,7 +6,6 @@ use libroxanne::common::metric_euclidean;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::VamanaParams;
 use ndarray::Array1;
-use ndarray::ArrayView1;
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
@@ -96,7 +95,7 @@ fn main() {
     search_list_cap: (args.k as f64 * args.search_list_cap_mul) as usize,
   };
 
-  let graph = InMemoryVamana::init(vecs, metric_euclidean, params);
+  let graph = InMemoryVamana::init(vecs, metric_euclidean, params, None);
 
   let correct: usize = qs
     .into_par_iter()

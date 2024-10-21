@@ -81,16 +81,12 @@ mod tests {
   use itertools::Itertools;
   use ndarray::Array;
   use ndarray::Array2;
-  use ndarray::ArrayView1;
   use ndarray::Axis;
-  use ndarray_linalg::Scalar;
   use ordered_float::OrderedFloat;
   use rand::distributions::Uniform;
   use rand::prelude::Distribution;
   use rand::thread_rng;
   use std::iter::zip;
-  use std::ops::AddAssign;
-  use std::ops::Sub;
 
   fn pairwise_euclidean_distance(matrix: &Array2<f32>) -> Array2<f32> {
     let n = matrix.nrows();

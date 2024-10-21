@@ -20,4 +20,3 @@ serde = { version = "1.0.210", features = ["derive"] }
 
 [dev-dependencies]
 ndarray-rand = "0.14.0" # Version 0.15 depends on ndarray 0.16 which we cannot use (see above).
-serde_json = "1.0.128"

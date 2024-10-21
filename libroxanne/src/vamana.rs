@@ -16,7 +16,39 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
+use serde::Serialize;
 use std::collections::VecDeque;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "$type")]
+pub enum VamanaInstrumentationEvent<T: Scalar> {
+  OptimizeBatchBegin {
+    batch_ids: Vec<Id>,
+  },
+  OptimizeBatchEnd {},
+  GreedySearchBegin {
+    query: Array1<T>,
+  },
+  GreedySearchIteration {
+    query: Array1<T>,
+    expanded: Vec<Id>,
+    neighbors_of_expanded: Vec<Id>,
+    new_unvisited: Vec<Id>,
+    final_search_list_visited: Vec<Id>,
+    final_search_list_unvisited: Vec<Id>,
+  },
+  RobustPruneBegin {
+    point: Array1<T>,
+    candidates: Vec<Id>,
+  },
+  RobustPruneIteration {
+    point: Array1<T>,
+    p_star: Id,
+    final_candidates: Option<Vec<Id>>, // None on final iteration.
+  },
+}
+
+pub type VamanaInstrumentation<T> = Box<dyn Fn(VamanaInstrumentationEvent<T>) + Send + Sync>;
 
 // Return owned values:
 // - We use DashMap for in-memory, so we can't return a ref while holding a lock in the map entry.
@@ -57,6 +89,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     dataset: Vec<(Id, Array1<T>)>,
     metric: Metric<T>,
     params: VamanaParams,
+    instrumentation: Option<VamanaInstrumentation<T>>,
   ) -> Vamana<T, Self> {
     // Initialise to R-regular graph with random edges.
     let adj_list = DashMap::new();
@@ -96,7 +129,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     let ids = dataset.iter().map(|e| e.0).collect_vec();
     let id_to_point = dataset.into_iter().collect();
 
-    let graph = Vamana::new(
+    let mut graph = Vamana::new(
       Self {
         adj_list,
         id_to_point,
@@ -105,6 +138,10 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
       metric,
       params,
     );
+
+    if let Some(instrumentation) = instrumentation {
+      graph.set_instrumentation(instrumentation);
+    };
 
     graph.optimize(&ids);
 
@@ -132,6 +169,7 @@ pub struct Vamana<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
   medoid: Id,
   metric: Metric<T>,
   params: VamanaParams,
+  instrumentation: Option<VamanaInstrumentation<T>>,
 }
 
 impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
@@ -141,7 +179,22 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       medoid,
       metric,
       params,
+      instrumentation: None,
     }
+  }
+
+  pub fn set_instrumentation(&mut self, instrumentation: VamanaInstrumentation<T>) {
+    self.instrumentation = Some(instrumentation);
+  }
+
+  fn inst(&self, evt_fn: impl FnOnce() -> VamanaInstrumentationEvent<T>) {
+    if let Some(instrumentation) = &self.instrumentation {
+      instrumentation(evt_fn());
+    }
+  }
+
+  pub fn medoid(&self) -> Id {
+    self.medoid
   }
 
   // DiskANN paper, Algorithm 1: GreedySearch.
@@ -160,6 +213,8 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     // We need both to reach up to `k` as in the worst case all `k` are in exactly one of them.
     // We also need `all_visited` as `l_visited` truncates to `k`, but we also want all visited points in the end.
     // L = l_visited + l_unvisited
+    // `l_unvisited_set` is for members currently in l_unvisited, to avoid pushing duplicates. (NOTE: This is *not* the same as `all_visited`.) We don't need one for `l_visited` because we only push popped elements from `l_unvisited`, which we guarantee are unique (as previously mentioned).
+    let mut l_unvisited_set = AHashSet::new();
     let mut l_unvisited = VecDeque::<PointDist>::new(); // L \ V
     let mut l_visited = VecDeque::<PointDist>::new(); // V
     let mut all_visited = AHashSet::new();
@@ -168,9 +223,9 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       dist: (self.metric)(&self.ds.get_point(start).unwrap().view(), query),
     });
     while !l_unvisited.is_empty() {
-      let mut new_visited = (0..self.params.beam_width)
+      let new_visited = (0..self.params.beam_width)
         .filter_map(|_| l_unvisited.pop_front())
-        .collect::<VecDeque<_>>();
+        .collect::<Vec<_>>();
       let neighbors = DashSet::new();
       new_visited.par_iter().for_each(|p_star| {
         for j in self.ds.get_out_neighbors(p_star.id).unwrap_or_default() {
@@ -179,16 +234,20 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       });
       // Move to visited section.
       all_visited.extend(new_visited.iter().map(|e| e.id));
-      l_visited.append(&mut new_visited);
+      l_visited.extend(&new_visited);
       l_visited
         .make_contiguous()
         .sort_unstable_by_key(|s| OrderedFloat(s.dist));
 
-      let mut new_unvisited = neighbors
-        .into_par_iter()
+      let new_unvisited = neighbors
+        .par_iter()
         .filter_map(|neighbor| {
+          let neighbor = *neighbor;
           // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
           if all_visited.contains(&neighbor) {
+            return None;
+          };
+          if l_unvisited_set.contains(&neighbor) {
             return None;
           };
           let Some(neighbor_point) = self.ds.get_point(neighbor) else {
@@ -200,7 +259,8 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
           })
         })
         .collect::<VecDeque<_>>();
-      l_unvisited.append(&mut new_unvisited);
+      l_unvisited_set.extend(new_unvisited.iter().map(|e| e.id));
+      l_unvisited.extend(&new_unvisited);
       l_unvisited
         .make_contiguous()
         .sort_unstable_by_key(|s| OrderedFloat(s.dist));
@@ -215,6 +275,15 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
           l_visited.pop_back();
         }
       }
+
+      self.inst(|| VamanaInstrumentationEvent::GreedySearchIteration {
+        query: query.to_owned(),
+        expanded: new_visited.iter().map(|e| e.id).collect(),
+        neighbors_of_expanded: neighbors.into_iter().collect(),
+        new_unvisited: new_unvisited.iter().map(|e| e.id).collect(),
+        final_search_list_visited: l_visited.iter().map(|e| e.id).collect(),
+        final_search_list_unvisited: l_unvisited.iter().map(|e| e.id).collect(),
+      });
     }
 
     // Find the k closest points from both l_visited + l_unvisited (= L).
@@ -248,6 +317,11 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     let dist_thresh = self.params.distance_threshold;
     let degree_bound = self.params.degree_bound;
 
+    self.inst(|| VamanaInstrumentationEvent::RobustPruneBegin {
+      point: point.to_owned(),
+      candidates: candidate_ids.iter().copied().collect(),
+    });
+
     // TODO Why does `.into_par_iter()` instead of `.into_iter().par_bridge()` not work?
     let mut candidates = candidate_ids
       .into_iter()
@@ -266,11 +340,21 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     while let Some((PointDist { id: p_star, .. }, p_star_point)) = candidates.pop_front() {
       assert!(new_neighbors.insert(p_star));
       if new_neighbors.len() == degree_bound {
+        self.inst(|| VamanaInstrumentationEvent::RobustPruneIteration {
+          point: point.to_owned(),
+          p_star,
+          final_candidates: None,
+        });
         break;
       }
       candidates.retain(|s| {
         let dist_to_p_star = (self.metric)(&p_star_point.view(), &s.1.view());
         dist_thresh * dist_to_p_star > s.0.dist
+      });
+      self.inst(|| VamanaInstrumentationEvent::RobustPruneIteration {
+        point: point.to_owned(),
+        p_star,
+        final_candidates: Some(candidates.iter().map(|s| s.0.id).collect()),
       });
     }
     new_neighbors
@@ -287,6 +371,10 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         additional_edges: AHashSet<Id>,
       }
       let updates = DashMap::<Id, Update>::new();
+
+      self.inst(|| VamanaInstrumentationEvent::OptimizeBatchBegin {
+        batch_ids: batch.to_vec(),
+      });
 
       batch.into_par_iter().for_each(|&id| {
         let point = self.ds.get_point(id).unwrap();
@@ -312,26 +400,19 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       });
 
       // Update dirty nodes in this batch.
-      updates.into_par_iter().for_each(
-        |(
-          id,
-          Update {
-            replacement_base,
-            additional_edges,
-          },
-        )| {
-          let mut new_neighbors =
-            replacement_base.unwrap_or_else(|| self.ds.get_out_neighbors(id).unwrap());
-          for j in additional_edges {
-            new_neighbors.insert(j);
-          }
-          if new_neighbors.len() > self.params.degree_bound {
-            let point = self.ds.get_point(id).unwrap();
-            new_neighbors = self.compute_robust_pruned(&point.view(), new_neighbors);
-          };
-          self.ds.set_out_neighbors(id, new_neighbors);
-        },
-      );
+      updates.into_par_iter().for_each(|(id, u)| {
+        let mut new_neighbors = u
+          .replacement_base
+          .unwrap_or_else(|| self.ds.get_out_neighbors(id).unwrap());
+        for j in u.additional_edges {
+          new_neighbors.insert(j);
+        }
+        if new_neighbors.len() > self.params.degree_bound {
+          let point = self.ds.get_point(id).unwrap();
+          new_neighbors = self.compute_robust_pruned(&point.view(), new_neighbors);
+        };
+        self.ds.set_out_neighbors(id, new_neighbors);
+      });
     }
   }
 
@@ -356,147 +437,12 @@ mod tests {
   use crate::vamana::InMemoryVamana;
   use ahash::AHashSet;
   use itertools::Itertools;
-  use ndarray::array;
   use ndarray::Array;
   use ndarray::Array1;
   use ndarray_rand::RandomExt;
   use ordered_float::OrderedFloat;
   use rand::distributions::Uniform;
-  use rand::thread_rng;
-  use rand::Rng;
-  use serde::Serialize;
-  use std::fs::File;
   use std::iter::zip;
-
-  #[test]
-  fn test_vamana_2d() {
-    let mut rng = thread_rng();
-    let metric = metric_euclidean;
-    // Let's plot points such that it fits comfortably spread across a widescreen display, useful for when we visualise this.
-    let x_range = 0.0f32..1200.0f32;
-    let y_range = 0.0f32..700.0f32;
-    let n = 100u32;
-    let r = 10;
-    let ids = (0..n).collect_vec();
-    let k = 10;
-    let search_list_cap = k * 2;
-    let points = (0..n)
-      .map(|_| {
-        array![
-          rng.gen_range(x_range.clone()),
-          rng.gen_range(y_range.clone()),
-        ]
-      })
-      .collect_vec();
-    let dataset = zip(ids.clone(), points.clone()).collect_vec();
-
-    let vamana = InMemoryVamana::init(dataset, metric, VamanaParams {
-      beam_width: 1,
-      degree_bound: r,
-      distance_threshold: 1.1,
-      insert_batch_size: 64,
-      medoid_sample_size: 10_000,
-      search_list_cap,
-    });
-
-    // First, test ANN of every point.
-    let mut correct = 0;
-    for a in ids.iter().cloned() {
-      let a_pt = &points[a as usize];
-      let truth = ids
-        .iter()
-        .cloned()
-        .filter(|&b| b != a)
-        .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b as usize].view())))
-        .take(k)
-        .collect::<AHashSet<_>>();
-      let approx = vamana
-        .query(&a_pt.view(), k + 1) // +1 because the query point itself should be in the result.
-        .into_iter()
-        .map(|pd| pd.id)
-        .filter(|&b| b != a)
-        .take(k)
-        .collect::<AHashSet<_>>();
-      correct += approx.intersection(&truth).count();
-    }
-    println!(
-      "[2D Pairwise] Correct: {}/{} ({:.2}%)",
-      correct,
-      k * n as usize,
-      correct as f64 / (k * n as usize) as f64 * 100.0
-    );
-
-    // Second, test ANN of a query.
-    let query = array![rng.gen_range(x_range), rng.gen_range(y_range)];
-    let truth = ids
-      .iter()
-      .cloned()
-      .sorted_unstable_by_key(|&id| {
-        OrderedFloat(metric(&query.view(), &points[id as usize].view()))
-      })
-      .take(k)
-      .collect::<AHashSet<_>>();
-    let approx = vamana
-      .query(&query.view(), k)
-      .into_iter()
-      .map(|pd| pd.id)
-      .collect::<AHashSet<_>>();
-    let correct = approx.intersection(&truth).count();
-    println!(
-      "[2D Query] Correct: {}/{} ({:.2}%)",
-      correct,
-      k,
-      correct as f64 / k as f64 * 100.0
-    );
-
-    #[derive(Serialize)]
-    struct DataNode {
-      id: u32,
-      point: Vec<f32>,
-      neighbors: Vec<u32>,
-      knn: Vec<u32>,
-    }
-    let nodes = ids
-      .iter()
-      .map(|&id| {
-        let point = &points[id as usize];
-        let neighbors = vamana
-          .ds
-          .adj_list
-          .get(&id)
-          .unwrap()
-          .iter()
-          .copied()
-          .collect();
-        let knn = vamana
-          .query(&point.view(), k)
-          .into_iter()
-          .map(|pd| pd.id)
-          .collect();
-        DataNode {
-          id,
-          point: point.to_vec(),
-          neighbors,
-          knn,
-        }
-      })
-      .collect::<Vec<_>>();
-
-    #[derive(Serialize)]
-    struct Data {
-      medoid: u32,
-      nodes: Vec<DataNode>,
-    }
-
-    serde_json::to_writer_pretty(
-      File::create("../target/vamana-test-dump.json").unwrap(),
-      &Data {
-        medoid: vamana.medoid,
-        nodes,
-      },
-    )
-    .unwrap();
-  }
 
   #[test]
   fn test_vamana_512d() {
@@ -515,14 +461,19 @@ mod tests {
     let points = (0..n).map(|_| gen_vec()).collect_vec();
     let dataset = zip(ids.clone(), points.clone()).collect_vec();
 
-    let vamana = InMemoryVamana::init(dataset, metric, VamanaParams {
-      beam_width: 1,
-      degree_bound: r,
-      distance_threshold: 1.1,
-      insert_batch_size: 64,
-      medoid_sample_size: 1000,
-      search_list_cap,
-    });
+    let vamana = InMemoryVamana::init(
+      dataset,
+      metric,
+      VamanaParams {
+        beam_width: 1,
+        degree_bound: r,
+        distance_threshold: 1.1,
+        insert_batch_size: 64,
+        medoid_sample_size: 1000,
+        search_list_cap,
+      },
+      None,
+    );
 
     // First, test ANN of every point.
     let mut correct = 0;
