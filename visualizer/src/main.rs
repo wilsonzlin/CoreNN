@@ -1,4 +1,4 @@
-use ahash::AHashSet;
+use ahash::HashSet;
 use itertools::Itertools;
 use libroxanne::common::metric_euclidean;
 use libroxanne::vamana::InMemoryVamana;
@@ -63,14 +63,14 @@ fn main() {
       .filter(|&b| b != a)
       .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b as usize].view())))
       .take(k)
-      .collect::<AHashSet<_>>();
+      .collect::<HashSet<_>>();
     let approx = vamana
       .query(&a_pt.view(), k + 1) // +1 because the query point itself should be in the result.
       .into_iter()
       .map(|pd| pd.id)
       .filter(|&b| b != a)
       .take(k)
-      .collect::<AHashSet<_>>();
+      .collect::<HashSet<_>>();
     correct += approx.intersection(&truth).count();
   }
   println!(

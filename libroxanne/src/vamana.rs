@@ -1,7 +1,8 @@
 use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PointDist;
-use ahash::AHashSet;
+use ahash::HashSet;
+use ahash::HashSetExt;
 use dashmap::DashMap;
 use dashmap::DashSet;
 use itertools::Itertools;
@@ -14,7 +15,6 @@ use rand::thread_rng;
 use rand::Rng;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
-use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
@@ -56,18 +56,18 @@ pub type VamanaInstrumentation<T> = Box<dyn Fn(VamanaInstrumentationEvent<T>) + 
 pub trait VamanaDatastore<T: Scalar + Send + Sync>: Sync {
   fn get_point(&self, id: Id) -> Option<Array1<T>>;
   fn set_point(&self, id: Id, point: Array1<T>);
-  fn get_out_neighbors(&self, id: Id) -> Option<AHashSet<Id>>;
-  fn set_out_neighbors(&self, id: Id, neighbors: AHashSet<Id>);
+  fn get_out_neighbors(&self, id: Id) -> Option<HashSet<Id>>;
+  fn set_out_neighbors(&self, id: Id, neighbors: HashSet<Id>);
 }
 
 #[derive(Default)]
 pub struct InMemoryVamana<T: Scalar + Send + Sync> {
-  adj_list: DashMap<Id, AHashSet<Id>>,
+  adj_list: DashMap<Id, HashSet<Id>>,
   id_to_point: DashMap<Id, Array1<T>>,
 }
 
 impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
-  pub fn graph(&self) -> &DashMap<Id, AHashSet<Id>> {
+  pub fn graph(&self) -> &DashMap<Id, HashSet<Id>> {
     &self.adj_list
   }
 }
@@ -81,11 +81,11 @@ impl<T: Scalar + Send + Sync> VamanaDatastore<T> for InMemoryVamana<T> {
     self.id_to_point.insert(id, point);
   }
 
-  fn get_out_neighbors(&self, id: Id) -> Option<AHashSet<Id>> {
+  fn get_out_neighbors(&self, id: Id) -> Option<HashSet<Id>> {
     self.adj_list.get(&id).map(|e| e.clone())
   }
 
-  fn set_out_neighbors(&self, id: Id, neighbors: AHashSet<Id>) {
+  fn set_out_neighbors(&self, id: Id, neighbors: HashSet<Id>) {
     self.adj_list.insert(id, neighbors);
   }
 }
@@ -106,7 +106,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
         .map(|e| e.0)
         .filter(|oid| id != oid)
         .take(params.degree_bound)
-        .collect::<AHashSet<_>>();
+        .collect::<HashSet<_>>();
       adj_list.insert(*id, neighbors);
     });
 
@@ -209,7 +209,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
 
   // DiskANN paper, Algorithm 1: GreedySearch.
   // Returns a pair: (closest points, visited node IDs).
-  fn greedy_search(&self, query: &ArrayView1<T>, k: usize) -> (Vec<PointDist>, AHashSet<Id>) {
+  fn greedy_search(&self, query: &ArrayView1<T>, k: usize) -> (Vec<PointDist>, HashSet<Id>) {
     let start = self.medoid;
     let search_list_cap = self.params.search_list_cap;
     assert!(
@@ -224,10 +224,10 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     // We also need `all_visited` as `l_visited` truncates to `k`, but we also want all visited points in the end.
     // L = l_visited + l_unvisited
     // `l_unvisited_set` is for members currently in l_unvisited, to avoid pushing duplicates. (NOTE: This is *not* the same as `all_visited`.) We don't need one for `l_visited` because we only push popped elements from `l_unvisited`, which we guarantee are unique (as previously mentioned).
-    let mut l_unvisited_set = AHashSet::new();
+    let mut l_unvisited_set = HashSet::new();
     let mut l_unvisited = VecDeque::<PointDist>::new(); // L \ V
     let mut l_visited = VecDeque::<PointDist>::new(); // V
-    let mut all_visited = AHashSet::new();
+    let mut all_visited = HashSet::new();
     l_unvisited.push_back(PointDist {
       id: start,
       dist: (self.metric)(&self.ds.get_point(start).unwrap().view(), query),
@@ -322,8 +322,8 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   fn compute_robust_pruned(
     &self,
     point: &ArrayView1<T>,
-    candidate_ids: AHashSet<Id>,
-  ) -> AHashSet<Id> {
+    candidate_ids: HashSet<Id>,
+  ) -> HashSet<Id> {
     let dist_thresh = self.params.distance_threshold;
     let degree_bound = self.params.degree_bound;
 
@@ -332,10 +332,8 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       candidates: candidate_ids.iter().copied().collect(),
     });
 
-    // TODO Why does `.into_par_iter()` instead of `.into_iter().par_bridge()` not work?
     let mut candidates = candidate_ids
-      .into_iter()
-      .par_bridge()
+      .into_par_iter()
       .filter_map(|id| self.ds.get_point(id).map(|p| (id, p)))
       .map(|(id, other_point)| {
         let dist = (self.metric)(&other_point.view(), point);
@@ -345,7 +343,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     candidates.sort_unstable_by_key(|s| OrderedFloat(s.0.dist));
     let mut candidates = VecDeque::from(candidates);
 
-    let mut new_neighbors = AHashSet::new();
+    let mut new_neighbors = HashSet::new();
     // Even though the algorithm in the paper doesn't actually pop, the later pruning of the candidates at the end of the loop guarantees it will always be removed because d(p*, p') will always be zero for itself (p* == p').
     while let Some((PointDist { id: p_star, .. }, p_star_point)) = candidates.pop_front() {
       assert!(new_neighbors.insert(p_star));
@@ -380,8 +378,8 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       #[derive(Default)]
       struct Update {
         // These two aren't the same and can't be merged, as otherwise we can't tell whether we are supposed to replace or merge with the existing out-neighbors.
-        replacement_base: Option<AHashSet<Id>>,
-        additional_edges: AHashSet<Id>,
+        replacement_base: Option<HashSet<Id>>,
+        additional_edges: HashSet<Id>,
       }
       let updates = DashMap::<Id, Update>::new();
 
@@ -450,7 +448,7 @@ mod tests {
   use super::VamanaParams;
   use crate::common::metric_euclidean;
   use crate::vamana::InMemoryVamana;
-  use ahash::AHashSet;
+  use ahash::HashSet;
   use itertools::Itertools;
   use ndarray::Array;
   use ndarray::Array1;
@@ -500,14 +498,14 @@ mod tests {
         .filter(|&b| b != a)
         .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b as usize].view())))
         .take(k)
-        .collect::<AHashSet<_>>();
+        .collect::<HashSet<_>>();
       let approx = vamana
         .query(&a_pt.view(), k + 1) // +1 because the query point itself should be in the result.
         .into_iter()
         .map(|pd| pd.id)
         .filter(|&b| b != a)
         .take(k)
-        .collect::<AHashSet<_>>();
+        .collect::<HashSet<_>>();
       correct += approx.intersection(&truth).count();
     }
     println!(
@@ -526,12 +524,12 @@ mod tests {
         OrderedFloat(metric(&query.view(), &points[id as usize].view()))
       })
       .take(k)
-      .collect::<AHashSet<_>>();
+      .collect::<HashSet<_>>();
     let approx = vamana
       .query(&query.view(), k)
       .into_iter()
       .map(|pd| pd.id)
-      .collect::<AHashSet<_>>();
+      .collect::<HashSet<_>>();
     let correct = approx.intersection(&truth).count();
     println!(
       "[512D Query] Correct: {}/{} ({:.2}%)",

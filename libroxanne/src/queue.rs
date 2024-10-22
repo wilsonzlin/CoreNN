@@ -1,6 +1,7 @@
 use crate::common::Id;
 use crate::common::PointDist;
-use ahash::AHashSet;
+use ahash::HashSet;
+use ahash::HashSetExt;
 use std::collections::VecDeque;
 
 // It's too inefficient to calculate argmin(dist(P, query)) repeatedly.
@@ -9,7 +10,7 @@ use std::collections::VecDeque;
 // This will also ensure there are no duplicates. (Important, as the algorithm in the DiskANN paper specifies that this is a set.)
 pub struct BoundedDistinctQueue {
   queue: VecDeque<PointDist>,
-  set: AHashSet<Id>,
+  set: HashSet<Id>,
   k: usize,
 }
 
@@ -17,7 +18,7 @@ impl BoundedDistinctQueue {
   pub fn new(k: usize) -> Self {
     Self {
       queue: VecDeque::new(),
-      set: AHashSet::new(),
+      set: HashSet::new(),
       k,
     }
   }

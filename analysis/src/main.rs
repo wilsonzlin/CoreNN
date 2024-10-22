@@ -1,4 +1,4 @@
-use ahash::AHashSet;
+use ahash::HashSet;
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use clap::Parser;
@@ -103,12 +103,12 @@ fn main() {
     .into_par_iter()
     .zip(knns)
     .map(|((_, vec), (_, knn_expected))| {
-      let knn_expected = AHashSet::from_iter(knn_expected);
+      let knn_expected = HashSet::from_iter(knn_expected);
       let knn_got = graph
         .query(&vec.view(), k)
         .into_iter()
         .map(|pd| pd.id)
-        .collect::<AHashSet<_>>();
+        .collect::<HashSet<_>>();
       knn_expected.intersection(&knn_got).count()
     })
     .sum();

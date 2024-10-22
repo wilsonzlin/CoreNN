@@ -77,7 +77,7 @@ impl<T: linfa::Float> ProductQuantizer<T> {
 mod tests {
   use super::ProductQuantizer;
   use crate::common::metric_euclidean;
-  use ahash::AHashSet;
+  use ahash::HashSet;
   use itertools::Itertools;
   use ndarray::Array;
   use ndarray::Array2;
@@ -107,7 +107,7 @@ mod tests {
     distances
   }
 
-  fn top_k_per_row(matrix: &Array2<f32>, k: usize) -> Vec<AHashSet<usize>> {
+  fn top_k_per_row(matrix: &Array2<f32>, k: usize) -> Vec<HashSet<usize>> {
     matrix
       .axis_iter(Axis(0))
       .map(|row| {
@@ -117,7 +117,7 @@ mod tests {
           .sorted_by_key(|(_, &x)| OrderedFloat(x))
           .take(k)
           .map(|(i, _)| i.try_into().unwrap())
-          .collect::<AHashSet<_>>()
+          .collect::<HashSet<_>>()
       })
       .collect()
   }
