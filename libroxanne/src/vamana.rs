@@ -12,7 +12,6 @@ use ndarray_linalg::Scalar;
 use ordered_float::OrderedFloat;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use rand::Rng;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
@@ -64,12 +63,6 @@ pub struct InMemoryVamana<T: Scalar + Send + Sync> {
   id_to_point: DashMap<Id, Array1<T>>,
 }
 
-impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
-  pub fn graph(&self) -> &DashMap<Id, HashSet<Id>> {
-    &self.adj_list
-  }
-}
-
 impl<T: Scalar + Send + Sync> VamanaDatastore<T> for InMemoryVamana<T> {
   fn get_point(&self, id: Id) -> Option<Array1<T>> {
     self.id_to_point.get(&id).map(|e| e.clone())
@@ -89,10 +82,25 @@ impl<T: Scalar + Send + Sync> VamanaDatastore<T> for InMemoryVamana<T> {
 }
 
 impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
+  pub fn new(adj_list: DashMap<Id, HashSet<Id>>, id_to_point: DashMap<Id, Array1<T>>) -> Self {
+    Self {
+      adj_list,
+      id_to_point,
+    }
+  }
+
+  /// This can be useful for serializing to disk. Usually the points are already stored elsewhere, so serializing the graph alone can save space. To deserialize, collect the points, deserialize this graph, and use InMemoryVamana::new.
+  /// This can also be used to introspect the graph, e.g. for debugging, analysis, or research.
+  pub fn graph(&self) -> &DashMap<Id, HashSet<Id>> {
+    &self.adj_list
+  }
+
   pub fn build_index(
     dataset: Vec<(Id, Array1<T>)>,
     metric: Metric<T>,
     params: VamanaParams,
+    // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
+    medoid_sample_size: usize,
     instrumentation: Option<VamanaInstrumentation<T>>,
   ) -> Vamana<T, Self> {
     // Initialise to R-regular graph with random edges.
@@ -125,7 +133,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     let medoid = {
       let mut rng = thread_rng();
       let sample_ids = ids
-        .choose_multiple(&mut rng, params.medoid_sample_size)
+        .choose_multiple(&mut rng, medoid_sample_size)
         .copied()
         .collect_vec();
       sample_ids
@@ -156,8 +164,6 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VamanaParams {
-  // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
-  pub medoid_sample_size: usize,
   // Must be greater than `k` (according to paper). This corresponds to `L` in the paper.
   pub search_list_cap: usize,
   // Corresponds to `α` in the DiskANN paper. Must be at least 1.
@@ -182,6 +188,14 @@ pub struct DistCache<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
 }
 
 impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> DistCache<T, DS> {
+  pub fn new(ds: Arc<DS>, metric: Metric<T>) -> Self {
+    Self {
+      cache: DashMap::new(),
+      ds,
+      metric,
+    }
+  }
+
   fn dist(&self, a: Id, b: IdOrPoint<T>) -> f64 {
     match b {
       IdOrPoint::Id(b) => {
@@ -252,7 +266,13 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
 
   // DiskANN paper, Algorithm 1: GreedySearch.
   // Returns a pair: (closest points, visited node IDs).
-  fn greedy_search(&self, query: IdOrPoint<T>, k: usize) -> (Vec<PointDist>, HashSet<Id>) {
+  // Filtered nodes will be visited and expanded but not considered for the final set of neighbors.
+  fn greedy_search(
+    &self,
+    query: IdOrPoint<T>,
+    k: usize,
+    filter: impl Fn(PointDist) -> bool,
+  ) -> (Vec<PointDist>, HashSet<Id>) {
     let start = self.medoid;
     let search_list_cap = self.params.search_list_cap;
     assert!(
@@ -287,7 +307,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       });
       // Move to visited section.
       all_visited.extend(new_visited.iter().map(|e| e.id));
-      l_visited.extend(&new_visited);
+      l_visited.extend(new_visited.iter().filter(|e| filter(**e)));
       l_visited
         .make_contiguous()
         .sort_unstable_by_key(|s| OrderedFloat(s.dist));
@@ -430,7 +450,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         // TODO Delete if already exists.
 
         // Initial GreedySearch.
-        let mut candidates = self.greedy_search(IdOrPoint::Id(id), 1).1;
+        let mut candidates = self.greedy_search(IdOrPoint::Id(id), 1, |_| true).1;
 
         // RobustPrune.
         // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
@@ -474,8 +494,17 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     self.optimize(ids);
   }
 
+  pub fn query_with_filter(
+    &self,
+    query: &ArrayView1<T>,
+    k: usize,
+    filter: impl Fn(PointDist) -> bool,
+  ) -> Vec<PointDist> {
+    self.greedy_search(IdOrPoint::Point(query), k, filter).0
+  }
+
   pub fn query(&self, query: &ArrayView1<T>, k: usize) -> Vec<PointDist> {
-    self.greedy_search(IdOrPoint::Point(query), k).0
+    self.query_with_filter(query, k, |_| true)
   }
 }
 
@@ -497,7 +526,7 @@ mod tests {
   fn test_vamana_512d() {
     let metric = metric_euclidean;
     const DIM: usize = 512;
-    let n = 1000u32;
+    let n = 1000usize;
     let r = 12;
     let ids = (0..n).collect_vec();
     let k = 15;
@@ -527,12 +556,12 @@ mod tests {
     // First, test ANN of every point.
     let mut correct = 0;
     for a in ids.iter().cloned() {
-      let a_pt = &points[a as usize];
+      let a_pt = &points[a];
       let truth = ids
         .iter()
         .cloned()
         .filter(|&b| b != a)
-        .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b as usize].view())))
+        .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b].view())))
         .take(k)
         .collect::<HashSet<_>>();
       let approx = vamana
@@ -547,8 +576,8 @@ mod tests {
     println!(
       "[512D Pairwise] Correct: {}/{} ({:.2}%)",
       correct,
-      k * n as usize,
-      correct as f64 / (k * n as usize) as f64 * 100.0
+      k * n,
+      correct as f64 / (k * n) as f64 * 100.0
     );
 
     // Second, test ANN of a query.
@@ -556,9 +585,7 @@ mod tests {
     let truth = ids
       .iter()
       .cloned()
-      .sorted_unstable_by_key(|&id| {
-        OrderedFloat(metric(&query.view(), &points[id as usize].view()))
-      })
+      .sorted_unstable_by_key(|&id| OrderedFloat(metric(&query.view(), &points[id].view())))
       .take(k)
       .collect::<HashSet<_>>();
     let approx = vamana

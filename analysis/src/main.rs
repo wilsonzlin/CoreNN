@@ -3,6 +3,7 @@ use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use clap::Parser;
 use libroxanne::common::metric_euclidean;
+use libroxanne::common::Id;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::VamanaParams;
 use ndarray::Array1;
@@ -39,7 +40,7 @@ struct Args {
 fn read_vectors<T: Copy + Default + Send, Reader: Fn(&[u8], &mut [T]) + Sync>(
   path: &str,
   reader: Reader,
-) -> Vec<(u32, Array1<T>)> {
+) -> Vec<(Id, Array1<T>)> {
   let raw = std::fs::read(path).unwrap();
   let dims = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
 
@@ -60,7 +61,7 @@ fn read_vectors<T: Copy + Default + Send, Reader: Fn(&[u8], &mut [T]) + Sync>(
       );
       let mut vec = vec![T::default(); dims];
       reader(raw, vec.as_mut_slice());
-      (i as u32, Array1::from_vec(vec))
+      (i, Array1::from_vec(vec))
     })
     .collect::<Vec<_>>()
 }
@@ -103,7 +104,7 @@ fn main() {
     .into_par_iter()
     .zip(knns)
     .map(|((_, vec), (_, knn_expected))| {
-      let knn_expected = HashSet::from_iter(knn_expected);
+      let knn_expected = HashSet::from_iter(knn_expected.mapv(|v| v as Id));
       let knn_got = graph
         .query(&vec.view(), k)
         .into_iter()

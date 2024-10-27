@@ -1,8 +1,7 @@
 use ndarray::ArrayView1;
 use ndarray_linalg::Scalar;
 
-// More than 4B is unlikely to scale well on a single shard. Using u32 instead of u64 allows us to use fast RoaringBitmaps everywhere.
-pub type Id = u32;
+pub type Id = usize;
 pub type Metric<T> = fn(&ArrayView1<T>, &ArrayView1<T>) -> f64;
 
 #[derive(Clone, Copy, Debug)]

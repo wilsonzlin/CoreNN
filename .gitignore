@@ -1,3 +1,4 @@
+.venv/
 Cargo.lock
 target/
 visualizer.data.json

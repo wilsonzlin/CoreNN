@@ -5,6 +5,7 @@ use linfa_clustering::KMeans;
 use linfa_nn::distance::L2Dist;
 use ndarray::s;
 use ndarray::Array2;
+use ndarray::ArrayView2;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
@@ -17,7 +18,7 @@ pub struct ProductQuantizer<T: linfa::Float> {
 }
 
 impl<T: linfa::Float> ProductQuantizer<T> {
-  pub fn train(mat: Array2<T>, subspaces: usize) -> Self {
+  pub fn train(mat: &ArrayView2<T>, subspaces: usize) -> Self {
     let dims = mat.shape()[1];
     assert_eq!(dims % subspaces, 0);
     let subdims = dims / subspaces;
@@ -35,7 +36,7 @@ impl<T: linfa::Float> ProductQuantizer<T> {
     }
   }
 
-  pub fn encode(&self, mat: Array2<T>) -> Array2<u8> {
+  pub fn encode(&self, mat: &ArrayView2<T>) -> Array2<u8> {
     assert_eq!(mat.shape()[1], self.dims);
     let n = mat.shape()[0];
     let subspaces = self.subspace_codebooks.len();
@@ -53,7 +54,7 @@ impl<T: linfa::Float> ProductQuantizer<T> {
     codes
   }
 
-  pub fn decode(&self, codes: &Array2<u8>) -> Array2<T> {
+  pub fn decode(&self, codes: &ArrayView2<u8>) -> Array2<T> {
     let n = codes.shape()[0];
     let subspaces = self.subspace_codebooks.len();
     let subdims = self.dims / subspaces;
@@ -129,12 +130,12 @@ mod tests {
     let n = 1000;
     let mat = Array::from_shape_fn((n, 128), |_| dist.sample(&mut rng));
 
-    let pq = ProductQuantizer::train(mat.clone(), 64);
-    let mat_pq = pq.encode(mat.clone());
+    let pq = ProductQuantizer::train(&mat.view(), 64);
+    let mat_pq = pq.encode(&mat.view());
 
     let k = 10;
     let dists = pairwise_euclidean_distance(&mat);
-    let dists_pq = pairwise_euclidean_distance(&pq.decode(&mat_pq));
+    let dists_pq = pairwise_euclidean_distance(&pq.decode(&mat_pq.view()));
     let mut correct = 0;
     for (top, top_pq) in zip(top_k_per_row(&dists, k), top_k_per_row(&dists_pq, k)) {
       correct += top.intersection(&top_pq).count();

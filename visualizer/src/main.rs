@@ -1,6 +1,7 @@
 use ahash::HashSet;
 use itertools::Itertools;
 use libroxanne::common::metric_euclidean;
+use libroxanne::common::Id;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::VamanaInstrumentationEvent;
 use libroxanne::vamana::VamanaParams;
@@ -19,7 +20,7 @@ fn main() {
   // Let's plot points such that it fits comfortably spread across a widescreen display, useful for when we visualise this.
   let x_range = 0.0f32..1200.0f32;
   let y_range = 0.0f32..700.0f32;
-  let n = 100u32;
+  let n = 100usize;
   let r = 10;
   let ids = (0..n).collect_vec();
   let k = 10;
@@ -56,12 +57,12 @@ fn main() {
   // Test k-NN of every point.
   let mut correct = 0;
   for a in ids.iter().cloned() {
-    let a_pt = &points[a as usize];
+    let a_pt = &points[a];
     let truth = ids
       .iter()
       .cloned()
       .filter(|&b| b != a)
-      .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b as usize].view())))
+      .sorted_unstable_by_key(|&b| OrderedFloat(metric(&a_pt.view(), &points[b].view())))
       .take(k)
       .collect::<HashSet<_>>();
     let approx = vamana
@@ -76,20 +77,20 @@ fn main() {
   println!(
     "[2D Pairwise] Correct: {}/{} ({:.2}%)",
     correct,
-    k * n as usize,
-    correct as f64 / (k * n as usize) as f64 * 100.0
+    k * n,
+    correct as f64 / (k * n) as f64 * 100.0
   );
 
   #[derive(Serialize)]
   struct DataNode {
-    id: u32,
+    id: Id,
     point: Vec<f32>,
-    knn: Vec<u32>,
+    knn: Vec<Id>,
   }
   let nodes = ids
     .iter()
     .map(|&id| {
-      let point = &points[id as usize];
+      let point = &points[id];
       let knn = vamana
         .query(&point.view(), k)
         .into_iter()
@@ -106,7 +107,7 @@ fn main() {
   #[derive(Serialize)]
   struct Data {
     events: Vec<VamanaInstrumentationEvent<f32>>,
-    medoid: u32,
+    medoid: Id,
     nodes: Vec<DataNode>,
   }
 
