@@ -92,12 +92,11 @@ fn main() {
     degree_bound: args.degree_bound,
     distance_threshold: args.distance_threshold,
     insert_batch_size: args.insert_batch_size,
-    medoid_sample_size: 10_000,
     search_list_cap: (k as f64 * args.search_list_cap_mul) as usize,
   };
   println!("Params: {params:?}");
 
-  let graph = InMemoryVamana::build_index(vecs, metric_euclidean, params, None);
+  let graph = InMemoryVamana::build_index(vecs, metric_euclidean, params, 10_000, None);
   println!("Indexed");
 
   let correct: usize = qs

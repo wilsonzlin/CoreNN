@@ -1,16 +1,15 @@
-pub mod hnsw;
-
 use ahash::HashMap;
 use ahash::HashMapExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
 use clap::Parser;
 use dashmap::DashMap;
-use hnsw::HnswIndex;
-use hnsw::LabelType;
+use hnswlib_rs::HnswIndex;
+use hnswlib_rs::LabelType;
+use indicatif::ProgressBar;
+use indicatif::ProgressStyle;
 use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
-use libroxanne::pq::ProductQuantizer;
 use libroxanne::vamana::DistCache;
 use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaDatastore;
@@ -20,13 +19,10 @@ use lmdb::Environment;
 use lmdb::Transaction;
 use lmdb::WriteFlags;
 use ndarray::Array1;
-use ndarray::Array2;
-use ndarray::ArrayView1;
-use ndarray::Axis;
-use rand::seq::IteratorRandom;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rayon::iter::IntoParallelIterator;
+use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use std::fs::File;
@@ -48,14 +44,6 @@ struct Args {
   #[arg(long)]
   out: PathBuf,
 
-  /// How many PQ subspaces to use.
-  #[arg(long, default_value_t = 64)]
-  pq: usize,
-
-  /// How many embeddings to sample for PQ training.
-  #[arg(long, default_value_t = 33554432)]
-  sample: usize,
-
   /// How many shards (n) to compute in parallel; requires n shards in memory at one time and n threads.
   #[arg(long, default_value_t = 2)]
   parallel: usize,
@@ -73,19 +61,19 @@ fn load_hnsw(dim: usize, path: impl AsRef<Path>) -> HnswIndex {
 
 pub struct HnswDatastore {
   hnsw: HnswIndex,
-  min_level: AtomicUsize,
+  level: AtomicUsize,
 }
 
 impl HnswDatastore {
   pub fn new(hnsw: HnswIndex) -> Self {
     Self {
       hnsw,
-      min_level: AtomicUsize::new(0),
+      level: AtomicUsize::new(0),
     }
   }
 
-  pub fn set_min_level(&self, min_level: usize) {
-    self.min_level.store(min_level, Ordering::Relaxed);
+  pub fn set_level(&self, level: usize) {
+    self.level.store(level, Ordering::Relaxed);
   }
 }
 
@@ -103,7 +91,8 @@ impl VamanaDatastore<f32> for HnswDatastore {
     Some(
       self
         .hnsw
-        .get_merged_neighbors(id, self.min_level.load(Ordering::Relaxed)),
+        .get_level_neighbors(id, self.level.load(Ordering::Relaxed))
+        .collect(),
     )
   }
 
@@ -127,8 +116,26 @@ fn into_vamana(hnsw: HnswIndex) -> Vamana<f32, HnswDatastore> {
   Vamana::new(dist_cache, ds, medoid, params)
 }
 
+fn new_pb(len: usize) -> ProgressBar {
+  let pb = ProgressBar::new(len.try_into().unwrap());
+  pb.set_style(
+    ProgressStyle::with_template(
+      "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
+    )
+    .unwrap()
+    .progress_chars("#>-"),
+  );
+  pb
+}
+
+// We don't perform PQ here, as it's expensive and not specifically related to this task; use the general `pqify` tool afterwards.
 fn main() {
   let args = Args::parse();
+
+  // Make sure database can be created before we do long expensive work.
+  let db_env = Environment::new().open(&args.out).unwrap();
+  let db = db_env.create_db(None, DatabaseFlags::empty()).unwrap();
+  println!("Created database");
 
   // First phase: load each shard to ensure integrity and compute some things.
   // - Ensure all shard files exist and are intact before we start doing long intensive work.
@@ -136,12 +143,10 @@ fn main() {
   // - Sample subset of embeddings across all shards to build PQ.
   let paths_raw = std::fs::read_to_string(&args.paths).unwrap();
   let mut paths = paths_raw.lines().collect::<Vec<_>>();
-  let mut shard_sizes = HashMap::<&str, usize>::new();
-  let mut seen_ids = HashMap::<Id, String>::new();
-  let n_sample_per_shard = args.sample.div_ceil(paths.len());
-  let n_sample = n_sample_per_shard * paths.len();
-  let mut pq_sample_mat = Array2::zeros((n_sample, args.dim));
-  for (path_no, path) in paths.iter().enumerate() {
+  let shard_sizes = DashMap::<&str, usize>::new();
+  let seen_ids = DashMap::<Id, String>::new();
+  let pb = new_pb(paths.len());
+  paths.par_iter().for_each(|path| {
     let index = load_hnsw(args.dim, path);
     shard_sizes.insert(path, index.cur_element_count);
     for id in index.labels() {
@@ -149,21 +154,10 @@ fn main() {
         panic!("Duplicate ID {id} in {other} and {path}");
       };
     }
-    for (i, id) in index
-      .labels()
-      .choose_multiple(&mut thread_rng(), n_sample_per_shard)
-      .into_iter()
-      .enumerate()
-    {
-      let emb = index.get_data_by_label(id);
-      pq_sample_mat
-        .row_mut(path_no * n_sample_per_shard + i)
-        .assign(&ArrayView1::from(&emb));
-    }
-  }
-
-  // Train PQ model.
-  let pq = ProductQuantizer::train(&pq_sample_mat.view(), args.pq);
+    pb.inc(1);
+  });
+  let total_n = shard_sizes.iter().map(|e| *e.value()).sum::<usize>();
+  pb.finish_with_message("Verified shards");
 
   // Map from base node ID to combined out-neighbors.
   // We don't need a set, as a node cannot have an out-neighbor that also exists in another shard.
@@ -173,7 +167,7 @@ fn main() {
   let out_neighbor_counts = DashMap::<Id, usize>::new();
 
   // Use the largest shard as the base, as otherwise there may be some leftovers and the code/algorithm gets messy. (Shards may not be perfectly balanced.)
-  paths.sort_unstable_by_key(|p| shard_sizes.get(p).unwrap());
+  paths.sort_unstable_by_key(|p| *shard_sizes.get(p).unwrap());
   let base = load_hnsw(args.dim, &paths[0]);
   let cfg = VamanaParams {
     beam_width: 4,
@@ -191,14 +185,17 @@ fn main() {
     assert!(level <= base.max_level);
     base_ids_by_level.entry(level).or_default().push(id);
   }
+  println!("Loaded base shard {}", &paths[0]);
+  let pb = new_pb(total_n - base.cur_element_count);
   for path_batch in (&paths[1..]).chunks(args.parallel - 1) {
     path_batch.into_par_iter().for_each(|path| {
-      let second = into_vamana(load_hnsw(args.dim, path));
+      let mut second = into_vamana(load_hnsw(args.dim, path));
+      second.params_mut().search_list_cap = 1;
       // This should persist across levels.
       let mut seen = HashSet::new();
       for level in (0..=base.max_level).rev() {
-        // We only want to pick fellow nodes on the same level in other shards for our clique (or higher level, if other shards happen to have more levels).
-        second.datastore().set_min_level(level);
+        // We only want to pick fellow nodes on the same level in other shards for our clique.
+        second.datastore().set_level(level);
         for &id in base_ids_by_level.get(&level).unwrap().iter() {
           let emb = Array1::from_vec(base.get_data_by_label(id));
           let Some(nn) = second
@@ -207,6 +204,7 @@ fn main() {
           else {
             continue;
           };
+          pb.inc(1);
           seen.insert(nn.id);
           // Get full out-neighbors, not filtered by HnswDatastore.min_level.
           let neighbors = second.datastore().hnsw.get_merged_neighbors(nn.id, 0);
@@ -218,14 +216,13 @@ fn main() {
     });
   }
   drop(base);
+  pb.finish_with_message("Processed shards");
 
   // Shuffle clique out-neighbors.
   cliques.par_iter_mut().for_each(|mut e| {
     e.shuffle(&mut thread_rng());
   });
-
-  let db_env = Environment::new().open(&args.out).unwrap();
-  let db = db_env.create_db(None, DatabaseFlags::empty()).unwrap();
+  println!("Shuffled edges");
 
   {
     let mut txn = db_env.begin_rw_txn().unwrap();
@@ -255,6 +252,7 @@ fn main() {
       .unwrap();
   }
 
+  let pb = new_pb(total_n);
   for path_batch in paths.chunks(args.parallel) {
     path_batch.into_par_iter().for_each(|path| {
       let index = load_hnsw(args.dim, path);
@@ -265,7 +263,9 @@ fn main() {
           let mut clique = cliques.get_mut(&clique_id).unwrap();
           let n = clique.len();
           // We've already shuffled this Vec, so we can just take the last n cheaply.
-          let pos = n.checked_sub(*out_neighbor_counts.get(&id).unwrap()).unwrap();
+          let pos = n
+            .checked_sub(*out_neighbor_counts.get(&id).unwrap())
+            .unwrap();
           clique.split_off(pos)
         };
 
@@ -276,22 +276,14 @@ fn main() {
         }
         node_data.extend(index.get_raw_data_by_internal_id(index.get_internal_id(id)));
 
-        let emb = Array1::from_vec(index.get_data_by_label(id));
-        let emb_pq = pq.encode(&emb.view().insert_axis(Axis(0)));
         let mut txn = db_env.begin_rw_txn().unwrap();
-        txn
-          .put(
-            db,
-            &format!("pq_emb/{id}"),
-            &emb_pq.into_raw_vec(),
-            WriteFlags::empty(),
-          )
-          .unwrap();
         txn
           .put(db, &format!("node/{id}"), &node_data, WriteFlags::empty())
           .unwrap();
         txn.commit().unwrap();
+        pb.inc(1);
       });
     });
   }
+  pb.finish_with_message("All done!");
 }

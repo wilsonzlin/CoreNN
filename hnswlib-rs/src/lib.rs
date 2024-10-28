@@ -181,6 +181,18 @@ impl HnswIndex {
     lst
   }
 
+  pub fn get_level_neighbors(
+    &self,
+    label: LabelType,
+    level: usize,
+  ) -> impl Iterator<Item = LabelType> + '_ {
+    let internal_id = self.get_internal_id(label);
+    let neighbors = self.get_link_list(internal_id, level);
+    neighbors
+      .into_iter()
+      .map(|internal_id| self.get_external_label(internal_id))
+  }
+
   // Provide `min_level` > 0 to filter out all nodes at lower levels and edges to them.
   pub fn get_merged_neighbors(&self, label: LabelType, min_level: usize) -> HashSet<LabelType> {
     let internal_id = self.get_internal_id(label);

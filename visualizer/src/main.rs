@@ -45,9 +45,9 @@ fn main() {
       degree_bound: r,
       distance_threshold: 1.1,
       insert_batch_size: 64,
-      medoid_sample_size: 10_000,
       search_list_cap,
     },
+    10_000,
     Some(Box::new({
       let events = events.clone();
       move |e| events.lock().push(e)

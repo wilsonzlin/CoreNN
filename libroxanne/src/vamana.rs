@@ -264,6 +264,10 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     &self.ds
   }
 
+  pub fn params_mut(&mut self) -> &mut VamanaParams {
+    &mut self.params
+  }
+
   // DiskANN paper, Algorithm 1: GreedySearch.
   // Returns a pair: (closest points, visited node IDs).
   // Filtered nodes will be visited and expanded but not considered for the final set of neighbors.
@@ -276,8 +280,8 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     let start = self.medoid;
     let search_list_cap = self.params.search_list_cap;
     assert!(
-      search_list_cap > k,
-      "search list capacity must be greater than k"
+      search_list_cap >= k,
+      "search list capacity must be greater than or equal to k"
     );
 
     // It's too inefficient to calculate L\V repeatedly.
@@ -415,8 +419,9 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         break;
       }
       candidates.retain(|s| {
-        let dist_to_p_star = self.dist(p_star, s.id);
-        dist_thresh * dist_to_p_star > s.dist
+        let s_to_p = s.dist;
+        let s_to_p_star = self.dist(p_star, s.id);
+        s_to_p <= s_to_p_star * dist_thresh
       });
       self.inst(|| VamanaInstrumentationEvent::RobustPruneIteration {
         node: node_id,
@@ -547,9 +552,9 @@ mod tests {
         degree_bound: r,
         distance_threshold: 1.1,
         insert_batch_size: 64,
-        medoid_sample_size: 1000,
         search_list_cap,
       },
+      10_000,
       None,
     );
 

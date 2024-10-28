@@ -1,0 +1,8 @@
+[package]
+name = "hnswlib-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ahash = "0.8.11"
+byteorder = "1.5.0"
