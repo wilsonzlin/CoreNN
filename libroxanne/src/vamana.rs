@@ -219,6 +219,13 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> DistCache<T, DS> {
   }
 }
 
+#[derive(Default)]
+pub struct SearchMetrics {
+  pub visited: usize,
+  pub iterations: usize,
+  pub candidates: usize,
+}
+
 pub struct Vamana<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
   dist_cache: DistCache<T, DS>,
   ds: Arc<DS>,
@@ -276,6 +283,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     query: IdOrPoint<T>,
     k: usize,
     filter: impl Fn(PointDist) -> bool,
+    mut metrics: Option<&mut SearchMetrics>,
   ) -> (Vec<PointDist>, HashSet<Id>) {
     let start = self.medoid;
     let search_list_cap = self.params.search_list_cap;
@@ -333,6 +341,9 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
           })
         })
         .collect::<VecDeque<_>>();
+      if let Some(m) = &mut metrics {
+        m.candidates += new_unvisited.len();
+      }
       l_unvisited_set.extend(new_unvisited.iter().map(|e| e.id));
       l_unvisited.extend(&new_unvisited);
       l_unvisited
@@ -350,6 +361,9 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         }
       }
 
+      if let Some(m) = &mut metrics {
+        m.iterations += 1;
+      }
       self.inst(|| VamanaInstrumentationEvent::GreedySearchIteration {
         query: match query {
           IdOrPoint::Id(id) => self.ds.get_point(id).unwrap(),
@@ -362,6 +376,9 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         final_search_list_unvisited: l_unvisited.iter().map(|e| e.id).collect(),
       });
     }
+    if let Some(m) = &mut metrics {
+      m.visited = all_visited.len();
+    };
 
     // Find the k closest points from both l_visited + l_unvisited (= L).
     let mut closest = Vec::new();
@@ -455,7 +472,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         // TODO Delete if already exists.
 
         // Initial GreedySearch.
-        let mut candidates = self.greedy_search(IdOrPoint::Id(id), 1, |_| true).1;
+        let mut candidates = self.greedy_search(IdOrPoint::Id(id), 1, |_| true, None).1;
 
         // RobustPrune.
         // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
@@ -505,7 +522,21 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     k: usize,
     filter: impl Fn(PointDist) -> bool,
   ) -> Vec<PointDist> {
-    self.greedy_search(IdOrPoint::Point(query), k, filter).0
+    self
+      .greedy_search(IdOrPoint::Point(query), k, filter, None)
+      .0
+  }
+
+  pub fn query_with_metrics(
+    &self,
+    query: &ArrayView1<T>,
+    k: usize,
+  ) -> (Vec<PointDist>, SearchMetrics) {
+    let mut metrics = SearchMetrics::default();
+    let res = self
+      .greedy_search(IdOrPoint::Point(query), k, |_| true, Some(&mut metrics))
+      .0;
+    (res, metrics)
   }
 
   pub fn query(&self, query: &ArrayView1<T>, k: usize) -> Vec<PointDist> {

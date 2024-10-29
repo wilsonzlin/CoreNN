@@ -1,0 +1,8 @@
+hnswlib
+matplotlib
+msgpack
+numpy
+scikit-learn
+scipy
+seaborn
+umap-learn

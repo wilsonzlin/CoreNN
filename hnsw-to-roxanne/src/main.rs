@@ -29,8 +29,6 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -61,19 +59,11 @@ fn load_hnsw(dim: usize, path: impl AsRef<Path>) -> HnswIndex {
 
 pub struct HnswDatastore {
   hnsw: HnswIndex,
-  level: AtomicUsize,
 }
 
 impl HnswDatastore {
   pub fn new(hnsw: HnswIndex) -> Self {
-    Self {
-      hnsw,
-      level: AtomicUsize::new(0),
-    }
-  }
-
-  pub fn set_level(&self, level: usize) {
-    self.level.store(level, Ordering::Relaxed);
+    Self { hnsw }
   }
 }
 
@@ -88,12 +78,7 @@ impl VamanaDatastore<f32> for HnswDatastore {
   }
 
   fn get_out_neighbors(&self, id: Id) -> Option<HashSet<Id>> {
-    Some(
-      self
-        .hnsw
-        .get_level_neighbors(id, self.level.load(Ordering::Relaxed))
-        .collect(),
-    )
+    Some(self.hnsw.get_merged_neighbors(id, 0))
   }
 
   fn set_out_neighbors(&self, _id: Id, _neighbors: HashSet<Id>) {

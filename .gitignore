@@ -1,4 +1,7 @@
+__pycache__/
 .venv/
+analysis/dataset/
+analysis/out/
 Cargo.lock
 target/
 visualizer.data.json
