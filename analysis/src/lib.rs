@@ -6,6 +6,7 @@ use itertools::Itertools;
 use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
 use libroxanne::vamana::InMemoryVamana;
+use libroxanne::vamana::SearchMetrics;
 use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaDatastore;
 use ndarray::Array1;
@@ -52,7 +53,7 @@ pub fn read_vectors<T: Copy + Default + Send, Reader: Fn(&[u8], &mut [T]) + Sync
 pub struct Eval {
   pub correct: usize,
   pub total: usize,
-  pub query_path_lengths: Vec<usize>,
+  pub query_metrics: Vec<SearchMetrics>,
 }
 
 pub fn eval<DS: VamanaDatastore<f32>>(
@@ -62,24 +63,24 @@ pub fn eval<DS: VamanaDatastore<f32>>(
 ) -> Eval {
   let k = ground_truth[0].1.len();
   let correct = AtomicUsize::new(0);
-  let query_path_lengths = queries
+  let query_metrics = queries
     .into_par_iter()
     .zip(ground_truth)
     .map(|((_, vec), (_, knn_expected))| {
       let knn_expected = HashSet::from_iter(knn_expected.mapv(|v| v as Id));
-      let (res, metrics) = index.query_with_metrics(&vec.view(), k);
+      let (res, metrics) = index.query_with_metrics(&vec.view(), k, Some(&knn_expected));
       let knn_got = res.into_iter().map(|pd| pd.id).collect::<HashSet<_>>();
       correct.fetch_add(
         knn_expected.intersection(&knn_got).count(),
         Ordering::Relaxed,
       );
-      metrics.visited
+      metrics
     })
     .collect();
 
   Eval {
     correct: correct.load(Ordering::Relaxed),
-    query_path_lengths,
+    query_metrics,
     total: queries.len() * k,
   }
 }
@@ -137,16 +138,12 @@ pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
   println!("Exported medoid dists");
 
   let e = eval(&index, &qs, &knns);
-  File::create(format!("out/{out_dir}/query_path_lens.mat"))
-    .unwrap()
-    .write_all(
-      &e.query_path_lengths
-        .iter()
-        .flat_map(|l| l.to_le_bytes())
-        .collect_vec(),
-    )
-    .unwrap();
-  println!("Exported query path lengths");
+  fs::write(
+    format!("out/{out_dir}/query_metrics.msgpack"),
+    rmp_serde::to_vec_named(&e.query_metrics).unwrap(),
+  )
+  .unwrap();
+  println!("Exported query metrics");
 
   println!(
     "Correct: {:.2}% ({}/{})",

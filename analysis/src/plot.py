@@ -1,4 +1,5 @@
 from util import plot_distribution
+from util import plot_time_series
 import msgpack
 import numpy as np
 import sys
@@ -17,10 +18,10 @@ medoid_dists = np.frombuffer(
 )
 print("Loaded medoid dists")
 
-query_path_lens = np.frombuffer(
-    open(f"{d}/query_path_lens.mat", "rb").read(), dtype=np.uint64
+query_metrics = msgpack.unpack(
+    open(f"{d}/query_metrics.msgpack", "rb"), strict_map_key=False
 )
-print("Loaded query path lengths")
+print("Loaded query metrics")
 
 plot_distribution(
     data=[len(v) for v in graph.values()],
@@ -40,12 +41,24 @@ plot_distribution(
     data=medoid_dists,
     output_path=f"{d}/medoid_dists.webp",
     title="Medoid distances",
+    xlabel="Euclidean distance",
+    ylabel="Neighbors",
 )
 print("Plotted medoid dists")
 
 plot_distribution(
-    data=query_path_lens,
-    output_path=f"{d}/query_path_lens.webp",
-    title="Query path lengths",
+    data=[len(q["iterations"]) for q in query_metrics],
+    output_path=f"{d}/query_iterations.webp",
+    title="Query iterations",
 )
-print("Plotted query path lengths")
+print("Plotted query iterations")
+
+iters = query_metrics[0]["iterations"]
+for col in iters[0].keys():
+    plot_time_series(
+        arrays=[[i[col] for i in q["iterations"]] for q in query_metrics],
+        output_path=f"{d}/query_{col}.webp",
+        title=f"Query {col}",
+        xlabel="Search iteration",
+    )
+    print("Plotted query", col)

@@ -44,10 +44,18 @@ fn main() {
     for level in 0..=hnsw.get_node_level(id) {
       graph_dists_by_level.entry(level).or_default().insert(
         id,
-        hnsw.get_level_neighbors(id, level).map(|neighbor| (neighbor, metric_euclidean(
-          &Array1::from_vec(hnsw.get_data_by_label(id)).view(),
-          &Array1::from_vec(hnsw.get_data_by_label(neighbor)).view(),
-        ))).collect(),
+        hnsw
+          .get_level_neighbors(id, level)
+          .map(|neighbor| {
+            (
+              neighbor,
+              metric_euclidean(
+                &Array1::from_vec(hnsw.get_data_by_label(id)).view(),
+                &Array1::from_vec(hnsw.get_data_by_label(neighbor)).view(),
+              ),
+            )
+          })
+          .collect(),
       );
     }
   }

@@ -18,6 +18,8 @@ use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize)]
@@ -219,11 +221,21 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> DistCache<T, DS> {
   }
 }
 
-#[derive(Default)]
-pub struct SearchMetrics {
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SearchIterationMetrics {
   pub visited: usize,
-  pub iterations: usize,
-  pub candidates: usize,
+  pub unvisited_dist_sum: f64,   // The sum of all unvisited nodes.
+  pub unvisited_dist_mins: f64,  // The min. dist. of all unvisited nodes.
+  pub dropped_candidates: usize, // Neighbors of an expanded node that were already visited or in the unvisited queue.
+  pub new_candidates: usize,
+  pub dropped_visited: usize,
+  pub dropped_unvisited: usize,
+  pub ground_truth_found: usize, // Cumulative.
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SearchMetrics {
+  pub iterations: Vec<SearchIterationMetrics>,
 }
 
 pub struct Vamana<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
@@ -284,6 +296,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     k: usize,
     filter: impl Fn(PointDist) -> bool,
     mut metrics: Option<&mut SearchMetrics>,
+    ground_truth: Option<&HashSet<Id>>,
   ) -> (Vec<PointDist>, HashSet<Id>) {
     let start = self.medoid;
     let search_list_cap = self.params.search_list_cap;
@@ -295,7 +308,6 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     // It's too inefficient to calculate L\V repeatedly.
     // Since we need both L (return value) and L\V (each iteration), we split L into V and ¬V.
     // For simplicity, we'll just allow both to reach `k` size, and do a final merge at the end. This doubles the memory requirements, but in reality `k` is often small enough that it's not a problem.
-    // We need both to reach up to `k` as in the worst case all `k` are in exactly one of them.
     // We also need `all_visited` as `l_visited` truncates to `k`, but we also want all visited points in the end.
     // L = l_visited + l_unvisited
     // `l_unvisited_set` is for members currently in l_unvisited, to avoid pushing duplicates. (NOTE: This is *not* the same as `all_visited`.) We don't need one for `l_visited` because we only push popped elements from `l_unvisited`, which we guarantee are unique (as previously mentioned).
@@ -307,6 +319,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       id: start,
       dist: self.dist2(start, query),
     });
+    let ground_truth_found = AtomicUsize::new(0);
     while !l_unvisited.is_empty() {
       let new_visited = (0..self.params.beam_width)
         .filter_map(|_| l_unvisited.pop_front())
@@ -335,34 +348,47 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
           if l_unvisited_set.contains(&neighbor) {
             return None;
           };
+          if ground_truth.is_some_and(|gt| gt.contains(&neighbor)) {
+            ground_truth_found.fetch_add(1, Ordering::Relaxed);
+          }
           Some(PointDist {
             id: neighbor,
             dist: self.dist2(neighbor, query),
           })
         })
         .collect::<VecDeque<_>>();
-      if let Some(m) = &mut metrics {
-        m.candidates += new_unvisited.len();
-      }
       l_unvisited_set.extend(new_unvisited.iter().map(|e| e.id));
       l_unvisited.extend(&new_unvisited);
       l_unvisited
         .make_contiguous()
         .sort_unstable_by_key(|s| OrderedFloat(s.dist));
 
+      let mut dropped_unvisited = 0;
+      let mut dropped_visited = 0;
       while l_unvisited.len() + l_visited.len() > search_list_cap {
         let (Some(u), Some(v)) = (l_unvisited.back(), l_visited.back()) else {
           break;
         };
         if u.dist >= v.dist {
           l_unvisited.pop_back();
+          dropped_unvisited += 1;
         } else {
           l_visited.pop_back();
+          dropped_visited += 1;
         }
       }
 
       if let Some(m) = &mut metrics {
-        m.iterations += 1;
+        m.iterations.push(SearchIterationMetrics {
+          dropped_candidates: neighbors.len() - new_unvisited.len(),
+          dropped_unvisited,
+          dropped_visited,
+          ground_truth_found: ground_truth_found.load(Ordering::Relaxed),
+          new_candidates: new_unvisited.len(),
+          unvisited_dist_mins: l_unvisited.front().map(|n| n.dist).unwrap_or_default(),
+          unvisited_dist_sum: l_unvisited.iter().map(|n| n.dist).sum(),
+          visited: all_visited.len(),
+        });
       }
       self.inst(|| VamanaInstrumentationEvent::GreedySearchIteration {
         query: match query {
@@ -376,9 +402,6 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         final_search_list_unvisited: l_unvisited.iter().map(|e| e.id).collect(),
       });
     }
-    if let Some(m) = &mut metrics {
-      m.visited = all_visited.len();
-    };
 
     // Find the k closest points from both l_visited + l_unvisited (= L).
     let mut closest = Vec::new();
@@ -472,7 +495,9 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         // TODO Delete if already exists.
 
         // Initial GreedySearch.
-        let mut candidates = self.greedy_search(IdOrPoint::Id(id), 1, |_| true, None).1;
+        let mut candidates = self
+          .greedy_search(IdOrPoint::Id(id), 1, |_| true, None, None)
+          .1;
 
         // RobustPrune.
         // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
@@ -523,7 +548,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     filter: impl Fn(PointDist) -> bool,
   ) -> Vec<PointDist> {
     self
-      .greedy_search(IdOrPoint::Point(query), k, filter, None)
+      .greedy_search(IdOrPoint::Point(query), k, filter, None, None)
       .0
   }
 
@@ -531,10 +556,17 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     &self,
     query: &ArrayView1<T>,
     k: usize,
+    ground_truth: Option<&HashSet<Id>>,
   ) -> (Vec<PointDist>, SearchMetrics) {
     let mut metrics = SearchMetrics::default();
     let res = self
-      .greedy_search(IdOrPoint::Point(query), k, |_| true, Some(&mut metrics))
+      .greedy_search(
+        IdOrPoint::Point(query),
+        k,
+        |_| true,
+        Some(&mut metrics),
+        ground_truth,
+      )
       .0;
     (res, metrics)
   }
