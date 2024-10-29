@@ -97,7 +97,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     &self.adj_list
   }
 
-  pub fn build_index(
+  pub fn init_random_index(
     dataset: Vec<(Id, Array1<T>)>,
     metric: Metric<T>,
     params: VamanaParams,
@@ -158,7 +158,23 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
       graph.set_instrumentation(instrumentation);
     };
 
-    graph.optimize(ids);
+    graph
+  }
+
+  pub fn build_index(
+    dataset: Vec<(Id, Array1<T>)>,
+    metric: Metric<T>,
+    params: VamanaParams,
+    // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
+    medoid_sample_size: usize,
+    instrumentation: Option<VamanaInstrumentation<T>>,
+  ) -> Vamana<T, Self> {
+    let mut ids_random = dataset.iter().map(|e| e.0).collect_vec();
+    ids_random.shuffle(&mut thread_rng());
+
+    let graph = Self::init_random_index(dataset, metric, params, medoid_sample_size, instrumentation);
+
+    graph.optimize(ids_random);
 
     graph
   }
