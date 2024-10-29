@@ -6,3 +6,9 @@ scikit-learn
 scipy
 seaborn
 umap-learn
+
+
+
+autoflake
+black
+isort

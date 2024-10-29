@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+pushd "$(dirname "$0")" >/dev/null
+
+autoflake --in-place --remove-all-unused-imports $(git ls-files '*.py')
+black $(git ls-files '*.py')
+isort --settings-path .isort.cfg $(git ls-files '*.py')

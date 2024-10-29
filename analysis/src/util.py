@@ -1,31 +1,34 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
-import matplotlib.pyplot as plt
 import seaborn as sns
+
 
 def read_vector(path: str, dtype: npt.DTypeLike) -> np.ndarray:
     elem_bytes = np.dtype(dtype).itemsize
     with open(path, "rb") as f:
         raw = f.read()
     dim = int.from_bytes(raw[:4], byteorder="little")
-    raw_vec_len = (4 + dim * elem_bytes)
+    raw_vec_len = 4 + dim * elem_bytes
     n = len(raw) // raw_vec_len
-    return np.vstack([
-        # Add 4 to skip past leading dim. uint32.
-        np.frombuffer(raw, dtype=np.float32, count=dim, offset=raw_vec_len * i + 4)
-        for i in range(n)
-    ])
+    return np.vstack(
+        [
+            # Add 4 to skip past leading dim. uint32.
+            np.frombuffer(raw, dtype=np.float32, count=dim, offset=raw_vec_len * i + 4)
+            for i in range(n)
+        ]
+    )
 
 
 def plot_distribution(
-  data,
-  output_path,
-  title='Distribution plot',
-  bins=150,
-  kde=False,
-  color='blue',
-  figsize=(15, 10),
-  dpi=300,
+    data,
+    output_path,
+    title="Distribution plot",
+    bins=150,
+    kde=False,
+    color="blue",
+    figsize=(15, 10),
+    dpi=300,
 ):
     """
     Create a distribution plot of float values and save it as a WebP image.
@@ -58,8 +61,8 @@ def plot_distribution(
 
     # Customize the plot
     plt.title(title)
-    plt.xlabel('Value')
-    plt.ylabel('Count')
+    plt.xlabel("Value")
+    plt.ylabel("Count")
 
     # Add grid for better readability
     plt.grid(True, alpha=0.3)
@@ -68,5 +71,5 @@ def plot_distribution(
     plt.tight_layout()
 
     # Save as WebP with high quality
-    plt.savefig(output_path, format='webp', dpi=dpi)
+    plt.savefig(output_path, format="webp", dpi=dpi)
     plt.close()

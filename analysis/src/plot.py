@@ -9,13 +9,17 @@ d = sys.argv[1]
 graph = msgpack.unpack(open(f"{d}/graph.msgpack", "rb"), strict_map_key=False)
 print("Loaded graph")
 
-graph_dists = msgpack.unpack(open(f"{d}/edge_dists.msgpack", "rb"), strict_map_key=False)
+edge_dists = msgpack.unpack(open(f"{d}/edge_dists.msgpack", "rb"), strict_map_key=False)
 print("Loaded edge dists")
 
-medoid_dists = np.frombuffer(open(f"{d}/medoid_dists.mat", "rb").read(), dtype=np.float32)
+medoid_dists = np.frombuffer(
+    open(f"{d}/medoid_dists.mat", "rb").read(), dtype=np.float32
+)
 print("Loaded medoid dists")
 
-query_path_lens = np.frombuffer(open(f"{d}/query_path_lens.mat", "rb").read(), dtype=np.uint64)
+query_path_lens = np.frombuffer(
+    open(f"{d}/query_path_lens.mat", "rb").read(), dtype=np.uint64
+)
 print("Loaded query path lengths")
 
 plot_distribution(
@@ -26,7 +30,7 @@ plot_distribution(
 print("Plotted out-neighbors")
 
 plot_distribution(
-    data=[v for d in graph_dists.values() for v in d.values()],
+    data=[v for d in edge_dists.values() for v in d.values()],
     output_path=f"{d}/edge_dists.webp",
     title="ANN edge distances",
 )
