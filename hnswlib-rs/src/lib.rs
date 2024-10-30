@@ -233,6 +233,10 @@ impl HnswIndex {
     )
   }
 
+  pub fn has_label(&self, label: LabelType) -> bool {
+    self.label_lookup.contains_key(&label)
+  }
+
   pub fn internal_ids(&self) -> std::ops::Range<TableInt> {
     0..TableInt::try_from(self.cur_element_count).unwrap()
   }

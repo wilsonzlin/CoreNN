@@ -1,18 +1,11 @@
+from util import read_vectors
 import hnswlib
 import numpy as np
 import pathlib
 
 print("Loading")
-with open("dataset/base.fvecs", "rb") as f:
-    raw = f.read()
-dim = int.from_bytes(raw[:4], byteorder="little")
-n = len(raw) // (4 + dim * 4)
-mat = np.vstack(
-    [
-        np.frombuffer(raw, dtype=np.float32, count=dim, offset=(4 + dim * 4) * i + 4)
-        for i in range(n)
-    ]
-)
+mat = read_vectors("dataset/base.fvecs", np.float32)
+n, dim = mat.shape
 
 pathlib.Path("out/hnsw").mkdir(parents=True, exist_ok=True)
 

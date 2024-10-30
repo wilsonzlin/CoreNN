@@ -10,7 +10,6 @@ use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
-use libroxanne::vamana::DistCache;
 use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaDatastore;
 use libroxanne::vamana::VamanaParams;
@@ -29,7 +28,6 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -92,13 +90,11 @@ fn into_vamana(hnsw: HnswIndex) -> Vamana<f32, HnswDatastore> {
     beam_width: 1,
     degree_bound: hnsw.m,
     distance_threshold: 1.1,
-    insert_batch_size: num_cpus::get(),
-    search_list_cap: hnsw.ef_construction,
+    update_batch_size: num_cpus::get(),
+    update_search_list_cap: hnsw.ef_construction,
   };
-  let ds = Arc::new(HnswDatastore::new(hnsw));
-  let metric = metric_euclidean;
-  let dist_cache = DistCache::new(ds.clone(), metric);
-  Vamana::new(dist_cache, ds, medoid, params)
+  let ds = HnswDatastore::new(hnsw);
+  Vamana::new(ds, metric_euclidean, medoid, params)
 }
 
 fn new_pb(len: usize) -> ProgressBar {
@@ -158,8 +154,8 @@ fn main() {
     beam_width: 4,
     degree_bound: base.m,
     distance_threshold: 1.1,
-    insert_batch_size: 64,
-    search_list_cap: base.ef_construction,
+    update_batch_size: 64,
+    update_search_list_cap: base.ef_construction,
   };
   let medoid = base.enter_point_node;
   let mut base_ids_by_level = HashMap::<usize, Vec<LabelType>>::new();
@@ -175,7 +171,7 @@ fn main() {
   for path_batch in (&paths[1..]).chunks(args.parallel - 1) {
     path_batch.into_par_iter().for_each(|path| {
       let mut second = into_vamana(load_hnsw(args.dim, path));
-      second.params_mut().search_list_cap = 1;
+      second.params_mut().update_search_list_cap = 1;
       // This should persist across levels.
       let mut seen = HashSet::new();
       for level in (0..=base.max_level).rev() {

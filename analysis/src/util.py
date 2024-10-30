@@ -6,7 +6,7 @@ import numpy.typing as npt
 import seaborn as sns
 
 
-def read_vector(path: str, dtype: npt.DTypeLike) -> np.ndarray:
+def read_vectors(path: str, dtype: npt.DTypeLike) -> np.ndarray:
     elem_bytes = np.dtype(dtype).itemsize
     with open(path, "rb") as f:
         raw = f.read()

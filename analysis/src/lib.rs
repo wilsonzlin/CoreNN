@@ -56,6 +56,12 @@ pub struct Eval {
   pub query_metrics: Vec<SearchMetrics>,
 }
 
+impl Eval {
+  pub fn ratio(&self) -> f64 {
+    self.correct as f64 / self.total as f64
+  }
+}
+
 pub fn eval<DS: VamanaDatastore<f32>>(
   index: &Vamana<f32, DS>,
   queries: &[(usize, Array1<f32>)],
@@ -147,7 +153,7 @@ pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
 
   println!(
     "Correct: {:.2}% ({}/{})",
-    e.correct as f64 / e.total as f64 * 100.0,
+    e.ratio() * 100.0,
     e.correct,
     e.total,
   );

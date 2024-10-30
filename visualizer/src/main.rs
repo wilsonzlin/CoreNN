@@ -44,8 +44,8 @@ fn main() {
       beam_width: 1,
       degree_bound: r,
       distance_threshold: 1.1,
-      insert_batch_size: 64,
-      search_list_cap,
+      update_batch_size: 64,
+      update_search_list_cap: search_list_cap,
     },
     10_000,
     Some(Box::new({

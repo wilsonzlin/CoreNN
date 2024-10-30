@@ -34,8 +34,8 @@ fn main() {
     beam_width: args.beam_width,
     degree_bound: args.degree_bound,
     distance_threshold: 1.1,
-    insert_batch_size: 64,
-    search_list_cap: (k as f64 * args.search_list_cap_mul) as usize,
+    update_batch_size: 64,
+    update_search_list_cap: (k as f64 * args.search_list_cap_mul) as usize,
   };
 
   let index = InMemoryVamana::init_random_index(vecs, metric_euclidean, params, 10_000, None);

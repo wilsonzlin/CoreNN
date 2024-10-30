@@ -7,7 +7,6 @@ use dashmap::DashMap;
 use hnswlib_rs::HnswIndex;
 use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
-use libroxanne::vamana::DistCache;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaParams;
@@ -71,10 +70,11 @@ fn main() {
     beam_width: args.beam_width,
     degree_bound: hnsw.m,
     distance_threshold: 1.1,
-    insert_batch_size: num_cpus::get(),
-    search_list_cap: (k as f64 * args.search_list_cap_mul) as usize,
+    query_search_list_cap: (k as f64 * args.search_list_cap_mul) as usize,
+    update_batch_size: num_cpus::get(),
+    update_search_list_cap: (k as f64 * args.search_list_cap_mul) as usize,
   };
-  let ds = Arc::new(InMemoryVamana::new(
+  let ds = InMemoryVamana::new(
     hnsw
       .labels()
       .map(|id| (id, hnsw.get_merged_neighbors(id, 0)))
@@ -83,9 +83,8 @@ fn main() {
       .labels()
       .map(|id| (id, Array1::from_vec(hnsw.get_data_by_label(id))))
       .collect::<DashMap<_, _>>(),
-  ));
-  let dist_cache = DistCache::new(ds.clone(), metric_euclidean);
-  let index = Vamana::new(dist_cache, ds, hnsw.entry_label(), params);
+  );
+  let index = Vamana::new(ds, metric_euclidean, hnsw.entry_label(), params);
   println!("Built graph");
 
   analyse_index("hnsw", &index);

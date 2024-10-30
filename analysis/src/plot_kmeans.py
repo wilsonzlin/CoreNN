@@ -1,5 +1,5 @@
 from sklearn.cluster import MiniBatchKMeans
-from util import read_vector
+from util import read_vectors
 import json
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,7 +10,7 @@ with open("out/graph_dists.json", "r") as f:
     }
 print("Loaded graph dists")
 
-vecs = read_vector("dataset/base.fvecs", np.float32)
+vecs = read_vectors("dataset/base.fvecs", np.float32)
 print("Loaded vectors")
 
 k = 32

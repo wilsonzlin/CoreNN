@@ -20,7 +20,6 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "$type")]
@@ -59,7 +58,7 @@ pub trait VamanaDatastore<T: Scalar + Send + Sync>: Send + Sync {
   fn set_out_neighbors(&self, id: Id, neighbors: HashSet<Id>);
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct InMemoryVamana<T: Scalar + Send + Sync> {
   adj_list: DashMap<Id, HashSet<Id>>,
   id_to_point: DashMap<Id, Array1<T>>,
@@ -118,18 +117,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
       adj_list.insert(*id, neighbors);
     });
     let ids = dataset.iter().map(|e| e.0).collect_vec();
-    let id_to_point = dataset.into_iter().collect();
-
-    let ds = Arc::new(Self {
-      adj_list,
-      id_to_point,
-    });
-
-    let dist_cache = DistCache {
-      cache: DashMap::new(),
-      ds: ds.clone(),
-      metric,
-    };
+    let id_to_point = dataset.into_iter().collect::<DashMap<_, _>>();
 
     // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
     let medoid = {
@@ -145,14 +133,23 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
           OrderedFloat(
             sample_ids
               .par_iter()
-              .map(|&j| dist_cache.dist(i, IdOrPoint::Id(j)))
+              .map(|&j| {
+                metric(
+                  &id_to_point.get(&i).unwrap().view(),
+                  &id_to_point.get(&j).unwrap().view(),
+                )
+              })
               .sum::<f64>(),
           )
         })
         .unwrap()
     };
 
-    let mut graph = Vamana::new(dist_cache, ds, medoid, params);
+    let ds = Self {
+      adj_list,
+      id_to_point,
+    };
+    let mut graph = Vamana::new(ds, metric, medoid, params);
 
     if let Some(instrumentation) = instrumentation {
       graph.set_instrumentation(instrumentation);
@@ -172,9 +169,10 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     let mut ids_random = dataset.iter().map(|e| e.0).collect_vec();
     ids_random.shuffle(&mut thread_rng());
 
-    let graph = Self::init_random_index(dataset, metric, params, medoid_sample_size, instrumentation);
+    let graph =
+      Self::init_random_index(dataset, metric, params, medoid_sample_size, instrumentation);
 
-    graph.optimize(ids_random);
+    graph.optimize(ids_random, None);
 
     graph
   }
@@ -182,13 +180,13 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VamanaParams {
-  // Must be greater than `k` (according to paper). This corresponds to `L` in the paper.
-  pub search_list_cap: usize,
+  pub query_search_list_cap: usize,
+  pub update_search_list_cap: usize,
   // Corresponds to `α` in the DiskANN paper. Must be at least 1.
   pub distance_threshold: f64,
   // Corresponds to `R` in the DiskANN paper. The paper recommends at least log(N), where N is the number of points.
   pub degree_bound: usize,
-  pub insert_batch_size: usize,
+  pub update_batch_size: usize,
   // Corresponds to W in the DiskANN paper, section 3.3 (DiskANN Beam Search).
   pub beam_width: usize,
 }
@@ -197,44 +195,6 @@ pub struct VamanaParams {
 enum IdOrPoint<'a, 'b, T: Scalar> {
   Id(Id),
   Point(&'a ArrayView1<'b, T>),
-}
-
-pub struct DistCache<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
-  cache: DashMap<(Id, Id), f64>,
-  ds: Arc<DS>,
-  metric: Metric<T>,
-}
-
-impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> DistCache<T, DS> {
-  pub fn new(ds: Arc<DS>, metric: Metric<T>) -> Self {
-    Self {
-      cache: DashMap::new(),
-      ds,
-      metric,
-    }
-  }
-
-  fn dist(&self, a: Id, b: IdOrPoint<T>) -> f64 {
-    match b {
-      IdOrPoint::Id(b) => {
-        let (a, b) = if a < b { (a, b) } else { (b, a) };
-        *self
-          .cache
-          .entry((a, b))
-          .or_insert_with(|| {
-            (self.metric)(
-              &self.ds.get_point(a).unwrap().view(),
-              &self.ds.get_point(b).unwrap().view(),
-            )
-          })
-          .value()
-      }
-      IdOrPoint::Point(b) => {
-        let a = self.ds.get_point(a).unwrap();
-        (self.metric)(&a.view(), b)
-      }
-    }
-  }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -254,19 +214,24 @@ pub struct SearchMetrics {
   pub iterations: Vec<SearchIterationMetrics>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OptimizeMetrics {
+  pub updated_nodes: HashSet<Id>,
+}
+
 pub struct Vamana<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
-  dist_cache: DistCache<T, DS>,
-  ds: Arc<DS>,
+  ds: DS,
+  metric: Metric<T>,
   medoid: Id,
   params: VamanaParams,
   instrumentation: Option<VamanaInstrumentation<T>>,
 }
 
 impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
-  pub fn new(dist_cache: DistCache<T, DS>, ds: Arc<DS>, medoid: Id, params: VamanaParams) -> Self {
+  pub fn new(ds: DS, metric: Metric<T>, medoid: Id, params: VamanaParams) -> Self {
     Self {
-      dist_cache,
       ds,
+      metric,
       medoid,
       params,
       instrumentation: None,
@@ -278,7 +243,19 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   }
 
   fn dist2(&self, a: Id, b: IdOrPoint<T>) -> f64 {
-    self.dist_cache.dist(a, b)
+    match b {
+      IdOrPoint::Id(b) => {
+        let (a, b) = if a < b { (a, b) } else { (b, a) };
+        (self.metric)(
+          &self.ds.get_point(a).unwrap().view(),
+          &self.ds.get_point(b).unwrap().view(),
+        )
+      }
+      IdOrPoint::Point(b) => {
+        let a = self.ds.get_point(a).unwrap();
+        (self.metric)(&a.view(), b)
+      }
+    }
   }
 
   pub fn set_instrumentation(&mut self, instrumentation: VamanaInstrumentation<T>) {
@@ -299,6 +276,10 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     &self.ds
   }
 
+  pub fn params(&self) -> &VamanaParams {
+    &self.params
+  }
+
   pub fn params_mut(&mut self) -> &mut VamanaParams {
     &mut self.params
   }
@@ -310,12 +291,12 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     &self,
     query: IdOrPoint<T>,
     k: usize,
+    search_list_cap: usize,
     filter: impl Fn(PointDist) -> bool,
     mut metrics: Option<&mut SearchMetrics>,
     ground_truth: Option<&HashSet<Id>>,
   ) -> (Vec<PointDist>, HashSet<Id>) {
     let start = self.medoid;
-    let search_list_cap = self.params.search_list_cap;
     assert!(
       search_list_cap >= k,
       "search list capacity must be greater than or equal to k"
@@ -491,10 +472,11 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   // The point referenced by each ID should already be inserted into the DB.
   // This is used when inserting, but also during initialization, so this is a separate function from `insert`.
   // WARNING: The graph must not be mutated while this function is executing, but it is up to the caller to ensure this.
-  fn optimize(&self, mut ids: Vec<Id>) {
+  /// WARNING: This is publicly exposed, but use this only if you know what you're doing. There is no guarantees of API stability.
+  pub fn optimize(&self, mut ids: Vec<Id>, mut metrics: Option<&mut OptimizeMetrics>) {
     // Shuffle to reduce chance of inserting around the same area in latent space.
     ids.shuffle(&mut thread_rng());
-    for batch in ids.chunks(self.params.insert_batch_size) {
+    for batch in ids.chunks(self.params.update_batch_size) {
       #[derive(Default)]
       struct Update {
         // These two aren't the same and can't be merged, as otherwise we can't tell whether we are supposed to replace or merge with the existing out-neighbors.
@@ -512,12 +494,18 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
 
         // Initial GreedySearch.
         let mut candidates = self
-          .greedy_search(IdOrPoint::Id(id), 1, |_| true, None, None)
+          .greedy_search(
+            IdOrPoint::Id(id),
+            1,
+            self.params.update_search_list_cap,
+            |_| true,
+            None,
+            None,
+          )
           .1;
 
         // RobustPrune.
         // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
-        // Normally, we don't have any existing out-neighbors to add to `candidates`, but on initialization we do (initial R-regular random graph + changes from previous point initializations). Note that it's not safe to fetch the neighbors outside the lock (e.g. pass it into this function) as it may be changed with a crucial edge that we must preserve.
         for n in self.ds.get_out_neighbors(id).unwrap_or_default() {
           candidates.insert(n);
         }
@@ -534,6 +522,9 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       });
 
       // Update dirty nodes in this batch.
+      if let Some(m) = &mut metrics {
+        m.updated_nodes.extend(updates.iter().map(|u| *u.key()));
+      };
       updates.into_par_iter().for_each(|(id, u)| {
         let mut new_neighbors = u
           .replacement_base
@@ -554,7 +545,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     points
       .into_par_iter()
       .for_each(|(id, point)| self.ds.set_point(id, point));
-    self.optimize(ids);
+    self.optimize(ids, None);
   }
 
   pub fn query_with_filter(
@@ -564,7 +555,14 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     filter: impl Fn(PointDist) -> bool,
   ) -> Vec<PointDist> {
     self
-      .greedy_search(IdOrPoint::Point(query), k, filter, None, None)
+      .greedy_search(
+        IdOrPoint::Point(query),
+        k,
+        self.params.query_search_list_cap,
+        filter,
+        None,
+        None,
+      )
       .0
   }
 
@@ -579,6 +577,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       .greedy_search(
         IdOrPoint::Point(query),
         k,
+        self.params.query_search_list_cap,
         |_| true,
         Some(&mut metrics),
         ground_truth,
@@ -630,8 +629,8 @@ mod tests {
         beam_width: 1,
         degree_bound: r,
         distance_threshold: 1.1,
-        insert_batch_size: 64,
-        search_list_cap,
+        update_batch_size: 64,
+        update_search_list_cap: search_list_cap,
       },
       10_000,
       None,
