@@ -5,17 +5,16 @@ use byteorder::LittleEndian;
 use clap::Parser;
 use dashmap::DashMap;
 use hnswlib_rs::HnswIndex;
-use libroxanne::common::metric_euclidean;
-use libroxanne::common::Id;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaParams;
+use libroxanne_search::metric_euclidean;
+use libroxanne_search::Id;
 use ndarray::Array1;
 use roxanne_analysis::analyse_index;
 use roxanne_analysis::read_vectors;
 use std::fs;
 use std::fs::File;
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -77,7 +76,7 @@ fn main() {
   let ds = InMemoryVamana::new(
     hnsw
       .labels()
-      .map(|id| (id, hnsw.get_merged_neighbors(id, 0)))
+      .map(|id| (id, hnsw.get_merged_neighbors(id, 0).into_iter().collect()))
       .collect::<DashMap<_, _>>(),
     hnsw
       .labels()

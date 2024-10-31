@@ -5,6 +5,10 @@ use ahash::HashSetExt;
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
+use itertools::Itertools;
+use libroxanne_search::GreedySearchable;
+use libroxanne_search::Id;
+use ndarray::Array1;
 use std::io;
 use std::io::Read;
 use std::mem::size_of;
@@ -245,5 +249,58 @@ impl HnswIndex {
     self
       .internal_ids()
       .map(|internal_id| self.get_external_label(internal_id))
+  }
+
+  pub fn build_level_graph(&self, level: usize, level_nodes: &[LabelType]) -> HnswLevelIndex {
+    let graph = level_nodes
+      .iter()
+      .map(|&id| {
+        (
+          id,
+          self
+            .get_level_neighbors(id, level)
+            // We filter out edges to higher levels as they won't exist in this level's graph we're building.
+            // TODO Is removing edges (and degrading the graph) better than including those higher-level nodes (i.e. flattening the graph up to this level)? This is still safe as those won't be picked due to being visited already. Measure accuracy and performance.
+            .filter(|&n| self.get_node_level(n) == level)
+            .collect_vec(),
+        )
+      })
+      .collect::<HashMap<_, _>>();
+    HnswLevelIndex { hnsw: self, graph }
+  }
+}
+
+impl GreedySearchable<f32> for HnswIndex {
+  fn get_point(&self, id: Id) -> Array1<f32> {
+    Array1::from_vec(self.get_data_by_label(id))
+  }
+
+  fn get_out_neighbors(&self, id: Id) -> Vec<Id> {
+    self.get_merged_neighbors(id, 0).into_iter().collect()
+  }
+}
+
+pub struct HnswLevelIndex<'a> {
+  hnsw: &'a HnswIndex, // To fetch vectors.
+  graph: HashMap<LabelType, Vec<LabelType>>,
+}
+
+impl<'a> HnswLevelIndex<'a> {
+  pub fn base(&self) -> &HnswIndex {
+    self.hnsw
+  }
+
+  pub fn level_graph(&self) -> &HashMap<LabelType, Vec<LabelType>> {
+    &self.graph
+  }
+}
+
+impl<'a> GreedySearchable<f32> for HnswLevelIndex<'a> {
+  fn get_point(&self, id: Id) -> Array1<f32> {
+    Array1::from_vec(self.hnsw.get_data_by_label(id))
+  }
+
+  fn get_out_neighbors(&self, id: Id) -> Vec<Id> {
+    self.graph[&id].clone()
   }
 }

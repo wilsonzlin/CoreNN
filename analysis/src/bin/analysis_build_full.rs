@@ -1,7 +1,7 @@
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use itertools::Itertools;
-use libroxanne::common::metric_euclidean;
+use libroxanne_search::metric_euclidean;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use roxanne_analysis::read_vectors;

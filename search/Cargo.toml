@@ -1,0 +1,16 @@
+[package]
+name = "libroxanne-search"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ahash = "0.8.11"
+dashmap = "6.1.0"
+ndarray = "0.15" # linfa uses 0.15.
+ndarray-linalg = "0.15.0" # linfa uses 0.15.
+ordered-float = "4.4.0"
+parking_lot = "0.12.3"
+rayon = "1.10.0"
+serde = { version = "1.0.210", features = ["derive"] }
+strum = "0.26.3"
+strum_macros = "0.26.4"

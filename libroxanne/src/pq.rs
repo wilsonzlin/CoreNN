@@ -77,9 +77,9 @@ impl<T: linfa::Float> ProductQuantizer<T> {
 #[cfg(test)]
 mod tests {
   use super::ProductQuantizer;
-  use crate::common::metric_euclidean;
   use ahash::HashSet;
   use itertools::Itertools;
+  use libroxanne_search::metric_euclidean;
   use ndarray::Array;
   use ndarray::Array2;
   use ndarray::Axis;

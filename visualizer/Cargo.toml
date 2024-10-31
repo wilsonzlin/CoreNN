@@ -7,6 +7,7 @@ edition = "2021"
 ahash = "0.8.11"
 itertools = "0.13.0"
 libroxanne = { path = "../libroxanne" }
+libroxanne-search = { version = "0.1.0", path = "../search" }
 ndarray = "0.15" # Match libroxanne's version.
 ndarray-rand = "0.14.0" # Version 0.15 depends on ndarray 0.16 which libroxanne does not use.
 ordered-float = "4.4.0"

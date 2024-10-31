@@ -1,33 +1,34 @@
 use ahash::HashMap;
 use ahash::HashMapExt;
 use ahash::HashSet;
-use ahash::HashSetExt;
 use clap::Parser;
 use dashmap::DashMap;
 use hnswlib_rs::HnswIndex;
-use hnswlib_rs::LabelType;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
-use libroxanne::common::metric_euclidean;
-use libroxanne::common::Id;
-use libroxanne::vamana::Vamana;
-use libroxanne::vamana::VamanaDatastore;
+use itertools::Itertools;
 use libroxanne::vamana::VamanaParams;
+use libroxanne_search::find_shortest_spanning_path;
+use libroxanne_search::greedy_search_fast1;
+use libroxanne_search::metric_euclidean;
+use libroxanne_search::GreedySearchable;
+use libroxanne_search::Id;
+use libroxanne_search::StdMetric;
 use lmdb::DatabaseFlags;
 use lmdb::Environment;
 use lmdb::Transaction;
 use lmdb::WriteFlags;
-use ndarray::Array1;
-use rand::seq::SliceRandom;
-use rand::thread_rng;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
+use std::cmp::Reverse;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -47,54 +48,34 @@ struct Args {
   /// Dimensions of the vectors.
   #[arg(long)]
   dim: usize,
+
+  /// Metric.
+  #[arg(long)]
+  metric: StdMetric,
+
+  #[arg(long, default_value_t = 4)]
+  beam_width: usize,
+
+  #[arg(long, default_value_t = 80)]
+  degree_bound: usize,
+
+  #[arg(long, default_value_t = 1.1)]
+  distance_threshold: f64,
+
+  #[arg(long, default_value_t = 150)]
+  query_search_list_cap: usize,
+
+  #[arg(long, default_value_t = 64)]
+  update_batch_size: usize,
+
+  #[arg(long, default_value_t = 300)]
+  update_search_list_cap: usize,
 }
 
 fn load_hnsw(dim: usize, path: impl AsRef<Path>) -> HnswIndex {
   let raw = File::open(path).unwrap();
   let mut rd = BufReader::new(raw);
   HnswIndex::load(dim, &mut rd)
-}
-
-pub struct HnswDatastore {
-  hnsw: HnswIndex,
-}
-
-impl HnswDatastore {
-  pub fn new(hnsw: HnswIndex) -> Self {
-    Self { hnsw }
-  }
-}
-
-impl VamanaDatastore<f32> for HnswDatastore {
-  fn get_point(&self, id: Id) -> Option<Array1<f32>> {
-    let vec = self.hnsw.get_data_by_label(id);
-    Some(Array1::from_vec(vec))
-  }
-
-  fn set_point(&self, _id: Id, _point: Array1<f32>) {
-    panic!("read only");
-  }
-
-  fn get_out_neighbors(&self, id: Id) -> Option<HashSet<Id>> {
-    Some(self.hnsw.get_merged_neighbors(id, 0))
-  }
-
-  fn set_out_neighbors(&self, _id: Id, _neighbors: HashSet<Id>) {
-    panic!("read only");
-  }
-}
-
-fn into_vamana(hnsw: HnswIndex) -> Vamana<f32, HnswDatastore> {
-  let medoid = hnsw.entry_label();
-  let params = VamanaParams {
-    beam_width: 1,
-    degree_bound: hnsw.m,
-    distance_threshold: 1.1,
-    update_batch_size: num_cpus::get(),
-    update_search_list_cap: hnsw.ef_construction,
-  };
-  let ds = HnswDatastore::new(hnsw);
-  Vamana::new(ds, metric_euclidean, medoid, params)
 }
 
 fn new_pb(len: usize) -> ProgressBar {
@@ -112,6 +93,7 @@ fn new_pb(len: usize) -> ProgressBar {
 // We don't perform PQ here, as it's expensive and not specifically related to this task; use the general `pqify` tool afterwards.
 fn main() {
   let args = Args::parse();
+  let metric = args.metric.get_fn::<f32>();
 
   // Make sure database can be created before we do long expensive work.
   let db_env = Environment::new().open(&args.out).unwrap();
@@ -121,89 +103,124 @@ fn main() {
   // First phase: load each shard to ensure integrity and compute some things.
   // - Ensure all shard files exist and are intact before we start doing long intensive work.
   // - Ensure all IDs are unique across all shards.
-  // - Sample subset of embeddings across all shards to build PQ.
   let paths_raw = std::fs::read_to_string(&args.paths).unwrap();
-  let mut paths = paths_raw.lines().collect::<Vec<_>>();
-  let shard_sizes = DashMap::<&str, usize>::new();
+  let paths = paths_raw.lines().collect::<Vec<_>>();
+  // Map from level to (shard path, nodes).
+  let shard_nodes_by_level = DashMap::<usize, Vec<(String, Vec<Id>)>>::new();
+  let total_n = AtomicUsize::new(0);
   let seen_ids = DashMap::<Id, String>::new();
   let pb = new_pb(paths.len());
   paths.par_iter().for_each(|path| {
     let index = load_hnsw(args.dim, path);
-    shard_sizes.insert(path, index.cur_element_count);
+    let mut map = HashMap::<usize, Vec<Id>>::new();
     for id in index.labels() {
       if let Some(other) = seen_ids.insert(id, path.to_string()) {
         panic!("Duplicate ID {id} in {other} and {path}");
       };
+      let level = index.get_node_level(id);
+      map.entry(level).or_default().push(id);
+    }
+    for (level, nodes) in map {
+      total_n.fetch_add(nodes.len(), Ordering::Relaxed);
+      shard_nodes_by_level
+        .entry(level)
+        .or_default()
+        .push((path.to_string(), nodes));
     }
     pb.inc(1);
   });
-  let total_n = shard_sizes.iter().map(|e| *e.value()).sum::<usize>();
+  let total_n = total_n.load(Ordering::Relaxed);
   pb.finish_with_message("Verified shards");
 
+  let pb = new_pb(total_n);
+  let mut medoid: Option<Id> = None;
+  // Map from base node ID to map from shard path to other shard node ID.
+  let cliques = DashMap::<Id, DashMap<String, Id>>::new();
   // Map from base node ID to combined out-neighbors.
   // We don't need a set, as a node cannot have an out-neighbor that also exists in another shard.
-  let cliques = DashMap::<Id, Vec<Id>>::new();
+  let clique_neighbors = DashMap::<Id, Vec<Id>>::new();
   let node_to_clique = DashMap::<Id, Id>::new();
-  // We'll preserve the amount of out-neighbors each node has in case that's important.
-  let out_neighbor_counts = DashMap::<Id, usize>::new();
+  // We want to go by level as nodes on different levels have different edge length and count distributions, which is probably ideal to preserve.
+  for (level, mut shards) in shard_nodes_by_level
+    .into_iter()
+    .sorted_unstable_by_key(|e| e.0)
+    .rev()
+  {
+    // Use the shard with the most nodes at the current level as the base, as otherwise there may be some leftover nodes in other shards and the code/algorithm gets messy if we want to ensure they get used too. (Shards may not be perfectly balanced.)
+    // Recalculate base shard for every level as different levels may have different largest shards.
+    shards.sort_unstable_by_key(|e| Reverse(e.1.len()));
 
-  // Use the largest shard as the base, as otherwise there may be some leftovers and the code/algorithm gets messy. (Shards may not be perfectly balanced.)
-  paths.sort_unstable_by_key(|p| *shard_sizes.get(p).unwrap());
-  let base = load_hnsw(args.dim, &paths[0]);
-  let cfg = VamanaParams {
-    beam_width: 4,
-    degree_bound: base.m,
-    distance_threshold: 1.1,
-    update_batch_size: 64,
-    update_search_list_cap: base.ef_construction,
-  };
-  let medoid = base.enter_point_node;
-  let mut base_ids_by_level = HashMap::<usize, Vec<LabelType>>::new();
-  for id in base.labels() {
-    cliques.insert(id, base.get_merged_neighbors(id, 0).into_iter().collect());
-    node_to_clique.insert(id, id);
-    let level = base.get_node_level(id);
-    assert!(level <= base.max_level);
-    base_ids_by_level.entry(level).or_default().push(id);
-  }
-  println!("Loaded base shard {}", &paths[0]);
-  let pb = new_pb(total_n - base.cur_element_count);
-  for path_batch in (&paths[1..]).chunks(args.parallel - 1) {
-    path_batch.into_par_iter().for_each(|path| {
-      let mut second = into_vamana(load_hnsw(args.dim, path));
-      second.params_mut().update_search_list_cap = 1;
-      // This should persist across levels.
-      let mut seen = HashSet::new();
-      for level in (0..=base.max_level).rev() {
-        // We only want to pick fellow nodes on the same level in other shards for our clique.
-        second.datastore().set_level(level);
-        for &id in base_ids_by_level.get(&level).unwrap().iter() {
-          let emb = Array1::from_vec(base.get_data_by_label(id));
-          let Some(nn) = second
-            .query_with_filter(&emb.view(), 1, |e| !seen.contains(&e.id))
-            .pop()
-          else {
-            continue;
-          };
-          pb.inc(1);
-          seen.insert(nn.id);
-          // Get full out-neighbors, not filtered by HnswDatastore.min_level.
-          let neighbors = second.datastore().hnsw.get_merged_neighbors(nn.id, 0);
-          out_neighbor_counts.insert(nn.id, neighbors.len());
-          cliques.get_mut(&id).unwrap().extend(neighbors.iter());
-          node_to_clique.insert(nn.id, id);
-        }
-      }
+    let (base_file, base_level_nodes) = &shards[0];
+    let base = load_hnsw(args.dim, base_file);
+    let base_graph = base.build_level_graph(level, base_level_nodes);
+    // We can't just pick the entry point as the start that may not exist on our level.
+    let base_path = find_shortest_spanning_path(&base_graph, metric, base_level_nodes[0]);
+    if medoid.is_none() {
+      medoid = Some(base.entry_label());
+    };
+
+    base_level_nodes.par_iter().for_each(|&id| {
+      assert!(cliques.insert(id, DashMap::new()).is_none());
+      assert!(clique_neighbors
+        .insert(id, base.get_merged_neighbors(id, 0).into_iter().collect())
+        .is_none());
+      assert!(node_to_clique.insert(id, id).is_none());
     });
+
+    for batch in (&shards[1..]).chunks(args.parallel - 1) {
+      batch.into_par_iter().for_each(|(path, shard_level_nodes)| {
+        let other = load_hnsw(args.dim, path);
+        let other_graph = other.build_level_graph(level, &shard_level_nodes);
+        let mut available = shard_level_nodes.iter().cloned().collect::<HashSet<_>>();
+
+        for (base_id_from, base_id) in base_path.iter().cloned() {
+          let base_vec = base_graph.get_point(base_id);
+
+          // If None: we're at the start.
+          cliques
+            .get(&base_id_from)
+            // If None: no eqivalent to `from` in this shard was found previously.
+            .and_then(|c| c.get(path).map(|e| *e))
+            // We'll just use any point still available as the start. If there's not even a point available, we'll have to skip this shard.
+            // NOTE: We cannot just use the HNSW entry node as it isn't available on this level (unless we're at the top level).
+            .or_else(|| available.iter().cloned().next())
+            .and_then(|start| {
+              greedy_search_fast1(
+                &other_graph,
+                &base_vec.view(),
+                metric_euclidean,
+                start,
+                |n| available.contains(&n),
+              )
+            })
+            .inspect(|&other_node| {
+              pb.inc(1);
+              assert!(available.remove(&other_node));
+              cliques
+                .get_mut(&base_id)
+                .unwrap()
+                .insert(path.clone(), other_node);
+              clique_neighbors
+                .get_mut(&base_id)
+                .unwrap()
+                .extend(other.get_merged_neighbors(other_node, 0));
+              assert!(node_to_clique.insert(other_node, base_id).is_none());
+            });
+        }
+      });
+    }
   }
-  drop(base);
   pb.finish_with_message("Processed shards");
 
-  // Shuffle clique out-neighbors.
-  cliques.par_iter_mut().for_each(|mut e| {
-    e.shuffle(&mut thread_rng());
-  });
-  println!("Shuffled edges");
+  // Allow custom params for new super graph that will likely be stored on disk, which means the params might be different from a single HNSW shard's (so don't just copy existing).
+  let cfg = VamanaParams {
+    beam_width: args.beam_width,
+    degree_bound: args.degree_bound,
+    distance_threshold: args.distance_threshold,
+    query_search_list_cap: args.query_search_list_cap,
+    update_batch_size: args.update_batch_size,
+    update_search_list_cap: args.update_search_list_cap,
+  };
 
   {
     let mut txn = db_env.begin_rw_txn().unwrap();
@@ -227,7 +244,15 @@ fn main() {
       .put(
         db,
         &"medoid".to_string(),
-        &medoid.to_le_bytes(),
+        &medoid.unwrap().to_le_bytes(),
+        WriteFlags::empty(),
+      )
+      .unwrap();
+    txn
+      .put(
+        db,
+        &"metric".to_string(),
+        &args.metric.to_string(),
         WriteFlags::empty(),
       )
       .unwrap();
@@ -239,16 +264,7 @@ fn main() {
       let index = load_hnsw(args.dim, path);
       index.labels().par_bridge().for_each(|id| {
         let clique_id = node_to_clique.get(&id).unwrap();
-        // Release lock ASAP.
-        let new_out_neighbors = {
-          let mut clique = cliques.get_mut(&clique_id).unwrap();
-          let n = clique.len();
-          // We've already shuffled this Vec, so we can just take the last n cheaply.
-          let pos = n
-            .checked_sub(*out_neighbor_counts.get(&id).unwrap())
-            .unwrap();
-          clique.split_off(pos)
-        };
+        let new_out_neighbors = clique_neighbors.get(&clique_id).unwrap();
 
         let mut node_data = Vec::new();
         node_data.extend(new_out_neighbors.len().to_le_bytes());

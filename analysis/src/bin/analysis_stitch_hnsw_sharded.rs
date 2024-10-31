@@ -1,5 +1,3 @@
-use ahash::HashMap;
-use ahash::HashMapExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
 use byteorder::ByteOrder;
@@ -8,19 +6,19 @@ use clap::Parser;
 use dashmap::DashMap;
 use hnswlib_rs::HnswIndex;
 use itertools::Itertools;
-use libroxanne::common::metric_euclidean;
-use libroxanne::common::Id;
-use libroxanne::common::PointDist;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::OptimizeMetrics;
 use libroxanne::vamana::Vamana;
-use libroxanne::vamana::VamanaDatastore;
 use libroxanne::vamana::VamanaParams;
+use libroxanne_search::find_shortest_spanning_path;
+use libroxanne_search::greedy_search_fast1;
+use libroxanne_search::metric_euclidean;
+use libroxanne_search::GreedySearchable;
+use libroxanne_search::Id;
 use ndarray::Array1;
-use ordered_float::OrderedFloat;
-use rand::seq::IteratorRandom;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use roxanne_analysis::analyse_index;
@@ -29,7 +27,6 @@ use roxanne_analysis::read_vectors;
 use std::cmp::Reverse;
 use std::fs;
 use std::fs::File;
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -50,9 +47,9 @@ struct Args {
 struct Ctx {
   ground_truths: Vec<(Id, Array1<u32>)>,
   k: usize,
+  level_to_shard_to_nodes: DashMap<usize, DashMap<usize, Vec<Id>>>,
   medoid: Id,
   node_to_level: DashMap<Id, usize>,
-  nodes_by_level: DashMap<usize, Vec<Id>>,
   queries: Vec<(Id, Array1<f32>)>,
   shards: Vec<HnswIndex>,
 }
@@ -128,7 +125,7 @@ fn strategy_reinsert_by_level(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
 
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
   for ent in ctx
-    .nodes_by_level
+    .level_to_shard_to_nodes
     .iter()
     .sorted_unstable_by_key(|e| Reverse(*e.key()))
   {
@@ -137,7 +134,7 @@ fn strategy_reinsert_by_level(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
     if level == 0 {
       continue;
     };
-    let nodes = ent.value().clone();
+    let nodes = ent.iter().flat_map(|e| e.to_vec()).collect_vec();
     let n = nodes.len();
     let mut metrics = OptimizeMetrics::default();
     index.optimize(nodes, Some(&mut metrics));
@@ -159,6 +156,9 @@ fn strategy_reinsert_by_level(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
 // TODO Ablation studies:
 // - Insert edges randomly across any levels.
 // - Insert edges randomly within level.
+// - Find random pair/clique (not closest) across shards and merge edges.
+// - Stitch across all levels, not level-by-level.
+// - Stitch subset of neighbors.
 fn strategy_stitch_cliques(
   ctx: &Ctx,
   ds: InMemoryVamana<f32>,
@@ -166,93 +166,93 @@ fn strategy_stitch_cliques(
 ) -> Vamana<f32, InMemoryVamana<f32>> {
   let index = Vamana::new(ds, metric_euclidean, ctx.medoid, params);
 
-  let fast_greedy_k1_search =
-    |graph: &HashMap<Id, Vec<Id>>, whitelist: &HashSet<Id>, query: Id| -> Option<Id> {
-      let start = *graph
-        .keys()
-        .filter(|id| whitelist.contains(id))
-        .choose(&mut thread_rng())?;
-      let calc_dist = |a: Id, b: Id| {
-        metric_euclidean(
-          &index.datastore().get_point(a).unwrap().view(),
-          &index.datastore().get_point(b).unwrap().view(),
-        )
-      };
-      let mut cur = PointDist {
-        id: start,
-        dist: calc_dist(start, query),
-      };
-      let mut seen = HashSet::<Id>::new();
-      loop {
-        seen.insert(cur.id);
-        // TODO Normally filtered nodes (i.e. `whitelist` in this case) must still be traversed, and is simply ignored in the final result, as actually ignoring them like they're deleted may be traversing a broken graph.
-        let new = graph[&cur.id]
-          .par_iter()
-          .filter(|n| whitelist.contains(n) && !seen.contains(n))
-          .map(|&n| PointDist {
-            id: n,
-            dist: calc_dist(cur.id, n),
-          })
-          .min_by_key(|e| OrderedFloat(e.dist));
-        let Some(new) = new else {
-          return Some(cur.id);
-        };
-        if cur.dist < new.dist {
-          return Some(cur.id);
-        };
-        cur = new;
-      }
-    };
-
   // We want to go by level as nodes on different levels have different edge length and count distributions, which is probably ideal to preserve.
   for ent in ctx
-    .nodes_by_level
+    .level_to_shard_to_nodes
     .iter()
     .sorted_unstable_by_key(|e| Reverse(*e.key()))
   {
     let level = *ent.key();
-    let nodes = ent.value();
-    let graphs = ctx
-      .shards
+    let total_node_count = ent.iter().map(|e| e.len()).sum::<usize>();
+    let graphs = ent
       .iter()
-      .map(|hnsw| {
-        let mut graph = HashMap::<Id, Vec<Id>>::new();
-        for &label in nodes.iter() {
-          if hnsw.has_label(label) {
-            graph.insert(label, hnsw.get_level_neighbors(label, level).collect());
-          }
-        }
-        graph
+      .map(|e| {
+        let hnsw = &ctx.shards[*e.key()];
+        hnsw.build_level_graph(level, e.value())
       })
       .collect_vec();
-    let mut available = nodes.iter().cloned().collect::<HashSet<_>>();
-    while let Some(&base_node) = available.iter().next() {
-      let mut nodes = Vec::new();
-      let mut out_neighbors = Vec::<Id>::new();
-      for g in graphs.iter() {
-        let node = if g.contains_key(&base_node) {
-          base_node
-        } else {
-          let Some(n) = fast_greedy_k1_search(g, &available, base_node) else {
-            continue;
-          };
-          n
-        };
-        assert!(available.remove(&node));
-        out_neighbors.extend(index.datastore().graph().get(&node).unwrap().iter());
-        nodes.push(node);
+
+    // Idea for faster finding of closest neighbor in another shard:
+    // - Find closest node A' in shard 2 to base shard's start node A.
+    // - Assumption: A ~= A', so neighbors(A) ~= neighbors(A').
+    // - Traverse using Dijkstra, so we visit a node (B) only when we reach them by (hopefully) their closest neighbor (A) as other longer ways would not get queue-popped as soon.
+    // - Let one neighbor of A be B. Query B from A' to find B'.
+    // TODO Ablation study: just pick random node to start from for every query in another shard, instead of specifically the closest.
+
+    // Map from base node ID to map from shard number to shard node ID.
+    let cliques = DashMap::<Id, DashMap<usize, Id>>::new();
+    // We can't just pick the entry point as the start that may not exist on our level.
+    let base_path = find_shortest_spanning_path(
+      &graphs[0],
+      metric_euclidean,
+      *graphs[0].level_graph().keys().next().unwrap(),
+    );
+
+    // In the base shard, the closest to `to` is from `from`.
+    // Therefore, in every other shard, we query for the equivalent to `to` starting from the equivalent to the base `from` in the shard for faster convergence.
+    graphs.par_iter().enumerate().skip(1).for_each(|(i, o)| {
+      let mut available = o.level_graph().keys().cloned().collect::<HashSet<_>>();
+      for (from, to) in base_path.iter().cloned() {
+        let to_emb = graphs[0].get_point(to);
+
+        // If None: we're at the start.
+        cliques
+          .get(&from)
+          // If None: no eqivalent to `from` in this shard was found previously.
+          .and_then(|c| c.get(&i).map(|e| *e))
+          // We'll just use any point still available as the start. If there's not even a point available, we'll have to skip this shard.
+          // NOTE: We cannot just use the HNSW entry node as it isn't available on this level (unless we're at the top level).
+          .or_else(|| available.iter().cloned().next())
+          .and_then(|start| {
+            greedy_search_fast1(o, &to_emb.view(), metric_euclidean, start, |n| {
+              available.contains(&n)
+            })
+          })
+          .inspect(|&other_node| {
+            cliques.entry(to).or_default().insert(i, other_node);
+            assert!(available.remove(&other_node));
+          });
       }
-      for id in nodes {
-        let mut n = index.datastore().graph().get_mut(&id).unwrap();
-        n.clear();
-        n.extend(out_neighbors.iter());
+    });
+
+    for (base_id, others) in cliques {
+      // Get all neighbors, not just same-level ones.
+      // No need for HashSet, as nodes can't exist across multiple shards.
+      let mut combined_neighbors = graphs[0]
+        .base()
+        .get_merged_neighbors(base_id, 0)
+        .into_iter()
+        .collect_vec();
+      for (i, o) in others.clone() {
+        combined_neighbors.extend(graphs[i].base().get_merged_neighbors(o, 0));
+      }
+
+      // Update neighbors of all nodes in this clique.
+      index
+        .datastore()
+        .graph()
+        .insert(base_id, combined_neighbors.clone());
+      for (_, o) in others {
+        index
+          .datastore()
+          .graph()
+          .insert(o, combined_neighbors.clone());
       }
     }
 
     let e = eval(&index, &ctx.queries, &ctx.ground_truths);
     println!(
-      "[Level {level} with {} nodes] Correct: {:.2}% ({}/{})",
-      nodes.len(),
+      "[Level {level} with {total_node_count} nodes] Correct: {:.2}% ({}/{})",
       e.ratio() * 100.0,
       e.correct,
       e.total
@@ -279,16 +279,21 @@ fn main() {
     .par_iter()
     .map(|f| HnswIndex::load(128, File::open(f).unwrap()))
     .collect::<Vec<_>>();
-  let nodes_by_level = DashMap::<usize, Vec<Id>>::new();
+  let level_to_shard_to_nodes = DashMap::<usize, DashMap<usize, Vec<Id>>>::new();
   let node_to_level = DashMap::<Id, usize>::new();
-  let adj_list = DashMap::<Id, HashSet<Id>>::new();
+  let adj_list = DashMap::<Id, Vec<Id>>::new();
   let id_to_point = DashMap::<Id, Array1<f32>>::new();
-  hnsws.par_iter().for_each(|hnsw| {
+  hnsws.par_iter().enumerate().for_each(|(shard_no, hnsw)| {
     for id in hnsw.labels() {
       let level = hnsw.get_node_level(id);
-      nodes_by_level.entry(level).or_default().push(id);
+      level_to_shard_to_nodes
+        .entry(level)
+        .or_default()
+        .entry(shard_no)
+        .or_default()
+        .push(id);
       node_to_level.insert(id, level);
-      adj_list.insert(id, hnsw.get_merged_neighbors(id, 0));
+      adj_list.insert(id, hnsw.get_merged_neighbors(id, 0).into_iter().collect());
       id_to_point.insert(id, Array1::from_vec(hnsw.get_data_by_label(id)));
     }
   });
@@ -296,16 +301,16 @@ fn main() {
   for &id in entrypoints.iter() {
     for &neighbor in entrypoints.iter() {
       if id != neighbor {
-        adj_list.get_mut(&id).unwrap().insert(neighbor);
+        adj_list.get_mut(&id).unwrap().push(neighbor);
       }
     }
   }
   let ctx = Ctx {
     ground_truths,
     k,
+    level_to_shard_to_nodes,
     medoid: hnsws[0].entry_label(),
     node_to_level,
-    nodes_by_level,
     queries,
     shards: hnsws,
   };
@@ -323,6 +328,15 @@ fn main() {
     update_search_list_cap: (ctx.k as f64 * args.update_search_list_cap_mul) as usize,
   };
 
+  println!("strategy_stitch_cliques");
+  println!("============");
+  let index = strategy_stitch_cliques(&ctx, ds.clone(), params.clone());
+  println!();
+
+  analyse_index("hnsw-sharded", &index);
+  println!();
+
+  // Other worse strategies, provided for reference. Ctrl+C (SIGINT) at this point if not useful.
   println!("baseline_build_from_scratch");
   println!("============");
   baseline_build_from_scratch(&args, &ctx, ds.clone(), params.clone());
@@ -337,11 +351,4 @@ fn main() {
   println!("============");
   strategy_reinsert_randomly(&ctx, ds.clone(), params.clone());
   println!();
-
-  println!("strategy_stitch_cliques");
-  println!("============");
-  let index = strategy_stitch_cliques(&ctx, ds.clone(), params.clone());
-  println!();
-
-  analyse_index("hnsw-sharded", &index);
 }

@@ -1,11 +1,14 @@
-use crate::common::Id;
-use crate::common::Metric;
-use crate::common::PointDist;
 use ahash::HashSet;
 use ahash::HashSetExt;
 use dashmap::DashMap;
 use dashmap::DashSet;
 use itertools::Itertools;
+use libroxanne_search::GreedySearchable;
+use libroxanne_search::Id;
+use libroxanne_search::Metric;
+use libroxanne_search::PointDist;
+use libroxanne_search::SearchIterationMetrics;
+use libroxanne_search::SearchMetrics;
 use ndarray::Array1;
 use ndarray::ArrayView1;
 use ndarray_linalg::Scalar;
@@ -51,39 +54,39 @@ pub type VamanaInstrumentation<T> = Box<dyn Fn(VamanaInstrumentationEvent<T>) + 
 // Return owned values:
 // - We use DashMap for in-memory, so we can't return a ref while holding a lock in the map entry.
 // - From disk, we copy the bytes.
-pub trait VamanaDatastore<T: Scalar + Send + Sync>: Send + Sync {
-  fn get_point(&self, id: Id) -> Option<Array1<T>>;
+pub trait VamanaDatastore<T: Scalar + Send + Sync>: GreedySearchable<T> + Send + Sync {
   fn set_point(&self, id: Id, point: Array1<T>);
-  fn get_out_neighbors(&self, id: Id) -> Option<HashSet<Id>>;
-  fn set_out_neighbors(&self, id: Id, neighbors: HashSet<Id>);
+  fn set_out_neighbors(&self, id: Id, neighbors: Vec<Id>);
 }
 
 #[derive(Clone, Default)]
 pub struct InMemoryVamana<T: Scalar + Send + Sync> {
-  adj_list: DashMap<Id, HashSet<Id>>,
+  adj_list: DashMap<Id, Vec<Id>>,
   id_to_point: DashMap<Id, Array1<T>>,
 }
 
-impl<T: Scalar + Send + Sync> VamanaDatastore<T> for InMemoryVamana<T> {
-  fn get_point(&self, id: Id) -> Option<Array1<T>> {
-    self.id_to_point.get(&id).map(|e| e.clone())
+impl<T: Scalar + Send + Sync> GreedySearchable<T> for InMemoryVamana<T> {
+  fn get_point(&self, id: Id) -> Array1<T> {
+    self.id_to_point.get(&id).unwrap().clone()
   }
 
+  fn get_out_neighbors(&self, id: Id) -> Vec<Id> {
+    self.adj_list.get(&id).unwrap().clone()
+  }
+}
+
+impl<T: Scalar + Send + Sync> VamanaDatastore<T> for InMemoryVamana<T> {
   fn set_point(&self, id: Id, point: Array1<T>) {
     self.id_to_point.insert(id, point);
   }
 
-  fn get_out_neighbors(&self, id: Id) -> Option<HashSet<Id>> {
-    self.adj_list.get(&id).map(|e| e.clone())
-  }
-
-  fn set_out_neighbors(&self, id: Id, neighbors: HashSet<Id>) {
+  fn set_out_neighbors(&self, id: Id, neighbors: Vec<Id>) {
     self.adj_list.insert(id, neighbors);
   }
 }
 
 impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
-  pub fn new(adj_list: DashMap<Id, HashSet<Id>>, id_to_point: DashMap<Id, Array1<T>>) -> Self {
+  pub fn new(adj_list: DashMap<Id, Vec<Id>>, id_to_point: DashMap<Id, Array1<T>>) -> Self {
     Self {
       adj_list,
       id_to_point,
@@ -92,7 +95,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
 
   /// This can be useful for serializing to disk. Usually the points are already stored elsewhere, so serializing the graph alone can save space. To deserialize, collect the points, deserialize this graph, and use InMemoryVamana::new.
   /// This can also be used to introspect the graph, e.g. for debugging, analysis, or research.
-  pub fn graph(&self) -> &DashMap<Id, HashSet<Id>> {
+  pub fn graph(&self) -> &DashMap<Id, Vec<Id>> {
     &self.adj_list
   }
 
@@ -113,7 +116,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
         .map(|e| e.0)
         .filter(|oid| id != oid)
         .take(params.degree_bound)
-        .collect::<HashSet<_>>();
+        .collect::<Vec<_>>();
       adj_list.insert(*id, neighbors);
     });
     let ids = dataset.iter().map(|e| e.0).collect_vec();
@@ -198,23 +201,6 @@ enum IdOrPoint<'a, 'b, T: Scalar> {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SearchIterationMetrics {
-  pub visited: usize,
-  pub unvisited_dist_sum: f64,   // The sum of all unvisited nodes.
-  pub unvisited_dist_mins: f64,  // The min. dist. of all unvisited nodes.
-  pub dropped_candidates: usize, // Neighbors of an expanded node that were already visited or in the unvisited queue.
-  pub new_candidates: usize,
-  pub dropped_visited: usize,
-  pub dropped_unvisited: usize,
-  pub ground_truth_found: usize, // Cumulative.
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SearchMetrics {
-  pub iterations: Vec<SearchIterationMetrics>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OptimizeMetrics {
   pub updated_nodes: HashSet<Id>,
 }
@@ -246,13 +232,10 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     match b {
       IdOrPoint::Id(b) => {
         let (a, b) = if a < b { (a, b) } else { (b, a) };
-        (self.metric)(
-          &self.ds.get_point(a).unwrap().view(),
-          &self.ds.get_point(b).unwrap().view(),
-        )
+        (self.metric)(&self.ds.get_point(a).view(), &self.ds.get_point(b).view())
       }
       IdOrPoint::Point(b) => {
-        let a = self.ds.get_point(a).unwrap();
+        let a = self.ds.get_point(a);
         (self.metric)(&a.view(), b)
       }
     }
@@ -323,7 +306,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         .collect::<Vec<_>>();
       let neighbors = DashSet::new();
       new_visited.par_iter().for_each(|p_star| {
-        for j in self.ds.get_out_neighbors(p_star.id).unwrap_or_default() {
+        for j in self.ds.get_out_neighbors(p_star.id) {
           neighbors.insert(j);
         }
       });
@@ -389,7 +372,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       }
       self.inst(|| VamanaInstrumentationEvent::GreedySearchIteration {
         query: match query {
-          IdOrPoint::Id(id) => self.ds.get_point(id).unwrap(),
+          IdOrPoint::Id(id) => self.ds.get_point(id),
           IdOrPoint::Point(p) => p.to_owned(),
         },
         expanded: new_visited.iter().map(|e| e.id).collect(),
@@ -423,13 +406,17 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   }
 
   /// WARNING: `candidate_ids` must not contain the point itself.
-  fn compute_robust_pruned(&self, node_id: Id, candidate_ids: HashSet<Id>) -> HashSet<Id> {
+  fn compute_robust_pruned(
+    &self,
+    node_id: Id,
+    candidate_ids: impl IntoParallelIterator<Item = Id> + Clone,
+  ) -> Vec<Id> {
     let dist_thresh = self.params.distance_threshold;
     let degree_bound = self.params.degree_bound;
 
     self.inst(|| VamanaInstrumentationEvent::RobustPruneBegin {
       node: node_id,
-      candidates: candidate_ids.iter().copied().collect(),
+      candidates: candidate_ids.clone().into_par_iter().collect::<Vec<_>>(),
     });
 
     let mut candidates = candidate_ids
@@ -443,10 +430,10 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       .make_contiguous()
       .sort_unstable_by_key(|s| OrderedFloat(s.dist));
 
-    let mut new_neighbors = HashSet::new();
+    let mut new_neighbors = Vec::new();
     // Even though the algorithm in the paper doesn't actually pop, the later pruning of the candidates at the end of the loop guarantees it will always be removed because d(p*, p') will always be zero for itself (p* == p').
     while let Some(PointDist { id: p_star, .. }) = candidates.pop_front() {
-      assert!(new_neighbors.insert(p_star));
+      new_neighbors.push(p_star);
       if new_neighbors.len() == degree_bound {
         self.inst(|| VamanaInstrumentationEvent::RobustPruneIteration {
           node: node_id,
@@ -480,7 +467,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       #[derive(Default)]
       struct Update {
         // These two aren't the same and can't be merged, as otherwise we can't tell whether we are supposed to replace or merge with the existing out-neighbors.
-        replacement_base: Option<HashSet<Id>>,
+        replacement_base: Option<Vec<Id>>,
         additional_edges: HashSet<Id>,
       }
       let updates = DashMap::<Id, Update>::new();
@@ -506,7 +493,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
 
         // RobustPrune.
         // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
-        for n in self.ds.get_out_neighbors(id).unwrap_or_default() {
+        for n in self.ds.get_out_neighbors(id) {
           candidates.insert(n);
         }
         // RobustPrune requires that the point itself is never in the candidate set.
@@ -528,9 +515,11 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       updates.into_par_iter().for_each(|(id, u)| {
         let mut new_neighbors = u
           .replacement_base
-          .unwrap_or_else(|| self.ds.get_out_neighbors(id).unwrap());
+          .unwrap_or_else(|| self.ds.get_out_neighbors(id));
         for j in u.additional_edges {
-          new_neighbors.insert(j);
+          if !new_neighbors.contains(&j) {
+            new_neighbors.push(j);
+          };
         }
         if new_neighbors.len() > self.params.degree_bound {
           new_neighbors = self.compute_robust_pruned(id, new_neighbors);
@@ -594,10 +583,10 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
 #[cfg(test)]
 mod tests {
   use super::VamanaParams;
-  use crate::common::metric_euclidean;
   use crate::vamana::InMemoryVamana;
   use ahash::HashSet;
   use itertools::Itertools;
+  use libroxanne_search::metric_euclidean;
   use ndarray::Array;
   use ndarray::Array1;
   use ndarray_rand::RandomExt;
@@ -629,6 +618,7 @@ mod tests {
         beam_width: 1,
         degree_bound: r,
         distance_threshold: 1.1,
+        query_search_list_cap: search_list_cap,
         update_batch_size: 64,
         update_search_list_cap: search_list_cap,
       },

@@ -5,6 +5,7 @@ members = [
   "hnsw-to-roxanne",
   "hnswlib-rs",
   "libroxanne",
+  "search",
   "visualizer",
 ]
 

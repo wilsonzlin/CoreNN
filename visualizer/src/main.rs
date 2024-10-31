@@ -1,10 +1,10 @@
 use ahash::HashSet;
 use itertools::Itertools;
-use libroxanne::common::metric_euclidean;
-use libroxanne::common::Id;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::VamanaInstrumentationEvent;
 use libroxanne::vamana::VamanaParams;
+use libroxanne_search::metric_euclidean;
+use libroxanne_search::Id;
 use ndarray::array;
 use ordered_float::OrderedFloat;
 use rand::thread_rng;
@@ -44,6 +44,7 @@ fn main() {
       beam_width: 1,
       degree_bound: r,
       distance_threshold: 1.1,
+      query_search_list_cap: search_list_cap,
       update_batch_size: 64,
       update_search_list_cap: search_list_cap,
     },

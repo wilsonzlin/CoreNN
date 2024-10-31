@@ -1,9 +1,9 @@
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use clap::Parser;
-use libroxanne::common::metric_euclidean;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::VamanaParams;
+use libroxanne_search::metric_euclidean;
 use roxanne_analysis::analyse_index;
 use roxanne_analysis::read_vectors;
 use std::fs;
@@ -40,6 +40,7 @@ fn main() {
     beam_width: args.beam_width,
     degree_bound: args.degree_bound,
     distance_threshold: args.distance_threshold,
+    query_search_list_cap: (k as f64 * args.search_list_cap_mul) as usize,
     update_batch_size: args.insert_batch_size,
     update_search_list_cap: (k as f64 * args.search_list_cap_mul) as usize,
   };
