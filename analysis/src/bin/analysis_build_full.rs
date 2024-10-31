@@ -16,10 +16,10 @@ fn main() {
 
   let full_dists = vecs
     .par_iter()
-    .flat_map(|(_, vec_i)| {
+    .flat_map(|vec_i| {
       vecs
         .par_iter()
-        .map(|(_, vec_j)| metric_euclidean(&vec_i.view(), &vec_j.view()))
+        .map(|vec_j| metric_euclidean(&vec_i.view(), &vec_j.view()))
     })
     .collect::<Vec<_>>();
   println!("Calculated full dists");

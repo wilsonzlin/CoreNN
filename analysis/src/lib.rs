@@ -2,6 +2,7 @@ use ahash::HashMap;
 use ahash::HashSet;
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
+use byteorder::ReadBytesExt;
 use itertools::Itertools;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::Vamana;
@@ -21,10 +22,15 @@ use std::mem::size_of;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+pub fn read_vectors_dims(filename: &str) -> usize {
+  let mut f = File::open(format!("dataset/{filename}")).unwrap();
+  f.read_u32::<LittleEndian>().unwrap() as usize
+}
+
 pub fn read_vectors<T: Copy + Default + Send, Reader: Fn(&[u8], &mut [T]) + Sync>(
   filename: &str,
   reader: Reader,
-) -> Vec<(Id, Array1<T>)> {
+) -> Vec<Array1<T>> {
   let raw = std::fs::read(format!("dataset/{filename}")).unwrap();
   let dims = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
 
@@ -45,7 +51,7 @@ pub fn read_vectors<T: Copy + Default + Send, Reader: Fn(&[u8], &mut [T]) + Sync
       );
       let mut vec = vec![T::default(); dims];
       reader(raw, vec.as_mut_slice());
-      (i, Array1::from_vec(vec))
+      Array1::from_vec(vec)
     })
     .collect::<Vec<_>>()
 }
@@ -64,15 +70,15 @@ impl Eval {
 
 pub fn eval<DS: VamanaDatastore<f32>>(
   index: &Vamana<f32, DS>,
-  queries: &[(usize, Array1<f32>)],
-  ground_truth: &[(usize, Array1<u32>)],
+  queries: &[Array1<f32>],
+  ground_truth: &[Array1<u32>],
 ) -> Eval {
-  let k = ground_truth[0].1.len();
+  let k = ground_truth[0].len();
   let correct = AtomicUsize::new(0);
   let query_metrics = queries
     .into_par_iter()
     .zip(ground_truth)
-    .map(|((_, vec), (_, knn_expected))| {
+    .map(|(vec, knn_expected)| {
       let knn_expected = HashSet::from_iter(knn_expected.mapv(|v| v as Id));
       let (res, metrics) = index.query_with_metrics(&vec.view(), k, Some(&knn_expected));
       let knn_got = res.into_iter().map(|pd| pd.id).collect::<HashSet<_>>();
@@ -112,7 +118,7 @@ pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
         .value()
         .par_iter()
         .map(|&j| {
-          let dist = metric_euclidean(&vecs[i].1.view(), &vecs[j].1.view());
+          let dist = metric_euclidean(&vecs[i].view(), &vecs[j].view());
           (j, dist)
         })
         .collect::<HashMap<_, _>>();
@@ -129,7 +135,7 @@ pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
 
   let medoid_dists = vecs
     .par_iter()
-    .map(|(_, vec_i)| metric_euclidean(&vecs[index.medoid()].1.view(), &vec_i.view()))
+    .map(|vec_i| metric_euclidean(&vecs[index.medoid()].view(), &vec_i.view()))
     .collect::<Vec<_>>();
   println!("Calculated medoid dists");
   File::create(format!("out/{out_dir}/medoid_dists.mat"))

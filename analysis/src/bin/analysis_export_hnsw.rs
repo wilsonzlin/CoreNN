@@ -1,7 +1,5 @@
 use ahash::HashMap;
 use ahash::HashMapExt;
-use byteorder::ByteOrder;
-use byteorder::LittleEndian;
 use clap::Parser;
 use dashmap::DashMap;
 use hnswlib_rs::HnswIndex;
@@ -12,7 +10,7 @@ use libroxanne_search::metric_euclidean;
 use libroxanne_search::Id;
 use ndarray::Array1;
 use roxanne_analysis::analyse_index;
-use roxanne_analysis::read_vectors;
+use roxanne_analysis::read_vectors_dims;
 use std::fs;
 use std::fs::File;
 
@@ -31,10 +29,10 @@ fn main() {
 
   fs::create_dir_all("out/hnsw").unwrap();
 
-  let knns = read_vectors("groundtruth.ivecs", LittleEndian::read_u32_into);
-  let k = knns[0].1.len();
+  let dim = read_vectors_dims("base.fvecs");
+  let k = read_vectors_dims("groundtruth.ivecs");
 
-  let hnsw = HnswIndex::load(128, File::open("out/hnsw/index.hnsw").unwrap());
+  let hnsw = HnswIndex::load(dim, File::open("out/hnsw/index.hnsw").unwrap());
   println!("Loaded index");
 
   let mut graph_dists_by_level = HashMap::<usize, HashMap<Id, HashMap<Id, f64>>>::new();

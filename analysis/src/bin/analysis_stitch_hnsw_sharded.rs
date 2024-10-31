@@ -45,12 +45,12 @@ struct Args {
 }
 
 struct Ctx {
-  ground_truths: Vec<(Id, Array1<u32>)>,
+  ground_truths: Vec<Array1<u32>>,
   k: usize,
   level_to_shard_to_nodes: DashMap<usize, DashMap<usize, Vec<Id>>>,
   medoid: Id,
   node_to_level: DashMap<Id, usize>,
-  queries: Vec<(Id, Array1<f32>)>,
+  queries: Vec<Array1<f32>>,
   shards: Vec<HnswIndex>,
 }
 
@@ -178,7 +178,7 @@ fn strategy_stitch_cliques(
       .iter()
       .map(|e| {
         let hnsw = &ctx.shards[*e.key()];
-        hnsw.build_level_graph(level, e.value())
+        hnsw.build_level_index(level, e.value())
       })
       .collect_vec();
 
@@ -273,11 +273,11 @@ fn main() {
 
   let queries = read_vectors("query.fvecs", LittleEndian::read_f32_into);
   let ground_truths = read_vectors("groundtruth.ivecs", LittleEndian::read_u32_into);
-  let k = ground_truths[0].1.len();
+  let k = ground_truths[0].len();
 
   let hnsws = shard_files
     .par_iter()
-    .map(|f| HnswIndex::load(128, File::open(f).unwrap()))
+    .map(|f| HnswIndex::load(queries[0].len(), File::open(f).unwrap()))
     .collect::<Vec<_>>();
   let level_to_shard_to_nodes = DashMap::<usize, DashMap<usize, Vec<Id>>>::new();
   let node_to_level = DashMap::<Id, usize>::new();

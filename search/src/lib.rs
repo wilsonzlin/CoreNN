@@ -47,7 +47,7 @@ pub fn metric_cosine<T: Scalar>(a: &ArrayView1<T>, b: &ArrayView1<T>) -> f64 {
   }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Display, EnumString)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Display, EnumString, Serialize, Deserialize)]
 pub enum StdMetric {
   L2,
   Cosine,

@@ -22,6 +22,7 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
+use serde::Serialize;
 use std::cmp::Reverse;
 use std::fs::File;
 use std::io::BufReader;
@@ -29,6 +30,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::Sender;
+use std::thread::spawn;
+use std::thread::JoinHandle;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -90,15 +94,52 @@ fn new_pb(len: usize) -> ProgressBar {
   pb
 }
 
+// LMDB has excruciatingly slow writes, so we send all writes to one thread with one giant long-term transaction.
+struct Db {
+  send: Sender<(Vec<u8>, Vec<u8>)>,
+  thread: JoinHandle<()>,
+}
+
+impl Db {
+  pub fn new(dir: PathBuf) -> Self {
+    let (send, recv) = std::sync::mpsc::channel::<(Vec<u8>, Vec<u8>)>();
+    let thread = spawn(move || {
+      std::fs::create_dir_all(&dir).unwrap();
+      // Use an arbitrarily huge value for map size; the default is 10 MiB.
+      let db_env = Environment::new()
+        .set_map_size(1024 * 1024 * 1024 * 1024 * 64)
+        .open(&dir)
+        .unwrap();
+      let db = db_env.create_db(None, DatabaseFlags::empty()).unwrap();
+      let mut txn = db_env.begin_rw_txn().unwrap();
+      while let Some((k, v)) = recv.recv().ok() {
+        txn.put(db, &k, &v, WriteFlags::empty()).unwrap();
+      }
+      txn.commit().unwrap();
+    });
+    Self { send, thread }
+  }
+
+  pub fn write(&self, k: impl AsRef<str>, v: &impl Serialize) {
+    let k = k.as_ref().to_string().into_bytes();
+    let v = rmp_serde::to_vec_named(v).unwrap();
+    self.send.send((k, v)).unwrap();
+  }
+
+  pub fn finish(self) {
+    drop(self.send);
+    self.thread.join().unwrap();
+  }
+}
+
 // We don't perform PQ here, as it's expensive and not specifically related to this task; use the general `pqify` tool afterwards.
 fn main() {
   let args = Args::parse();
   let metric = args.metric.get_fn::<f32>();
 
   // Make sure database can be created before we do long expensive work.
-  let db_env = Environment::new().open(&args.out).unwrap();
-  let db = db_env.create_db(None, DatabaseFlags::empty()).unwrap();
   println!("Created database");
+  let db = Db::new(args.out.clone());
 
   // First phase: load each shard to ensure integrity and compute some things.
   // - Ensure all shard files exist and are intact before we start doing long intensive work.
@@ -130,7 +171,8 @@ fn main() {
     pb.inc(1);
   });
   let total_n = total_n.load(Ordering::Relaxed);
-  pb.finish_with_message("Verified shards");
+  pb.finish();
+  println!("Verified shards");
 
   let pb = new_pb(total_n);
   let mut medoid: Option<Id> = None;
@@ -140,7 +182,7 @@ fn main() {
   // We don't need a set, as a node cannot have an out-neighbor that also exists in another shard.
   let clique_neighbors = DashMap::<Id, Vec<Id>>::new();
   let node_to_clique = DashMap::<Id, Id>::new();
-  // We want to go by level as nodes on different levels have different edge length and count distributions, which is probably ideal to preserve.
+  // We want to go level-by-level as nodes on different levels have different edge length and count distributions, which is probably ideal to preserve.
   for (level, mut shards) in shard_nodes_by_level
     .into_iter()
     .sorted_unstable_by_key(|e| e.0)
@@ -152,7 +194,7 @@ fn main() {
 
     let (base_file, base_level_nodes) = &shards[0];
     let base = load_hnsw(args.dim, base_file);
-    let base_graph = base.build_level_graph(level, base_level_nodes);
+    let base_graph = base.build_level_index(level, base_level_nodes);
     // We can't just pick the entry point as the start that may not exist on our level.
     let base_path = find_shortest_spanning_path(&base_graph, metric, base_level_nodes[0]);
     if medoid.is_none() {
@@ -166,18 +208,19 @@ fn main() {
         .is_none());
       assert!(node_to_clique.insert(id, id).is_none());
     });
+    pb.inc(base_level_nodes.len() as u64);
 
     for batch in (&shards[1..]).chunks(args.parallel - 1) {
       batch.into_par_iter().for_each(|(path, shard_level_nodes)| {
         let other = load_hnsw(args.dim, path);
-        let other_graph = other.build_level_graph(level, &shard_level_nodes);
+        let other_graph = other.build_level_index(level, &shard_level_nodes);
         let mut available = shard_level_nodes.iter().cloned().collect::<HashSet<_>>();
 
         for (base_id_from, base_id) in base_path.iter().cloned() {
           let base_vec = base_graph.get_point(base_id);
 
-          // If None: we're at the start.
-          cliques
+          let other_node = cliques
+            // If None: we're at the start.
             .get(&base_id_from)
             // If None: no eqivalent to `from` in this shard was found previously.
             .and_then(|c| c.get(path).map(|e| *e))
@@ -192,25 +235,29 @@ fn main() {
                 start,
                 |n| available.contains(&n),
               )
-            })
-            .inspect(|&other_node| {
-              pb.inc(1);
-              assert!(available.remove(&other_node));
-              cliques
-                .get_mut(&base_id)
-                .unwrap()
-                .insert(path.clone(), other_node);
-              clique_neighbors
-                .get_mut(&base_id)
-                .unwrap()
-                .extend(other.get_merged_neighbors(other_node, 0));
-              assert!(node_to_clique.insert(other_node, base_id).is_none());
             });
+          let Some(other_node) = other_node else {
+            continue;
+          };
+
+          assert!(available.remove(&other_node));
+          cliques
+            .get_mut(&base_id)
+            .unwrap()
+            .insert(path.clone(), other_node);
+          clique_neighbors
+            .get_mut(&base_id)
+            .unwrap()
+            .extend(other.get_merged_neighbors(other_node, 0));
+          assert!(node_to_clique.insert(other_node, base_id).is_none());
+          pb.inc(1);
         }
       });
     }
   }
-  pb.finish_with_message("Processed shards");
+  let nodes_touched = pb.position();
+  pb.finish();
+  println!("Processed shards: {nodes_touched} of {total_n} nodes updated");
 
   // Allow custom params for new super graph that will likely be stored on disk, which means the params might be different from a single HNSW shard's (so don't just copy existing).
   let cfg = VamanaParams {
@@ -222,65 +269,35 @@ fn main() {
     update_search_list_cap: args.update_search_list_cap,
   };
 
-  {
-    let mut txn = db_env.begin_rw_txn().unwrap();
-    txn
-      .put(
-        db,
-        &"cfg".to_string(),
-        &rmp_serde::to_vec_named(&cfg).unwrap(),
-        WriteFlags::empty(),
-      )
-      .unwrap();
-    txn
-      .put(
-        db,
-        &"dim".to_string(),
-        &args.dim.to_le_bytes(),
-        WriteFlags::empty(),
-      )
-      .unwrap();
-    txn
-      .put(
-        db,
-        &"medoid".to_string(),
-        &medoid.unwrap().to_le_bytes(),
-        WriteFlags::empty(),
-      )
-      .unwrap();
-    txn
-      .put(
-        db,
-        &"metric".to_string(),
-        &args.metric.to_string(),
-        WriteFlags::empty(),
-      )
-      .unwrap();
-  }
+  db.write("cfg", &cfg);
+  db.write("dim", &args.dim);
+  db.write("medoid", &medoid);
+  db.write("metric", &args.metric);
 
   let pb = new_pb(total_n);
   for path_batch in paths.chunks(args.parallel) {
     path_batch.into_par_iter().for_each(|path| {
       let index = load_hnsw(args.dim, path);
       index.labels().par_bridge().for_each(|id| {
-        let clique_id = node_to_clique.get(&id).unwrap();
-        let new_out_neighbors = clique_neighbors.get(&clique_id).unwrap();
+        let neighbors = match node_to_clique.get(&id) {
+          Some(clique_id) => clique_neighbors.get(&clique_id).unwrap().clone(),
+          // This node was not matched to any clique, so just use existing neighbors.
+          None => index.get_merged_neighbors(id, 0).into_iter().collect_vec(),
+        };
 
         let mut node_data = Vec::new();
-        node_data.extend(new_out_neighbors.len().to_le_bytes());
-        for &n in new_out_neighbors.iter() {
-          node_data.extend(n.to_le_bytes());
-        }
-        node_data.extend(index.get_raw_data_by_internal_id(index.get_internal_id(id)));
+        node_data.extend(neighbors.len().to_le_bytes());
+        node_data.extend(neighbors.into_iter().flat_map(|n| n.to_le_bytes()));
+        node_data.extend(index.get_raw_data_by_label(id));
 
-        let mut txn = db_env.begin_rw_txn().unwrap();
-        txn
-          .put(db, &format!("node/{id}"), &node_data, WriteFlags::empty())
-          .unwrap();
-        txn.commit().unwrap();
+        db.write(format!("node/{id}"), &node_data);
         pb.inc(1);
       });
     });
   }
-  pb.finish_with_message("All done!");
+  pb.finish();
+  println!("Finalizing database");
+
+  db.finish();
+  println!("All done!");
 }

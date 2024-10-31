@@ -150,13 +150,48 @@ impl HnswIndex {
     }
   }
 
-  pub fn get_raw_data_by_internal_id(&self, internal_id: TableInt) -> &[u8] {
+  pub fn entry_label(&self) -> LabelType {
+    self.get_external_label(self.enter_point_node)
+  }
+
+  fn get_internal_id(&self, label: LabelType) -> TableInt {
+    *self.label_lookup.get(&label).unwrap()
+  }
+
+  fn get_external_label(&self, internal_id: TableInt) -> LabelType {
+    get_external_label(
+      &self.data_level_0_memory,
+      internal_id,
+      self.size_data_per_element,
+      self.label_offset,
+    )
+  }
+
+  pub fn has_label(&self, label: LabelType) -> bool {
+    self.label_lookup.contains_key(&label)
+  }
+
+  pub fn internal_ids(&self) -> std::ops::Range<TableInt> {
+    0..TableInt::try_from(self.cur_element_count).unwrap()
+  }
+
+  pub fn labels(&self) -> impl Iterator<Item = LabelType> + '_ {
+    self
+      .internal_ids()
+      .map(|internal_id| self.get_external_label(internal_id))
+  }
+
+  fn get_raw_data_by_internal_id(&self, internal_id: TableInt) -> &[u8] {
     let internal_id: usize = internal_id.try_into().unwrap();
     let pos = internal_id * self.size_data_per_element + self.offset_data;
     &self.data_level_0_memory[pos..]
   }
 
-  pub fn get_data_by_internal_id(&self, internal_id: TableInt) -> Vec<f32> {
+  pub fn get_raw_data_by_label(&self, label: LabelType) -> &[u8] {
+    self.get_raw_data_by_internal_id(self.get_internal_id(label))
+  }
+
+  fn get_data_by_internal_id(&self, internal_id: TableInt) -> Vec<f32> {
     let ptr = self.get_raw_data_by_internal_id(internal_id);
     let mut vec = vec![0.0f32; self.dim];
     LittleEndian::read_f32_into(&ptr[..4 * self.dim], &mut vec);
@@ -164,8 +199,7 @@ impl HnswIndex {
   }
 
   pub fn get_data_by_label(&self, label: LabelType) -> Vec<f32> {
-    let internal_id = self.get_internal_id(label);
-    self.get_data_by_internal_id(internal_id)
+    self.get_data_by_internal_id(self.get_internal_id(label))
   }
 
   fn get_link_list(&self, internal_id: TableInt, level: usize) -> Vec<TableInt> {
@@ -202,7 +236,6 @@ impl HnswIndex {
     let internal_id = self.get_internal_id(label);
     let mut out = HashSet::new();
     // Source: searchKnn and searchBaseLayerST (called by searchKnn).
-    // Bound to node's own level to avoid out-of-bounds access in get_link_list, which the source doesn't do for some reason: https://github.com/nmslib/hnswlib/issues/595.
     for level in min_level..=self.get_node_level(label) {
       let list = self.get_link_list(internal_id, level);
       for internal_id in list {
@@ -220,38 +253,7 @@ impl HnswIndex {
     self.element_levels[internal_id as usize]
   }
 
-  pub fn entry_label(&self) -> LabelType {
-    self.get_external_label(self.enter_point_node)
-  }
-
-  pub fn get_internal_id(&self, label: LabelType) -> TableInt {
-    *self.label_lookup.get(&label).unwrap()
-  }
-
-  pub fn get_external_label(&self, internal_id: TableInt) -> LabelType {
-    get_external_label(
-      &self.data_level_0_memory,
-      internal_id,
-      self.size_data_per_element,
-      self.label_offset,
-    )
-  }
-
-  pub fn has_label(&self, label: LabelType) -> bool {
-    self.label_lookup.contains_key(&label)
-  }
-
-  pub fn internal_ids(&self) -> std::ops::Range<TableInt> {
-    0..TableInt::try_from(self.cur_element_count).unwrap()
-  }
-
-  pub fn labels(&self) -> impl Iterator<Item = LabelType> + '_ {
-    self
-      .internal_ids()
-      .map(|internal_id| self.get_external_label(internal_id))
-  }
-
-  pub fn build_level_graph(&self, level: usize, level_nodes: &[LabelType]) -> HnswLevelIndex {
+  pub fn build_level_index(&self, level: usize, level_nodes: &[LabelType]) -> HnswLevelIndex {
     let graph = level_nodes
       .iter()
       .map(|&id| {
