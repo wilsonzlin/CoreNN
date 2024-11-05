@@ -19,7 +19,7 @@ shard_size = n // shards
 for i in range(0, shards):
     shard_ids = ids[i * shard_size : (i + 1) * shard_size]
     index = hnswlib.Index("l2", dim)
-    index.init_index(max_elements=shard_size, ef_construction=133, M=16)
+    index.init_index(max_elements=shard_size, ef_construction=133, M=80)
     print("Indexing", i)
     index.add_items(mat[shard_ids, :], shard_ids)
     print("Saving", i)

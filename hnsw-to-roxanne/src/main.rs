@@ -278,7 +278,8 @@ fn main() {
   for path_batch in paths.chunks(args.parallel) {
     path_batch.into_par_iter().for_each(|path| {
       let index = load_hnsw(args.dim, path);
-      index.labels().par_bridge().for_each(|id| {
+      // Collect to Vec so we can use into_par_iter, which is much faster than par_bridge.
+      index.labels().collect_vec().into_par_iter().for_each(|id| {
         let neighbors = match node_to_clique.get(&id) {
           Some(clique_id) => clique_neighbors.get(&clique_id).unwrap().clone(),
           // This node was not matched to any clique, so just use existing neighbors.
