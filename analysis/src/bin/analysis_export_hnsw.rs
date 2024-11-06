@@ -76,6 +76,7 @@ fn main() {
     update_batch_size: num_cpus::get(),
     update_search_list_cap: (k as f64 * args.search_list_cap_mul) as usize,
   };
+  println!("{params:?}");
   let ds = InMemoryVamana::new(
     hnsw
       .labels()

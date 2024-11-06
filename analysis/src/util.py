@@ -16,7 +16,7 @@ def read_vectors(path: str, dtype: npt.DTypeLike) -> np.ndarray:
     return np.vstack(
         [
             # Add 4 to skip past leading dim. uint32.
-            np.frombuffer(raw, dtype=np.float32, count=dim, offset=raw_vec_len * i + 4)
+            np.frombuffer(raw, dtype=dtype, count=dim, offset=raw_vec_len * i + 4)
             for i in range(n)
         ]
     )
