@@ -1,8 +1,12 @@
 import matplotlib.pyplot as plt
 import msgpack
+import os
+
+dataset = os.environ["DS"]
 
 edge_dists_by_level = msgpack.unpack(
-    open("out/hnsw/edge_dists_by_level.msgpack", "rb"), strict_map_key=False
+    open(f"dataset/{dataset}/out/hnsw/edge_dists_by_level.msgpack", "rb"),
+    strict_map_key=False,
 )
 print("Loaded edge dists by level")
 
@@ -23,6 +27,9 @@ for level, edge_dists in edge_dists_by_level.items():
 
 plt.tight_layout()
 plt.savefig(
-    "out/hnsw/edge_dists_by_level.webp", format="webp", bbox_inches="tight", dpi=150
+    f"dataset/{dataset}/out/hnsw/edge_dists_by_level.webp",
+    format="webp",
+    bbox_inches="tight",
+    dpi=150,
 )
 print("Rendered plot")

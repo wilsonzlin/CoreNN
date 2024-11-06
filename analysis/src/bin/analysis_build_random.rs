@@ -23,9 +23,11 @@ struct Args {
 }
 
 fn main() {
+  let ds = std::env::var("DS").unwrap();
+
   let args = Args::parse();
 
-  fs::create_dir_all("out/random").unwrap();
+  fs::create_dir_all(format!("dataset/{ds}/out/random")).unwrap();
 
   let vecs = read_vectors("base.fvecs", LittleEndian::read_f32_into);
   let k = read_vectors_dims("groundtruth.ivecs");

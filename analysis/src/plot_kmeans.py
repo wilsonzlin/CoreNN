@@ -1,16 +1,18 @@
 from sklearn.cluster import MiniBatchKMeans
 from util import read_vectors
-import json
 import matplotlib.pyplot as plt
+import msgpack
 import numpy as np
+import os
 
-with open("out/graph_dists.json", "r") as f:
-    graph_dists = {
-        int(i): {int(j): v for j, v in d.items()} for i, d in json.load(f).items()
-    }
-print("Loaded graph dists")
+dataset = os.environ["DS"]
 
-vecs = read_vectors("dataset/base.fvecs", np.float32)
+edge_dists = msgpack.unpack(
+    open(f"dataset/{dataset}/out/vamana/edge_dists.msgpack", "rb"), strict_map_key=False
+)
+print("Loaded edge dists")
+
+vecs = read_vectors("dataset/{dataset}/base.fvecs", np.float32)
 print("Loaded vectors")
 
 k = 32
@@ -28,7 +30,7 @@ fig.suptitle("Graph edge distances by cluster", fontsize=16, y=1.02)
 axes_flat = axes.flatten()
 
 
-all_values = np.array([v for d in graph_dists.values() for v in d.values()])
+all_values = np.array([v for d in edge_dists.values() for v in d.values()])
 # Calculate global min and max for x-axis
 global_min = np.min(all_values)
 global_max = np.max(all_values)
@@ -38,7 +40,7 @@ all_bins = np.linspace(global_min, global_max, 150)
 max_frequency = 0
 for i in range(k):
     cluster_data = []
-    for src, dists in graph_dists.items():
+    for src, dists in edge_dists.items():
         cluster = cluster_labels[src]
         if cluster == i:
             cluster_data.extend(dists.values())
@@ -50,7 +52,7 @@ for i in range(k):
 for i in range(k):
     ax = axes_flat[i]
     cluster_data = []
-    for src, dists in graph_dists.items():
+    for src, dists in edge_dists.items():
         cluster = cluster_labels[src]
         if cluster == i:
             cluster_data.extend(dists.values())
@@ -65,7 +67,7 @@ for i in range(k):
     print(f"Plotted cluster {i}")
 
 plt.tight_layout()
-plt.savefig("out/graph_dists.kmeans.webp", format="webp", bbox_inches="tight", dpi=150)
+plt.savefig("out/edge_dists.kmeans.webp", format="webp", bbox_inches="tight", dpi=150)
 print("Rendered plot")
 
 

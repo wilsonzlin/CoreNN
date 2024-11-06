@@ -263,10 +263,11 @@ fn strategy_stitch_cliques(
 }
 
 fn main() {
+  let ds = std::env::var("DS").unwrap();
   let args = Args::parse();
 
-  fs::create_dir_all("out/hnsw-sharded").unwrap();
-  let shard_files = fs::read_dir("out/hnsw-sharded/indices")
+  fs::create_dir_all(format!("dataset/{ds}/out/hnsw-sharded")).unwrap();
+  let shard_files = fs::read_dir(format!("dataset/{ds}/out/hnsw-sharded/indices"))
     .unwrap()
     .map(|e| e.unwrap().path())
     .collect_vec();

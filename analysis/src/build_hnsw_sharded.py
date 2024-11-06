@@ -1,13 +1,18 @@
 from util import read_vectors
 import hnswlib
 import numpy as np
+import os
 import pathlib
 
+dataset = os.environ["DS"]
+
 print("Loading")
-mat = read_vectors("dataset/base.fvecs", np.float32)
+mat = read_vectors(f"dataset/{dataset}/base.fvecs", np.float32)
 n, dim = mat.shape
 
-pathlib.Path("out/hnsw-sharded/indices").mkdir(parents=True, exist_ok=True)
+pathlib.Path(f"dataset/{dataset}/out/hnsw-sharded/indices").mkdir(
+    parents=True, exist_ok=True
+)
 
 ids = np.arange(n)
 np.random.seed(42)
@@ -23,5 +28,5 @@ for i in range(0, shards):
     print("Indexing", i)
     index.add_items(mat[shard_ids, :], shard_ids)
     print("Saving", i)
-    index.save_index(f"out/hnsw-sharded/indices/shard{i}.hnsw")
+    index.save_index(f"dataset/{dataset}/out/hnsw-sharded/indices/shard{i}.hnsw")
 print("All done!")

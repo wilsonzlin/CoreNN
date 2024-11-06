@@ -10,7 +10,9 @@ use std::fs::File;
 use std::io::Write;
 
 fn main() {
-  fs::create_dir_all("out/full").unwrap();
+  let ds = std::env::var("DS").unwrap();
+
+  fs::create_dir_all(format!("dataset/{ds}/out/full")).unwrap();
 
   let vecs = read_vectors("base.fvecs", LittleEndian::read_f32_into);
 
@@ -23,7 +25,7 @@ fn main() {
     })
     .collect::<Vec<_>>();
   println!("Calculated full dists");
-  File::create("out/full/edge_dists.mat")
+  File::create(format!("dataset/{ds}/out/full/edge_dists.mat"))
     .unwrap()
     .write_all(
       &full_dists

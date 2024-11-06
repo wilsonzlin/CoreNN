@@ -25,14 +25,19 @@ struct Args {
 }
 
 fn main() {
+  let ds = std::env::var("DS").unwrap();
+
   let args = Args::parse();
 
-  fs::create_dir_all("out/hnsw").unwrap();
+  fs::create_dir_all(format!("dataset/{ds}/out/hnsw")).unwrap();
 
   let dim = read_vectors_dims("base.fvecs");
   let k = read_vectors_dims("groundtruth.ivecs");
 
-  let hnsw = HnswIndex::load(dim, File::open("out/hnsw/index.hnsw").unwrap());
+  let hnsw = HnswIndex::load(
+    dim,
+    File::open(format!("dataset/{ds}/out/hnsw/index.hnsw")).unwrap(),
+  );
   println!("Loaded index");
 
   let mut graph_dists_by_level = HashMap::<usize, HashMap<Id, HashMap<Id, f64>>>::new();
@@ -57,7 +62,7 @@ fn main() {
   }
   println!("Calculated edge dists by level");
   fs::write(
-    format!("out/hnsw/edge_dists_by_level.msgpack"),
+    format!("dataset/{ds}/out/hnsw/edge_dists_by_level.msgpack"),
     rmp_serde::to_vec_named(&graph_dists_by_level).unwrap(),
   )
   .unwrap();

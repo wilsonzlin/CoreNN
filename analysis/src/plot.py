@@ -4,7 +4,7 @@ import msgpack
 import numpy as np
 import sys
 
-# Path to dir containing output data e.g. out/vamana.
+# Path to dir containing output data e.g. dataset/sift/out/vamana.
 d = sys.argv[1]
 
 graph = msgpack.unpack(open(f"{d}/graph.msgpack", "rb"), strict_map_key=False)

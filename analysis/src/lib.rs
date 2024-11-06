@@ -23,7 +23,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 pub fn read_vectors_dims(filename: &str) -> usize {
-  let mut f = File::open(format!("dataset/{filename}")).unwrap();
+  let dataset = std::env::var("DS").unwrap();
+  let mut f = File::open(format!("dataset/{dataset}/{filename}")).unwrap();
   f.read_u32::<LittleEndian>().unwrap() as usize
 }
 
@@ -31,7 +32,8 @@ pub fn read_vectors<T: Copy + Default + Send, Reader: Fn(&[u8], &mut [T]) + Sync
   filename: &str,
   reader: Reader,
 ) -> Vec<Array1<T>> {
-  let raw = std::fs::read(format!("dataset/{filename}")).unwrap();
+  let dataset = std::env::var("DS").unwrap();
+  let raw = std::fs::read(format!("dataset/{dataset}/{filename}")).unwrap();
   let dims = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
 
   let bytes_per_vec = 4 + dims * size_of::<T>();
@@ -98,13 +100,14 @@ pub fn eval<DS: VamanaDatastore<f32>>(
 }
 
 pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
+  let ds = std::env::var("DS").unwrap();
   let vecs = read_vectors("base.fvecs", LittleEndian::read_f32_into);
   let qs = read_vectors("query.fvecs", LittleEndian::read_f32_into);
   let knns = read_vectors("groundtruth.ivecs", LittleEndian::read_u32_into);
 
   let graph = index.datastore().graph();
   fs::write(
-    format!("out/{out_dir}/graph.msgpack"),
+    format!("dataset/{ds}/out/{out_dir}/graph.msgpack"),
     rmp_serde::to_vec_named(&graph).unwrap(),
   )
   .unwrap();
@@ -127,7 +130,7 @@ pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
     .collect::<HashMap<_, _>>();
   println!("Calculated edge dists");
   fs::write(
-    format!("out/{out_dir}/edge_dists.msgpack"),
+    format!("dataset/{ds}/out/{out_dir}/edge_dists.msgpack"),
     rmp_serde::to_vec_named(&ann_dists).unwrap(),
   )
   .unwrap();
@@ -138,7 +141,7 @@ pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
     .map(|vec_i| metric_euclidean(&vecs[index.medoid()].view(), &vec_i.view()))
     .collect::<Vec<_>>();
   println!("Calculated medoid dists");
-  File::create(format!("out/{out_dir}/medoid_dists.mat"))
+  File::create(format!("dataset/{ds}/out/{out_dir}/medoid_dists.mat"))
     .unwrap()
     .write_all(
       &medoid_dists
@@ -151,7 +154,7 @@ pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
 
   let e = eval(&index, &qs, &knns);
   fs::write(
-    format!("out/{out_dir}/query_metrics.msgpack"),
+    format!("dataset/{ds}/out/{out_dir}/query_metrics.msgpack"),
     rmp_serde::to_vec_named(&e.query_metrics).unwrap(),
   )
   .unwrap();
