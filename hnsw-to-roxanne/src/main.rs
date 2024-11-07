@@ -8,11 +8,12 @@ use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use itertools::Itertools;
 use libroxanne::vamana::VamanaParams;
-use libroxanne_search::find_shortest_spanning_path;
+use libroxanne_search::find_shortest_spanning_tree;
 use libroxanne_search::greedy_search_fast1;
 use libroxanne_search::metric_euclidean;
 use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
+use libroxanne_search::PointDist;
 use libroxanne_search::StdMetric;
 use lmdb::DatabaseFlags;
 use lmdb::Environment;
@@ -20,7 +21,6 @@ use lmdb::Transaction;
 use lmdb::WriteFlags;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
-use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -196,7 +196,7 @@ fn main() {
     let base = load_hnsw(args.dim, base_file);
     let base_graph = base.build_level_index(level, base_level_nodes);
     // We can't just pick the entry point as the start that may not exist on our level.
-    let base_path = find_shortest_spanning_path(&base_graph, metric, base_level_nodes[0]);
+    let base_path = find_shortest_spanning_tree(&base_graph, metric, base_level_nodes[0]);
     if medoid.is_none() {
       medoid = Some(base.entry_label());
     };
@@ -236,7 +236,7 @@ fn main() {
                 |n| available.contains(&n),
               )
             });
-          let Some(other_node) = other_node else {
+          let Some(PointDist { id: other_node, .. }) = other_node else {
             continue;
           };
 

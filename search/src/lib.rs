@@ -91,7 +91,7 @@ pub fn greedy_search_fast1<T: Scalar + Send + Sync>(
   metric: Metric<T>,
   start: Id,
   filter: impl (Fn(Id) -> bool) + Send + Sync,
-) -> Option<Id> {
+) -> Option<PointDist> {
   struct State {
     cur: PointDist,
     optima: Option<PointDist>,
@@ -134,10 +134,10 @@ pub fn greedy_search_fast1<T: Scalar + Send + Sync>(
       break;
     }
   }
-  state.into_inner().optima.map(|n| n.id)
+  state.into_inner().optima
 }
 
-pub fn find_shortest_spanning_path<T: Scalar + Send + Sync>(
+pub fn find_shortest_spanning_tree<T: Scalar + Send + Sync>(
   graph: &impl GreedySearchable<T>,
   metric: Metric<T>,
   start: Id,
@@ -153,7 +153,6 @@ pub fn find_shortest_spanning_path<T: Scalar + Send + Sync>(
       continue;
     };
 
-    // We could just search the other shards here, instead of storing the path. However, we do it this way to emulate how it works in reality, as it's unlikely we can load all shards into memory at once.
     path.push((from, to));
 
     // Move on to neighbors of `to` in the base shard.

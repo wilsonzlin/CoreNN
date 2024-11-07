@@ -10,11 +10,12 @@ use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::OptimizeMetrics;
 use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaParams;
-use libroxanne_search::find_shortest_spanning_path;
+use libroxanne_search::find_shortest_spanning_tree;
 use libroxanne_search::greedy_search_fast1;
 use libroxanne_search::metric_euclidean;
 use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
+use libroxanne_search::PointDist;
 use ndarray::Array1;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -192,7 +193,7 @@ fn strategy_stitch_cliques(
     // Map from base node ID to map from shard number to shard node ID.
     let cliques = DashMap::<Id, DashMap<usize, Id>>::new();
     // We can't just pick the entry point as the start that may not exist on our level.
-    let base_path = find_shortest_spanning_path(
+    let base_path = find_shortest_spanning_tree(
       &graphs[0],
       metric_euclidean,
       *graphs[0].level_graph().keys().next().unwrap(),
@@ -218,7 +219,7 @@ fn strategy_stitch_cliques(
               available.contains(&n)
             })
           })
-          .inspect(|&other_node| {
+          .inspect(|&PointDist { id: other_node, .. }| {
             cliques.entry(to).or_default().insert(i, other_node);
             assert!(available.remove(&other_node));
           });

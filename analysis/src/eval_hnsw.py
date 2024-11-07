@@ -21,6 +21,6 @@ knn, _ = index.knn_query(mat, k)
 correct = 0
 total = n * k
 for i in range(n):
-  correct += len(set(knn[i]).intersection(set(ground_truth[i])))
+    correct += len(set(knn[i]).intersection(set(ground_truth[i])))
 accuracy = (correct / total) * 100
 print(f"Correct: {accuracy:.2f}% ({correct}/{total})")

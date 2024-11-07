@@ -58,7 +58,7 @@ pub struct HnswIndex {
 
   pub mult: f64,
   pub rev_size: f64,
-  pub max_level: usize, // This is stored as i32 in source, but we store as usize for convenience.
+  pub max_level: usize, // This is stored as i32 in the original hnswlib, but we store as usize for convenience.
 
   pub enter_point_node: TableInt,
 
@@ -69,7 +69,7 @@ pub struct HnswIndex {
 
   pub data_level_0_memory: Vec<u8>,
   pub link_lists: Vec<Option<Vec<u8>>>,
-  pub element_levels: Vec<usize>, // These are stored as i32 in source, but we store as usize for convenience.
+  pub element_levels: Vec<usize>, // These are stored as i32 in the original hnswlib, but we store as usize for convenience.
 
   pub label_lookup: HashMap<LabelType, TableInt>,
 }
