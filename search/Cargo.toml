@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 ahash = "0.8.11"
-dashmap = "6.1.0"
+dashmap = { version = "6.1.0", features = ["rayon"] }
 ndarray = "0.15" # linfa uses 0.15.
 ndarray-linalg = "0.15.0" # linfa uses 0.15.
 ordered-float = "4.4.0"
