@@ -7,17 +7,21 @@ use ndarray_linalg::Scalar;
 use ordered_float::OrderedFloat;
 use parking_lot::Mutex;
 use rayon::iter::IntoParallelIterator;
+use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BinaryHeap;
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use strum_macros::Display;
 use strum_macros::EnumString;
 
 pub type Id = usize;
 pub type Metric<T> = fn(&ArrayView1<T>, &ArrayView1<T>) -> f64;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PointDist {
   pub id: Id,
   pub dist: f64,
@@ -135,6 +139,139 @@ pub fn greedy_search_fast1<T: Scalar + Send + Sync>(
     }
   }
   state.into_inner().optima
+}
+
+// DiskANN paper, Algorithm 1: GreedySearch.
+// Returns a pair: (closest points, visited node IDs).
+// Filtered nodes will be visited and expanded but not considered for the final set of neighbors.
+pub fn greedy_search<T: Scalar + Send + Sync>(
+  graph: &impl GreedySearchable<T>,
+  query: &ArrayView1<T>,
+  k: usize,
+  search_list_cap: usize,
+  beam_width: usize,
+  metric: Metric<T>,
+  start: Id,
+  filter: impl Fn(PointDist) -> bool,
+  mut out_visited: Option<&mut HashSet<Id>>,
+  mut out_metrics: Option<&mut SearchMetrics>,
+  ground_truth: Option<&HashSet<Id>>,
+) -> Vec<PointDist> {
+  assert!(
+    search_list_cap >= k,
+    "search list capacity must be greater than or equal to k"
+  );
+
+  // It's too inefficient to calculate L\V repeatedly.
+  // Since we need both L (return value) and L\V (each iteration), we split L into V and ¬V.
+  // For simplicity, we'll just allow both to reach `k` size, and do a final merge at the end. This doubles the memory requirements, but in reality `k` is often small enough that it's not a problem.
+  // We also need `all_visited` as `l_visited` truncates to `k`, but we also want all visited points in the end.
+  // L = l_visited + l_unvisited
+  // `l_unvisited_set` is for members currently in l_unvisited, to avoid pushing duplicates. (NOTE: This is *not* the same as `all_visited`.) We don't need one for `l_visited` because we only push popped elements from `l_unvisited`, which we guarantee are unique (as previously mentioned).
+  let mut l_unvisited_set = HashSet::new();
+  let mut l_unvisited = VecDeque::<PointDist>::new(); // L \ V
+  let mut l_visited = VecDeque::<PointDist>::new(); // V
+  let mut all_visited = HashSet::new();
+  l_unvisited.push_back(PointDist {
+    id: start,
+    dist: metric(&graph.get_point(start).view(), query),
+  });
+  let ground_truth_found = AtomicUsize::new(0);
+  while !l_unvisited.is_empty() {
+    let new_visited = (0..beam_width)
+      .filter_map(|_| l_unvisited.pop_front())
+      .collect::<Vec<_>>();
+    let neighbors = DashSet::new();
+    new_visited.par_iter().for_each(|p_star| {
+      for j in graph.get_out_neighbors(p_star.id) {
+        neighbors.insert(j);
+      }
+    });
+    // Move to visited section.
+    all_visited.extend(new_visited.iter().map(|e| e.id));
+    l_visited.extend(new_visited.iter().filter(|e| filter(**e)));
+    l_visited
+      .make_contiguous()
+      .sort_unstable_by_key(|s| OrderedFloat(s.dist));
+
+    let new_unvisited = neighbors
+      .par_iter()
+      .filter_map(|neighbor| {
+        let neighbor = *neighbor;
+        // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
+        if all_visited.contains(&neighbor) {
+          return None;
+        };
+        if l_unvisited_set.contains(&neighbor) {
+          return None;
+        };
+        if ground_truth.is_some_and(|gt| gt.contains(&neighbor)) {
+          ground_truth_found.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(PointDist {
+          id: neighbor,
+          dist: metric(&graph.get_point(neighbor).view(), query),
+        })
+      })
+      .collect::<VecDeque<_>>();
+    l_unvisited_set.extend(new_unvisited.iter().map(|e| e.id));
+    l_unvisited.extend(&new_unvisited);
+    l_unvisited
+      .make_contiguous()
+      .sort_unstable_by_key(|s| OrderedFloat(s.dist));
+
+    let mut dropped_unvisited = 0;
+    let mut dropped_visited = 0;
+    while l_unvisited.len() + l_visited.len() > search_list_cap {
+      let (Some(u), Some(v)) = (l_unvisited.back(), l_visited.back()) else {
+        break;
+      };
+      if u.dist >= v.dist {
+        l_unvisited.pop_back();
+        dropped_unvisited += 1;
+      } else {
+        l_visited.pop_back();
+        dropped_visited += 1;
+      }
+    }
+
+    if let Some(m) = &mut out_metrics {
+      m.iterations.push(SearchIterationMetrics {
+        dropped_candidates: neighbors.len() - new_unvisited.len(),
+        dropped_unvisited,
+        dropped_visited,
+        ground_truth_found: ground_truth_found.load(Ordering::Relaxed),
+        new_candidates: new_unvisited.len(),
+        unvisited_dist_mins: l_unvisited.front().map(|n| n.dist).unwrap_or_default(),
+        unvisited_dist_sum: l_unvisited.iter().map(|n| n.dist).sum(),
+        visited: all_visited.len(),
+      });
+    }
+  }
+
+  // Find the k closest points from both l_visited + l_unvisited (= L).
+  let mut closest = Vec::new();
+  while closest.len() < k {
+    match (l_visited.pop_front(), l_unvisited.pop_front()) {
+      (None, None) => break,
+      (Some(v), None) | (None, Some(v)) => closest.push(v),
+      (Some(a), Some(b)) => {
+        if a.dist < b.dist {
+          closest.push(a);
+          closest.push(b);
+        } else {
+          closest.push(b);
+          closest.push(a);
+        };
+      }
+    };
+  }
+  // We may have exceeded k due to pushing both a and b in the last match arm.
+  closest.truncate(k);
+  if let Some(out) = &mut out_visited {
+    out.extend(all_visited);
+  };
+  closest
 }
 
 pub fn find_shortest_spanning_tree<T: Scalar + Send + Sync>(

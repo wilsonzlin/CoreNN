@@ -46,7 +46,6 @@ fn main() {
     metric_euclidean,
     params,
     10_000,
-    None,
   );
   println!("Built graph");
 

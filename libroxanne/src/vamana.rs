@@ -1,13 +1,12 @@
 use ahash::HashSet;
 use ahash::HashSetExt;
 use dashmap::DashMap;
-use dashmap::DashSet;
 use itertools::Itertools;
+use libroxanne_search::greedy_search;
 use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
 use libroxanne_search::Metric;
 use libroxanne_search::PointDist;
-use libroxanne_search::SearchIterationMetrics;
 use libroxanne_search::SearchMetrics;
 use ndarray::Array1;
 use ndarray::ArrayView1;
@@ -21,35 +20,6 @@ use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "$type")]
-pub enum VamanaInstrumentationEvent<T: Scalar> {
-  OptimizeBatchBegin {
-    batch_ids: Vec<Id>,
-  },
-  GreedySearchIteration {
-    query: Array1<T>,
-    expanded: Vec<Id>,
-    neighbors_of_expanded: Vec<Id>,
-    new_unvisited: Vec<Id>,
-    final_search_list_visited: Vec<Id>,
-    final_search_list_unvisited: Vec<Id>,
-  },
-  RobustPruneBegin {
-    node: Id,
-    candidates: Vec<Id>,
-  },
-  RobustPruneIteration {
-    node: Id,
-    p_star: Id,
-    final_candidates: Option<Vec<Id>>, // None on final iteration.
-  },
-}
-
-pub type VamanaInstrumentation<T> = Box<dyn Fn(VamanaInstrumentationEvent<T>) + Send + Sync>;
 
 // Return owned values:
 // - We use DashMap for in-memory, so we can't return a ref while holding a lock in the map entry.
@@ -105,7 +75,6 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     params: VamanaParams,
     // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
     medoid_sample_size: usize,
-    instrumentation: Option<VamanaInstrumentation<T>>,
   ) -> Vamana<T, Self> {
     // Initialise to R-regular graph with random edges.
     let adj_list = DashMap::new();
@@ -152,11 +121,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
       adj_list,
       id_to_point,
     };
-    let mut graph = Vamana::new(ds, metric, medoid, params);
-
-    if let Some(instrumentation) = instrumentation {
-      graph.set_instrumentation(instrumentation);
-    };
+    let graph = Vamana::new(ds, metric, medoid, params);
 
     graph
   }
@@ -167,13 +132,11 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     params: VamanaParams,
     // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
     medoid_sample_size: usize,
-    instrumentation: Option<VamanaInstrumentation<T>>,
   ) -> Vamana<T, Self> {
     let mut ids_random = dataset.iter().map(|e| e.0).collect_vec();
     ids_random.shuffle(&mut thread_rng());
 
-    let graph =
-      Self::init_random_index(dataset, metric, params, medoid_sample_size, instrumentation);
+    let graph = Self::init_random_index(dataset, metric, params, medoid_sample_size);
 
     graph.optimize(ids_random, None);
 
@@ -194,12 +157,6 @@ pub struct VamanaParams {
   pub beam_width: usize,
 }
 
-#[derive(Clone, Copy)]
-enum IdOrPoint<'a, 'b, T: Scalar> {
-  Id(Id),
-  Point(&'a ArrayView1<'b, T>),
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OptimizeMetrics {
   pub updated_nodes: HashSet<Id>,
@@ -210,7 +167,6 @@ pub struct Vamana<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
   metric: Metric<T>,
   medoid: Id,
   params: VamanaParams,
-  instrumentation: Option<VamanaInstrumentation<T>>,
 }
 
 impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
@@ -220,35 +176,11 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       metric,
       medoid,
       params,
-      instrumentation: None,
     }
   }
 
   fn dist(&self, a: Id, b: Id) -> f64 {
-    self.dist2(a, IdOrPoint::Id(b))
-  }
-
-  fn dist2(&self, a: Id, b: IdOrPoint<T>) -> f64 {
-    match b {
-      IdOrPoint::Id(b) => {
-        let (a, b) = if a < b { (a, b) } else { (b, a) };
-        (self.metric)(&self.ds.get_point(a).view(), &self.ds.get_point(b).view())
-      }
-      IdOrPoint::Point(b) => {
-        let a = self.ds.get_point(a);
-        (self.metric)(&a.view(), b)
-      }
-    }
-  }
-
-  pub fn set_instrumentation(&mut self, instrumentation: VamanaInstrumentation<T>) {
-    self.instrumentation = Some(instrumentation);
-  }
-
-  fn inst(&self, evt_fn: impl FnOnce() -> VamanaInstrumentationEvent<T>) {
-    if let Some(instrumentation) = &self.instrumentation {
-      instrumentation(evt_fn());
-    }
+    (self.metric)(&self.ds.get_point(a).view(), &self.ds.get_point(b).view())
   }
 
   pub fn medoid(&self) -> Id {
@@ -267,157 +199,40 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     &mut self.params
   }
 
-  // DiskANN paper, Algorithm 1: GreedySearch.
-  // Returns a pair: (closest points, visited node IDs).
-  // Filtered nodes will be visited and expanded but not considered for the final set of neighbors.
   fn greedy_search(
     &self,
-    query: IdOrPoint<T>,
+    query: &ArrayView1<T>,
     k: usize,
     search_list_cap: usize,
     filter: impl Fn(PointDist) -> bool,
-    mut metrics: Option<&mut SearchMetrics>,
+    metrics: Option<&mut SearchMetrics>,
     ground_truth: Option<&HashSet<Id>>,
   ) -> (Vec<PointDist>, HashSet<Id>) {
-    let start = self.medoid;
-    assert!(
-      search_list_cap >= k,
-      "search list capacity must be greater than or equal to k"
+    let mut visited = HashSet::<Id>::new();
+    let knn = greedy_search(
+      &self.ds,
+      query,
+      k,
+      search_list_cap,
+      self.params.beam_width,
+      self.metric,
+      self.medoid,
+      filter,
+      Some(&mut visited),
+      metrics,
+      ground_truth,
     );
-
-    // It's too inefficient to calculate L\V repeatedly.
-    // Since we need both L (return value) and L\V (each iteration), we split L into V and ¬V.
-    // For simplicity, we'll just allow both to reach `k` size, and do a final merge at the end. This doubles the memory requirements, but in reality `k` is often small enough that it's not a problem.
-    // We also need `all_visited` as `l_visited` truncates to `k`, but we also want all visited points in the end.
-    // L = l_visited + l_unvisited
-    // `l_unvisited_set` is for members currently in l_unvisited, to avoid pushing duplicates. (NOTE: This is *not* the same as `all_visited`.) We don't need one for `l_visited` because we only push popped elements from `l_unvisited`, which we guarantee are unique (as previously mentioned).
-    let mut l_unvisited_set = HashSet::new();
-    let mut l_unvisited = VecDeque::<PointDist>::new(); // L \ V
-    let mut l_visited = VecDeque::<PointDist>::new(); // V
-    let mut all_visited = HashSet::new();
-    l_unvisited.push_back(PointDist {
-      id: start,
-      dist: self.dist2(start, query),
-    });
-    let ground_truth_found = AtomicUsize::new(0);
-    while !l_unvisited.is_empty() {
-      let new_visited = (0..self.params.beam_width)
-        .filter_map(|_| l_unvisited.pop_front())
-        .collect::<Vec<_>>();
-      let neighbors = DashSet::new();
-      new_visited.par_iter().for_each(|p_star| {
-        for j in self.ds.get_out_neighbors(p_star.id) {
-          neighbors.insert(j);
-        }
-      });
-      // Move to visited section.
-      all_visited.extend(new_visited.iter().map(|e| e.id));
-      l_visited.extend(new_visited.iter().filter(|e| filter(**e)));
-      l_visited
-        .make_contiguous()
-        .sort_unstable_by_key(|s| OrderedFloat(s.dist));
-
-      let new_unvisited = neighbors
-        .par_iter()
-        .filter_map(|neighbor| {
-          let neighbor = *neighbor;
-          // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
-          if all_visited.contains(&neighbor) {
-            return None;
-          };
-          if l_unvisited_set.contains(&neighbor) {
-            return None;
-          };
-          if ground_truth.is_some_and(|gt| gt.contains(&neighbor)) {
-            ground_truth_found.fetch_add(1, Ordering::Relaxed);
-          }
-          Some(PointDist {
-            id: neighbor,
-            dist: self.dist2(neighbor, query),
-          })
-        })
-        .collect::<VecDeque<_>>();
-      l_unvisited_set.extend(new_unvisited.iter().map(|e| e.id));
-      l_unvisited.extend(&new_unvisited);
-      l_unvisited
-        .make_contiguous()
-        .sort_unstable_by_key(|s| OrderedFloat(s.dist));
-
-      let mut dropped_unvisited = 0;
-      let mut dropped_visited = 0;
-      while l_unvisited.len() + l_visited.len() > search_list_cap {
-        let (Some(u), Some(v)) = (l_unvisited.back(), l_visited.back()) else {
-          break;
-        };
-        if u.dist >= v.dist {
-          l_unvisited.pop_back();
-          dropped_unvisited += 1;
-        } else {
-          l_visited.pop_back();
-          dropped_visited += 1;
-        }
-      }
-
-      if let Some(m) = &mut metrics {
-        m.iterations.push(SearchIterationMetrics {
-          dropped_candidates: neighbors.len() - new_unvisited.len(),
-          dropped_unvisited,
-          dropped_visited,
-          ground_truth_found: ground_truth_found.load(Ordering::Relaxed),
-          new_candidates: new_unvisited.len(),
-          unvisited_dist_mins: l_unvisited.front().map(|n| n.dist).unwrap_or_default(),
-          unvisited_dist_sum: l_unvisited.iter().map(|n| n.dist).sum(),
-          visited: all_visited.len(),
-        });
-      }
-      self.inst(|| VamanaInstrumentationEvent::GreedySearchIteration {
-        query: match query {
-          IdOrPoint::Id(id) => self.ds.get_point(id),
-          IdOrPoint::Point(p) => p.to_owned(),
-        },
-        expanded: new_visited.iter().map(|e| e.id).collect(),
-        neighbors_of_expanded: neighbors.into_iter().collect(),
-        new_unvisited: new_unvisited.iter().map(|e| e.id).collect(),
-        final_search_list_visited: l_visited.iter().map(|e| e.id).collect(),
-        final_search_list_unvisited: l_unvisited.iter().map(|e| e.id).collect(),
-      });
-    }
-
-    // Find the k closest points from both l_visited + l_unvisited (= L).
-    let mut closest = Vec::new();
-    while closest.len() < k {
-      match (l_visited.pop_front(), l_unvisited.pop_front()) {
-        (None, None) => break,
-        (Some(v), None) | (None, Some(v)) => closest.push(v),
-        (Some(a), Some(b)) => {
-          if a.dist < b.dist {
-            closest.push(a);
-            closest.push(b);
-          } else {
-            closest.push(b);
-            closest.push(a);
-          };
-        }
-      };
-    }
-    // We may have exceeded k due to pushing both a and b in the last match arm.
-    closest.truncate(k);
-    (closest, all_visited)
+    (knn, visited)
   }
 
   /// WARNING: `candidate_ids` must not contain the point itself.
   fn compute_robust_pruned(
     &self,
     node_id: Id,
-    candidate_ids: impl IntoParallelIterator<Item = Id> + Clone,
+    candidate_ids: impl IntoParallelIterator<Item = Id>,
   ) -> Vec<Id> {
     let dist_thresh = self.params.distance_threshold;
     let degree_bound = self.params.degree_bound;
-
-    self.inst(|| VamanaInstrumentationEvent::RobustPruneBegin {
-      node: node_id,
-      candidates: candidate_ids.clone().into_par_iter().collect::<Vec<_>>(),
-    });
 
     let mut candidates = candidate_ids
       .into_par_iter()
@@ -435,22 +250,12 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     while let Some(PointDist { id: p_star, .. }) = candidates.pop_front() {
       new_neighbors.push(p_star);
       if new_neighbors.len() == degree_bound {
-        self.inst(|| VamanaInstrumentationEvent::RobustPruneIteration {
-          node: node_id,
-          p_star,
-          final_candidates: None,
-        });
         break;
       }
       candidates.retain(|s| {
         let s_to_p = s.dist;
         let s_to_p_star = self.dist(p_star, s.id);
         s_to_p <= s_to_p_star * dist_thresh
-      });
-      self.inst(|| VamanaInstrumentationEvent::RobustPruneIteration {
-        node: node_id,
-        p_star,
-        final_candidates: Some(candidates.iter().map(|s| s.id).collect()),
       });
     }
     new_neighbors
@@ -472,17 +277,13 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       }
       let updates = DashMap::<Id, Update>::new();
 
-      self.inst(|| VamanaInstrumentationEvent::OptimizeBatchBegin {
-        batch_ids: batch.to_vec(),
-      });
-
       batch.into_par_iter().for_each(|&id| {
         // TODO Delete if already exists.
 
         // Initial GreedySearch.
         let mut candidates = self
           .greedy_search(
-            IdOrPoint::Id(id),
+            &self.ds.get_point(id).view(),
             1,
             self.params.update_search_list_cap,
             |_| true,
@@ -545,7 +346,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   ) -> Vec<PointDist> {
     self
       .greedy_search(
-        IdOrPoint::Point(query),
+        query,
         k,
         self.params.query_search_list_cap,
         filter,
@@ -564,7 +365,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     let mut metrics = SearchMetrics::default();
     let res = self
       .greedy_search(
-        IdOrPoint::Point(query),
+        query,
         k,
         self.params.query_search_list_cap,
         |_| true,
@@ -623,7 +424,6 @@ mod tests {
         update_search_list_cap: search_list_cap,
       },
       10_000,
-      None,
     );
 
     // First, test ANN of every point.

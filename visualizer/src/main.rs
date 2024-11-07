@@ -1,7 +1,6 @@
 use ahash::HashSet;
 use itertools::Itertools;
 use libroxanne::vamana::InMemoryVamana;
-use libroxanne::vamana::VamanaInstrumentationEvent;
 use libroxanne::vamana::VamanaParams;
 use libroxanne_search::metric_euclidean;
 use libroxanne_search::Id;
@@ -12,7 +11,6 @@ use rand::Rng;
 use serde::Serialize;
 use std::fs::File;
 use std::iter::zip;
-use std::sync::Arc;
 
 fn main() {
   let mut rng = thread_rng();
@@ -35,8 +33,6 @@ fn main() {
     .collect_vec();
   let dataset = zip(ids.clone(), points.clone()).collect_vec();
 
-  let events: Arc<parking_lot::Mutex<Vec<VamanaInstrumentationEvent<f32>>>> = Default::default();
-
   let vamana = InMemoryVamana::build_index(
     dataset,
     metric,
@@ -49,10 +45,6 @@ fn main() {
       update_search_list_cap: search_list_cap,
     },
     10_000,
-    Some(Box::new({
-      let events = events.clone();
-      move |e| events.lock().push(e)
-    })),
   );
 
   // Test k-NN of every point.
@@ -107,13 +99,11 @@ fn main() {
 
   #[derive(Serialize)]
   struct Data {
-    events: Vec<VamanaInstrumentationEvent<f32>>,
     medoid: Id,
     nodes: Vec<DataNode>,
   }
 
   serde_json::to_writer_pretty(File::create("visualizer.data.json").unwrap(), &Data {
-    events: events.lock().to_vec(),
     medoid: vamana.medoid(),
     nodes,
   })
