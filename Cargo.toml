@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "analysis",
   "hnsw-sharded-to-roxanne",
+  "hnsw-to-roxanne",
   "hnswlib-rs",
   "libroxanne",
   "search",

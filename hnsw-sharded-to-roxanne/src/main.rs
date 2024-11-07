@@ -7,6 +7,8 @@ use hnswlib_rs::HnswIndex;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use itertools::Itertools;
+use libroxanne::db::DbWriter;
+use libroxanne::db::NodeData;
 use libroxanne::vamana::VamanaParams;
 use libroxanne_search::find_shortest_spanning_tree;
 use libroxanne_search::greedy_search_fast1;
@@ -15,14 +17,9 @@ use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
 use libroxanne_search::PointDist;
 use libroxanne_search::StdMetric;
-use lmdb::DatabaseFlags;
-use lmdb::Environment;
-use lmdb::Transaction;
-use lmdb::WriteFlags;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
-use serde::Serialize;
 use std::cmp::Reverse;
 use std::fs::File;
 use std::io::BufReader;
@@ -30,9 +27,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Sender;
-use std::thread::spawn;
-use std::thread::JoinHandle;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -94,52 +88,14 @@ fn new_pb(len: usize) -> ProgressBar {
   pb
 }
 
-// LMDB has excruciatingly slow writes, so we send all writes to one thread with one giant long-term transaction.
-struct Db {
-  send: Sender<(Vec<u8>, Vec<u8>)>,
-  thread: JoinHandle<()>,
-}
-
-impl Db {
-  pub fn new(dir: PathBuf) -> Self {
-    let (send, recv) = std::sync::mpsc::channel::<(Vec<u8>, Vec<u8>)>();
-    let thread = spawn(move || {
-      std::fs::create_dir_all(&dir).unwrap();
-      // Use an arbitrarily huge value for map size; the default is 10 MiB.
-      let db_env = Environment::new()
-        .set_map_size(1024 * 1024 * 1024 * 1024 * 64)
-        .open(&dir)
-        .unwrap();
-      let db = db_env.create_db(None, DatabaseFlags::empty()).unwrap();
-      let mut txn = db_env.begin_rw_txn().unwrap();
-      while let Some((k, v)) = recv.recv().ok() {
-        txn.put(db, &k, &v, WriteFlags::empty()).unwrap();
-      }
-      txn.commit().unwrap();
-    });
-    Self { send, thread }
-  }
-
-  pub fn write(&self, k: impl AsRef<str>, v: &impl Serialize) {
-    let k = k.as_ref().to_string().into_bytes();
-    let v = rmp_serde::to_vec_named(v).unwrap();
-    self.send.send((k, v)).unwrap();
-  }
-
-  pub fn finish(self) {
-    drop(self.send);
-    self.thread.join().unwrap();
-  }
-}
-
 // We don't perform PQ here, as it's expensive and not specifically related to this task; use the general `pqify` tool afterwards.
 fn main() {
   let args = Args::parse();
   let metric = args.metric.get_fn::<f32>();
 
   // Make sure database can be created before we do long expensive work.
+  let db = DbWriter::new(args.out.clone());
   println!("Created database");
-  let db = Db::new(args.out.clone());
 
   // First phase: load each shard to ensure integrity and compute some things.
   // - Ensure all shard files exist and are intact before we start doing long intensive work.
@@ -286,10 +242,11 @@ fn main() {
           None => index.get_merged_neighbors(id, 0).into_iter().collect_vec(),
         };
 
-        let mut node_data = Vec::new();
-        node_data.extend(neighbors.len().to_le_bytes());
-        node_data.extend(neighbors.into_iter().flat_map(|n| n.to_le_bytes()));
-        node_data.extend(index.get_raw_data_by_label(id));
+        let node_data = NodeData {
+          neighbors,
+          vector: index.get_data_by_label(id),
+        }
+        .serialize();
 
         db.write(format!("node/{id}"), &node_data);
         pb.inc(1);

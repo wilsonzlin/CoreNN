@@ -1,6 +1,7 @@
 use ndarray_linalg::Scalar;
 use std::mem::size_of;
 
+pub mod db;
 pub mod pq;
 pub mod queue;
 pub mod vamana;

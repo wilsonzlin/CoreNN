@@ -5,18 +5,22 @@ edition = "2021"
 
 [dependencies]
 ahash = { version = "0.8.11", features = ["serde"] }
+bitcode = "0.6.3"
+byteorder = "1.5.0"
 dashmap = { version = "6.1.0", features = ["rayon", "serde"] }
 itertools = "0.13.0"
 libroxanne-search = { version = "0.2.0", path = "../search" }
 linfa = "0.7.0"
 linfa-clustering = { version = "0.7.0", features = ["serde"] }
 linfa-nn = "0.7.0"
+lmdb = "0.8.0"
 ndarray = "0.15" # linfa uses 0.15.
 ndarray-linalg = "0.15.0" # linfa uses 0.15.
 ordered-float = "4.3.0"
 parking_lot = "0.12.3"
 rand = "0.8"
 rayon = "1.10.0"
+rmp-serde = "1.3.0"
 serde = { version = "1.0.210", features = ["derive"] }
 
 [dev-dependencies]
