@@ -11,7 +11,7 @@ dashmap = { version = "6.1.0", features = ["serde"] }
 hnswlib-rs = { path = "../hnswlib-rs" }
 itertools = "0.13.0"
 libroxanne = { path = "../libroxanne" }
-libroxanne-search = { version = "0.1.0", path = "../search" }
+libroxanne-search = { version = "0.2.0", path = "../search" }
 ndarray = "0.15"
 num_cpus = "1.16.0"
 ordered-float = "4.4.0"

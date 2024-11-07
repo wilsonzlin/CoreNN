@@ -12,7 +12,7 @@ hnswlib-rs = { path = "../hnswlib-rs" }
 indicatif = "0.17.8"
 itertools = "0.13.0"
 libroxanne = { path = "../libroxanne" }
-libroxanne-search = { version = "0.1.0", path = "../search" }
+libroxanne-search = { version = "0.2.0", path = "../search" }
 lmdb = "0.8.0"
 ndarray = "0.15"
 ndarray-linalg = { version = "0.15", features = ["openblas"] }

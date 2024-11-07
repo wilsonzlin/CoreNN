@@ -7,7 +7,7 @@ edition = "2021"
 ahash = { version = "0.8.11", features = ["serde"] }
 dashmap = { version = "6.1.0", features = ["rayon", "serde"] }
 itertools = "0.13.0"
-libroxanne-search = { version = "0.1.0", path = "../search" }
+libroxanne-search = { version = "0.2.0", path = "../search" }
 linfa = "0.7.0"
 linfa-clustering = { version = "0.7.0", features = ["serde"] }
 linfa-nn = "0.7.0"
