@@ -225,10 +225,10 @@ fn main() {
     update_search_list_cap: args.update_search_list_cap,
   };
 
-  db.write("cfg", &cfg);
-  db.write("dim", &args.dim);
-  db.write("medoid", &medoid);
-  db.write("metric", &args.metric);
+  db.write_cfg(&cfg);
+  db.write_dim(args.dim);
+  db.write_medoid(medoid.unwrap());
+  db.write_metric(args.metric);
 
   let pb = new_pb(total_n);
   for path_batch in paths.chunks(args.parallel) {
@@ -245,10 +245,9 @@ fn main() {
         let node_data = NodeData {
           neighbors,
           vector: index.get_data_by_label(id),
-        }
-        .serialize();
+        };
 
-        db.write(format!("node/{id}"), &node_data);
+        db.write_node(id, &node_data);
         pb.inc(1);
       });
     });

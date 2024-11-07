@@ -264,7 +264,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   // The point referenced by each ID should already be inserted into the DB.
   // This is used when inserting, but also during initialization, so this is a separate function from `insert`.
   // WARNING: The graph must not be mutated while this function is executing, but it is up to the caller to ensure this.
-  /// WARNING: This is publicly exposed, but use this only if you know what you're doing. There is no guarantees of API stability.
+  /// WARNING: This is publicly exposed, but use this only if you know what you're doing. There are no guarantees of API stability.
   pub fn optimize(&self, mut ids: Vec<Id>, mut metrics: Option<&mut OptimizeMetrics>) {
     // Shuffle to reduce chance of inserting around the same area in latent space.
     ids.shuffle(&mut thread_rng());

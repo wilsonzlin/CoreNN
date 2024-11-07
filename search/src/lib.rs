@@ -125,8 +125,10 @@ pub fn greedy_search_fast1<T: Scalar + Send + Sync>(
       .for_each(|n| {
         // If this node is a neighbor of a future expanded node, we don't need to compare the distance to this node, as if it's not the shortest now, it won't be then either.
         seen.insert(n.id);
+        // Call filter before lock to reduce contention.
+        let not_filtered = filter(n.id);
         let mut s = state.lock();
-        if filter(n.id) && !s.optima.is_some_and(|o| n.dist >= o.dist) {
+        if not_filtered && !s.optima.is_some_and(|o| o.dist <= n.dist) {
           s.optima = Some(n);
         }
         if n.dist < s.cur.dist {

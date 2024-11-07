@@ -90,10 +90,10 @@ fn main() {
     update_search_list_cap: args.update_search_list_cap,
   };
 
-  db.write("cfg", &cfg);
-  db.write("dim", &args.dim);
-  db.write("medoid", &index.entry_label());
-  db.write("metric", &args.metric);
+  db.write_cfg(&cfg);
+  db.write_dim(args.dim);
+  db.write_medoid(index.entry_label());
+  db.write_metric(args.metric);
 
   let pb = new_pb(index.cur_element_count);
   // Collect to Vec so we can use into_par_iter, which is much faster than par_bridge.
@@ -101,9 +101,8 @@ fn main() {
     let node_data = NodeData {
       neighbors: index.get_merged_neighbors(id, 0).into_iter().collect_vec(),
       vector: index.get_data_by_label(id),
-    }
-    .serialize();
-    db.write(format!("node/{id}"), &node_data);
+    };
+    db.write_node(id, &node_data);
     pb.inc(1);
   });
   pb.finish();

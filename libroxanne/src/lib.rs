@@ -1,28 +1,46 @@
-use ndarray_linalg::Scalar;
-use std::mem::size_of;
+use db::DbReader;
+use libroxanne_search::GreedySearchable;
+use libroxanne_search::Id;
+use ndarray::Array1;
+use std::path::Path;
+use vamana::Vamana;
+use vamana::VamanaDatastore;
 
 pub mod db;
 pub mod pq;
 pub mod queue;
 pub mod vamana;
 
-pub struct RoxanneDbParams {
-  pub n_per_shard: usize,
-  pub overlap: usize, // How many shards to insert each point into.
-  pub pq_subspaces: usize,
-  pub shards: usize,
+pub struct RoxanneDbReadOnly {
+  db: DbReader,
 }
 
-impl RoxanneDbParams {
-  // memlimit: how much memory (in bytes) to allow the DB to use for indexing, and when the indexed DB is loaded in memory.
-  // n: the maximum number of vectors this DB will ever have.
-  pub fn recommended<DType: Scalar>(memlimit: usize, n: usize, dims: usize) -> Self {
-    let n_per_shard = memlimit / (dims * size_of::<DType>());
-    Self {
-      n_per_shard,
-      overlap: 2,
-      pq_subspaces: memlimit / n,
-      shards: n.div_ceil(n_per_shard),
-    }
+impl GreedySearchable<f32> for RoxanneDbReadOnly {
+  fn get_point(&self, id: Id) -> Array1<f32> {
+    Array1::from_vec(self.db.read_node(id).vector)
+  }
+
+  fn get_out_neighbors(&self, id: Id) -> Vec<Id> {
+    self.db.read_node(id).neighbors
+  }
+}
+
+impl VamanaDatastore<f32> for RoxanneDbReadOnly {
+  fn set_point(&self, _id: Id, _point: Array1<f32>) {
+    panic!("read only");
+  }
+
+  fn set_out_neighbors(&self, _id: Id, _neighbors: Vec<Id>) {
+    panic!("read only");
+  }
+}
+
+impl RoxanneDbReadOnly {
+  pub fn open(dir: impl AsRef<Path>) -> Vamana<f32, Self> {
+    let db = DbReader::new(dir);
+    let cfg = db.read_cfg();
+    let medoid = db.read_medoid();
+    let metric = db.read_metric().get_fn::<f32>();
+    Vamana::new(Self { db }, metric, medoid, cfg)
   }
 }
