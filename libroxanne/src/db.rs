@@ -1,3 +1,4 @@
+use crate::pq::ProductQuantizer;
 use crate::vamana::VamanaParams;
 use bitcode::Decode;
 use bitcode::Encode;
@@ -65,6 +66,10 @@ impl Db {
     Db { db }
   }
 
+  pub fn inner(&self) -> &rocksdb::DB {
+    &self.db
+  }
+
   pub fn flush(&self) {
     self.db.flush().unwrap();
   }
@@ -121,5 +126,23 @@ impl Db {
 
   pub fn write_node(&self, id: Id, node: &NodeData) {
     self.write_raw(format!("node/{id}"), node.serialize());
+  }
+
+  pub fn read_pq_model(&self) -> ProductQuantizer<f32> {
+    let raw = self.db.get_pinned("pq_model").unwrap().unwrap();
+    rmp_serde::from_slice(&raw).unwrap()
+  }
+
+  pub fn write_pq_model(&self, pq: &ProductQuantizer<f32>) {
+    self.write("pq_model", pq);
+  }
+
+  pub fn read_pq_vec(&self, id: Id) -> Vec<u8> {
+    let raw = self.db.get_pinned(format!("pq_vec/{id}")).unwrap().unwrap();
+    raw.to_vec()
+  }
+
+  pub fn write_pq_vec(&self, id: Id, vec: Vec<u8>) {
+    self.write_raw(format!("pq_vec/{id}"), vec);
   }
 }

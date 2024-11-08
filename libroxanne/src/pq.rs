@@ -1,11 +1,14 @@
-use linfa::traits::Fit;
+use linfa::traits::FitWith;
 use linfa::traits::Predict;
 use linfa::DatasetBase;
+use linfa_clustering::IncrKMeansError;
 use linfa_clustering::KMeans;
+use linfa_clustering::KMeansInit;
 use linfa_nn::distance::L2Dist;
 use ndarray::s;
 use ndarray::Array2;
 use ndarray::ArrayView2;
+use rand::thread_rng;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
@@ -19,15 +22,42 @@ pub struct ProductQuantizer<T: linfa::Float> {
 
 impl<T: linfa::Float> ProductQuantizer<T> {
   pub fn train(mat: &ArrayView2<T>, subspaces: usize) -> Self {
+    // TODO Tune or allow config of this hyperparameter.
+    let batch_size = 128;
     let dims = mat.shape()[1];
     assert_eq!(dims % subspaces, 0);
     let subdims = dims / subspaces;
+    // Any NaN may completely break the K-means algorithm (it will fail to converge, due to distance and inertia calculations all failing to NaN).
+    assert!(!mat.iter().any(|x| x.is_nan()));
     let subspace_codebooks = (0..subspaces)
       .into_par_iter()
       .map(|i| {
         let submat = mat.slice(s![.., i * subdims..(i + 1) * subdims]);
-        let obs = DatasetBase::new(submat.to_owned(), ());
-        KMeans::params(256).fit(&obs).unwrap()
+        // Mini-Batch K-means: https://docs.rs/linfa-clustering/latest/linfa_clustering/struct.KMeans.html#tutorial.
+        // (It's much faster than standard K-means, while being similarly accurate.)
+        // Shuffling is important to Mini-Batch K-means (see documentation above).
+        let obs = DatasetBase::from(submat.to_owned()).shuffle(&mut thread_rng());
+        // Use KMeansPara as it's faster for larger datasets. (See its comment.)
+        let clf = KMeans::params(256).init_method(KMeansInit::KMeansPara);
+
+        let mut cur: Option<KMeans<T, L2Dist>> = None;
+        for batch in obs.sample_chunks(batch_size).cycle() {
+          match clf.fit_with(cur, &batch) {
+            // Early stop condition for the K-means loop.
+            Ok(model) => {
+              cur = Some(model);
+              break;
+            }
+            // Continue running if not converged.
+            Err(IncrKMeansError::NotConverged(model)) => {
+              cur = Some(model);
+            }
+            Err(err) => {
+              panic!("unexpected K-means error: {}", err);
+            }
+          };
+        }
+        cur.unwrap()
       })
       .collect::<Vec<_>>();
     ProductQuantizer {

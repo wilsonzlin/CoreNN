@@ -6,6 +6,7 @@ members = [
   "hnsw-to-roxanne",
   "hnswlib-rs",
   "libroxanne",
+  "pqify",
   "search",
   "visualizer",
 ]
