@@ -1,4 +1,4 @@
-use db::DbReader;
+use db::Db;
 use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
 use ndarray::Array1;
@@ -12,7 +12,7 @@ pub mod queue;
 pub mod vamana;
 
 pub struct RoxanneDbReadOnly {
-  db: DbReader,
+  db: Db,
 }
 
 impl GreedySearchable<f32> for RoxanneDbReadOnly {
@@ -37,7 +37,7 @@ impl VamanaDatastore<f32> for RoxanneDbReadOnly {
 
 impl RoxanneDbReadOnly {
   pub fn open(dir: impl AsRef<Path>) -> Vamana<f32, Self> {
-    let db = DbReader::new(dir);
+    let db = Db::open(dir);
     let cfg = db.read_cfg();
     let medoid = db.read_medoid();
     let metric = db.read_metric().get_fn::<f32>();

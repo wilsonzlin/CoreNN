@@ -7,7 +7,7 @@ use hnswlib_rs::HnswIndex;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use itertools::Itertools;
-use libroxanne::db::DbWriter;
+use libroxanne::db::Db;
 use libroxanne::db::NodeData;
 use libroxanne::vamana::VamanaParams;
 use libroxanne_search::find_shortest_spanning_tree;
@@ -94,7 +94,7 @@ fn main() {
   let metric = args.metric.get_fn::<f32>();
 
   // Make sure database can be created before we do long expensive work.
-  let db = DbWriter::new(args.out.clone());
+  let db = Db::create(&args.out);
   println!("Created database");
 
   // First phase: load each shard to ensure integrity and compute some things.
@@ -255,6 +255,7 @@ fn main() {
   pb.finish();
   println!("Finalizing database");
 
-  db.finish();
+  db.flush();
+  drop(db);
   println!("All done!");
 }

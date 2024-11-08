@@ -3,19 +3,9 @@ use bitcode::Decode;
 use bitcode::Encode;
 use libroxanne_search::Id;
 use libroxanne_search::StdMetric;
-use lmdb::Database;
-use lmdb::DatabaseFlags;
-use lmdb::Environment;
-use lmdb::Transaction;
-use lmdb::WriteFlags;
+use rocksdb::BlockBasedOptions;
 use serde::Serialize;
-use std::fs::create_dir_all;
 use std::path::Path;
-use std::path::PathBuf;
-use std::sync::mpsc::channel;
-use std::sync::mpsc::Sender;
-use std::thread::spawn;
-use std::thread::JoinHandle;
 
 // We store both in one DB entry to leverage one disk page read to get both, as specified in the DiskANN paper. (If we store them as separate DB entries, they are unlikely to be stored in the same disk page.) We don't have to store the embedding.
 // Why we chose Bitcode:
@@ -40,111 +30,96 @@ impl NodeData {
   }
 }
 
-// Use an arbitrarily huge value for map size; the default is 10 MiB.
-const DB_MAP_SIZE_MAX: usize = 1024 * 1024 * 1024 * 1024 * 64;
+fn rocksdb_options(create: bool) -> rocksdb::Options {
+  // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options.
+  let mut opt = rocksdb::Options::default();
+  opt.create_if_missing(create);
+  opt.set_error_if_exists(create);
+  opt.set_max_background_jobs(num_cpus::get() as i32 * 2);
+  opt.set_bytes_per_sync(1024 * 1024 * 4);
+  opt.set_write_buffer_size(1024 * 1024 * 128);
+  opt.set_compression_type(rocksdb::DBCompressionType::None);
 
-/// Perform a large batch of writes in one go, avoiding excessive LMDB-handled transactions and locking.
-pub struct DbWriter {
-  send: Sender<(Vec<u8>, Vec<u8>)>,
-  thread: JoinHandle<()>,
+  // https://github.com/facebook/rocksdb/wiki/Block-Cache.
+  let mut bbt_opt = BlockBasedOptions::default();
+  // Use close to a single page size to avoid excessive reads as that counters design of NodeData (seek DiskANN paper).
+  bbt_opt.set_block_size(1024 * 4);
+  bbt_opt.disable_cache();
+  bbt_opt.set_format_version(6);
+  opt.set_block_based_table_factory(&bbt_opt);
+  opt
 }
 
-impl DbWriter {
-  pub fn new(dir: PathBuf) -> Self {
-    let (send, recv) = channel::<(Vec<u8>, Vec<u8>)>();
-    let thread = spawn(move || {
-      create_dir_all(&dir).unwrap();
-      let db_env = Environment::new()
-        .set_map_size(DB_MAP_SIZE_MAX)
-        .open(&dir)
-        .unwrap();
-      let db = db_env.create_db(None, DatabaseFlags::empty()).unwrap();
-      let mut txn = db_env.begin_rw_txn().unwrap();
-      while let Some((k, v)) = recv.recv().ok() {
-        txn.put(db, &k, &v, WriteFlags::empty()).unwrap();
-      }
-      txn.commit().unwrap();
-    });
-    Self { send, thread }
+pub struct Db {
+  db: rocksdb::DB,
+}
+
+impl Db {
+  pub fn open(dir: impl AsRef<Path>) -> Self {
+    let db = rocksdb::DB::open(&rocksdb_options(false), dir).unwrap();
+    Db { db }
   }
 
-  pub fn finish(self) {
-    drop(self.send);
-    self.thread.join().unwrap();
+  pub fn create(dir: impl AsRef<Path>) -> Self {
+    let db = rocksdb::DB::open(&rocksdb_options(true), dir).unwrap();
+    Db { db }
+  }
+
+  pub fn flush(&self) {
+    self.db.flush().unwrap();
   }
 
   fn write_raw(&self, k: impl AsRef<str>, v: Vec<u8>) {
     let k = k.as_ref().to_string().into_bytes();
-    self.send.send((k, v)).unwrap();
+    self.db.put(k, v).unwrap();
   }
 
   fn write(&self, k: impl AsRef<str>, v: &impl Serialize) {
     self.write_raw(k, rmp_serde::to_vec_named(v).unwrap());
   }
 
+  pub fn read_cfg(&self) -> VamanaParams {
+    let raw = self.db.get_pinned("cfg").unwrap().unwrap();
+    rmp_serde::from_slice(&raw).unwrap()
+  }
+
   pub fn write_cfg(&self, cfg: &VamanaParams) {
     self.write("cfg", cfg);
+  }
+
+  pub fn read_dim(&self) -> usize {
+    let raw = self.db.get_pinned("dim").unwrap().unwrap();
+    rmp_serde::from_slice(&raw).unwrap()
   }
 
   pub fn write_dim(&self, dim: usize) {
     self.write("dim", &dim);
   }
 
+  pub fn read_medoid(&self) -> Id {
+    let raw = self.db.get_pinned("medoid").unwrap().unwrap();
+    rmp_serde::from_slice(&raw).unwrap()
+  }
+
   pub fn write_medoid(&self, medoid: Id) {
     self.write("medoid", &medoid);
+  }
+
+  pub fn read_metric(&self) -> StdMetric {
+    let raw = self.db.get_pinned("metric").unwrap().unwrap();
+    rmp_serde::from_slice(&raw).unwrap()
   }
 
   pub fn write_metric(&self, metric: StdMetric) {
     self.write("metric", &metric);
   }
 
+  pub fn read_node(&self, id: Id) -> NodeData {
+    let raw = self.db.get_pinned(format!("node/{id}")).unwrap().unwrap();
+    NodeData::deserialize(&raw)
+  }
+
   pub fn write_node(&self, id: Id, node: &NodeData) {
     self.write_raw(format!("node/{id}"), node.serialize());
-  }
-}
-
-pub struct DbReader {
-  db_env: Environment,
-  db: Database,
-}
-
-impl DbReader {
-  pub fn new(dir: impl AsRef<Path>) -> Self {
-    let db_env = Environment::new()
-      .set_map_size(DB_MAP_SIZE_MAX)
-      .open(dir.as_ref())
-      .unwrap();
-    let db = db_env.open_db(None).unwrap();
-    Self { db_env, db }
-  }
-
-  pub fn read_cfg(&self) -> VamanaParams {
-    let txn = self.db_env.begin_ro_txn().unwrap();
-    let raw = txn.get(self.db, &"cfg").unwrap();
-    rmp_serde::from_slice(raw).unwrap()
-  }
-
-  pub fn read_dim(&self) -> usize {
-    let txn = self.db_env.begin_ro_txn().unwrap();
-    let raw = txn.get(self.db, &"dim").unwrap();
-    rmp_serde::from_slice(raw).unwrap()
-  }
-
-  pub fn read_medoid(&self) -> Id {
-    let txn = self.db_env.begin_ro_txn().unwrap();
-    let raw = txn.get(self.db, &"medoid").unwrap();
-    rmp_serde::from_slice(raw).unwrap()
-  }
-
-  pub fn read_metric(&self) -> StdMetric {
-    let txn = self.db_env.begin_ro_txn().unwrap();
-    let raw = txn.get(self.db, &"metric").unwrap();
-    rmp_serde::from_slice(raw).unwrap()
-  }
-
-  pub fn read_node(&self, id: Id) -> NodeData {
-    let txn = self.db_env.begin_ro_txn().unwrap();
-    let raw = txn.get(self.db, &format!("node/{id}")).unwrap();
-    NodeData::deserialize(raw)
   }
 }

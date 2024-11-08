@@ -3,7 +3,7 @@ use hnswlib_rs::HnswIndex;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use itertools::Itertools;
-use libroxanne::db::DbWriter;
+use libroxanne::db::Db;
 use libroxanne::db::NodeData;
 use libroxanne::vamana::VamanaParams;
 use libroxanne_search::StdMetric;
@@ -75,7 +75,7 @@ fn main() {
   let args = Args::parse();
 
   // Make sure database can be created before we do long expensive work.
-  let db = DbWriter::new(args.out.clone());
+  let db = Db::create(&args.out);
   println!("Created database");
 
   let index = load_hnsw(args.dim, args.path);
@@ -108,6 +108,7 @@ fn main() {
   pb.finish();
   println!("Finalizing database");
 
-  db.finish();
+  db.flush();
+  drop(db);
   println!("All done!");
 }
