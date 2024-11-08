@@ -4,7 +4,7 @@ description = "Library for RoxanneDB"
 license = "Apache-2.0"
 homepage = "https://github.com/wilsonzlin/roxanne"
 repository = "https://github.com/wilsonzlin/roxanne.git"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
