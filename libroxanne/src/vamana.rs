@@ -12,6 +12,7 @@ use ndarray::Array1;
 use ndarray::ArrayView1;
 use ndarray_linalg::Scalar;
 use ordered_float::OrderedFloat;
+use rand::seq::IteratorRandom;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rayon::iter::IntoParallelIterator;
@@ -20,6 +21,35 @@ use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::VecDeque;
+
+pub fn calc_approx_medoid<T: Scalar + Send + Sync>(
+  id_to_point: &DashMap<Id, Array1<T>>,
+  metric: Metric<T>,
+  sample_size: usize,
+) -> Id {
+  let mut rng = thread_rng();
+  let sample_ids = id_to_point
+    .iter()
+    .map(|e| *e.key())
+    .choose_multiple(&mut rng, sample_size);
+  sample_ids
+    .par_iter()
+    .copied()
+    .min_by_key(|&i| {
+      OrderedFloat(
+        sample_ids
+          .par_iter()
+          .map(|&j| {
+            metric(
+              &id_to_point.get(&i).unwrap().view(),
+              &id_to_point.get(&j).unwrap().view(),
+            )
+          })
+          .sum::<f64>(),
+      )
+    })
+    .unwrap()
+}
 
 // Return owned values:
 // - We use DashMap for in-memory, so we can't return a ref while holding a lock in the map entry.
@@ -40,8 +70,8 @@ impl<T: Scalar + Send + Sync> GreedySearchable<T> for InMemoryVamana<T> {
     self.id_to_point.get(&id).unwrap().clone()
   }
 
-  fn get_out_neighbors(&self, id: Id) -> Vec<Id> {
-    self.adj_list.get(&id).unwrap().clone()
+  fn get_out_neighbors(&self, id: Id) -> (Vec<Id>, Option<Array1<T>>) {
+    (self.adj_list.get(&id).unwrap().clone(), None)
   }
 }
 
@@ -88,34 +118,10 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
         .collect::<Vec<_>>();
       adj_list.insert(*id, neighbors);
     });
-    let ids = dataset.iter().map(|e| e.0).collect_vec();
     let id_to_point = dataset.into_iter().collect::<DashMap<_, _>>();
 
     // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
-    let medoid = {
-      let mut rng = thread_rng();
-      let sample_ids = ids
-        .choose_multiple(&mut rng, medoid_sample_size)
-        .copied()
-        .collect_vec();
-      sample_ids
-        .par_iter()
-        .copied()
-        .min_by_key(|&i| {
-          OrderedFloat(
-            sample_ids
-              .par_iter()
-              .map(|&j| {
-                metric(
-                  &id_to_point.get(&i).unwrap().view(),
-                  &id_to_point.get(&j).unwrap().view(),
-                )
-              })
-              .sum::<f64>(),
-          )
-        })
-        .unwrap()
-    };
+    let medoid = calc_approx_medoid(&id_to_point, metric, medoid_sample_size);
 
     let ds = Self {
       adj_list,
@@ -294,7 +300,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
 
         // RobustPrune.
         // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
-        for n in self.ds.get_out_neighbors(id) {
+        for n in self.ds.get_out_neighbors(id).0 {
           candidates.insert(n);
         }
         // RobustPrune requires that the point itself is never in the candidate set.
@@ -316,7 +322,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       updates.into_par_iter().for_each(|(id, u)| {
         let mut new_neighbors = u
           .replacement_base
-          .unwrap_or_else(|| self.ds.get_out_neighbors(id));
+          .unwrap_or_else(|| self.ds.get_out_neighbors(id).0);
         for j in u.additional_edges {
           if !new_neighbors.contains(&j) {
             new_neighbors.push(j);

@@ -6,7 +6,9 @@ use linfa_clustering::KMeans;
 use linfa_clustering::KMeansInit;
 use linfa_nn::distance::L2Dist;
 use ndarray::s;
+use ndarray::Array1;
 use ndarray::Array2;
+use ndarray::ArrayView1;
 use ndarray::ArrayView2;
 use rand::thread_rng;
 use rayon::iter::IntoParallelIterator;
@@ -99,6 +101,20 @@ impl<T: linfa::Float> ProductQuantizer<T> {
           .slice_mut(s![j, i * subdims..(i + 1) * subdims])
           .assign(&dec[j]);
       }
+    }
+    mat
+  }
+
+  pub fn decode_1(&self, code: &ArrayView1<u8>) -> Array1<T> {
+    let subspaces = self.subspace_codebooks.len();
+    let subdims = self.dims / subspaces;
+    assert_eq!(code.dim(), subspaces);
+    let mut mat = Array1::<T>::zeros(self.dims);
+    for (i, codebook) in self.subspace_codebooks.iter().enumerate() {
+      let dec = codebook.centroids().row(code[i].into()).to_owned();
+      mat
+        .slice_mut(s![i * subdims..(i + 1) * subdims])
+        .assign(&dec);
     }
     mat
   }

@@ -8,6 +8,7 @@ use ordered_float::OrderedFloat;
 use parking_lot::Mutex;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
@@ -85,7 +86,8 @@ pub struct SearchMetrics {
 
 pub trait GreedySearchable<T: Scalar + Send + Sync>: Send + Sync {
   fn get_point(&self, id: Id) -> Array1<T>;
-  fn get_out_neighbors(&self, id: Id) -> Vec<Id>;
+  // If the graph supports it, provide full embedding for reranking as second return value.
+  fn get_out_neighbors(&self, id: Id) -> (Vec<Id>, Option<Array1<T>>);
 }
 
 // Optimised custom function for k=1 and search_list_cap=1.
@@ -114,8 +116,11 @@ pub fn greedy_search_fast1<T: Scalar + Send + Sync>(
   seen.insert(start);
   loop {
     let cur = state.lock().cur.id;
-    graph
-      .get_out_neighbors(cur)
+    let (neighbors, full_vec) = graph.get_out_neighbors(cur);
+    if let Some(v) = full_vec {
+      state.lock().cur.dist = metric(&v.view(), query);
+    };
+    neighbors
       .into_par_iter()
       .filter(|n| !seen.contains(n))
       .map(|n| PointDist {
@@ -180,12 +185,16 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
   });
   let ground_truth_found = AtomicUsize::new(0);
   while !l_unvisited.is_empty() {
-    let new_visited = (0..beam_width)
+    let mut new_visited = (0..beam_width)
       .filter_map(|_| l_unvisited.pop_front())
       .collect::<Vec<_>>();
     let neighbors = DashSet::new();
-    new_visited.par_iter().for_each(|p_star| {
-      for j in graph.get_out_neighbors(p_star.id) {
+    new_visited.par_iter_mut().for_each(|p_star| {
+      let (p_neighbors, full_vec) = graph.get_out_neighbors(p_star.id);
+      if let Some(v) = full_vec {
+        p_star.dist = metric(&v.view(), query);
+      }
+      for j in p_neighbors {
         neighbors.insert(j);
       }
     });
@@ -297,6 +306,7 @@ pub fn find_shortest_spanning_tree<T: Scalar + Send + Sync>(
     // Move on to neighbors of `to` in the base shard.
     let new = graph
       .get_out_neighbors(to)
+      .0
       .into_par_iter()
       .filter_map(|neighbor| {
         if visited.contains(&neighbor) {

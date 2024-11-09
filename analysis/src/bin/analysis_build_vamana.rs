@@ -54,6 +54,11 @@ fn main() {
     params,
     10_000,
   );
+  fs::write(
+    format!("dataset/{ds}/out/vamana/vamana.medoid.txt"),
+    index.medoid().to_string(),
+  )
+  .unwrap();
   println!("Built graph");
 
   analyse_index("vamana", &index);

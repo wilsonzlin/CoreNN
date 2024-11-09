@@ -1,7 +1,9 @@
+use dashmap::DashMap;
 use db::Db;
 use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
 use ndarray::Array1;
+use pq::ProductQuantizer;
 use std::path::Path;
 use vamana::Vamana;
 use vamana::VamanaDatastore;
@@ -13,15 +15,22 @@ pub mod vamana;
 
 pub struct RoxanneDbReadOnly {
   db: Db,
+  pq: ProductQuantizer<f32>,
+  pq_vec_cache: DashMap<Id, Array1<u8>>,
 }
 
 impl GreedySearchable<f32> for RoxanneDbReadOnly {
   fn get_point(&self, id: Id) -> Array1<f32> {
-    Array1::from_vec(self.db.read_node(id).vector)
+    let vec = self.pq_vec_cache.entry(id).or_insert_with(|| {
+      let raw = self.db.read_pq_vec(id);
+      Array1::from_vec(raw)
+    });
+    self.pq.decode_1(&vec.view())
   }
 
-  fn get_out_neighbors(&self, id: Id) -> Vec<Id> {
-    self.db.read_node(id).neighbors
+  fn get_out_neighbors(&self, id: Id) -> (Vec<Id>, Option<Array1<f32>>) {
+    let n = self.db.read_node(id);
+    (n.neighbors, Some(Array1::from_vec(n.vector)))
   }
 }
 
@@ -41,6 +50,16 @@ impl RoxanneDbReadOnly {
     let cfg = db.read_cfg();
     let medoid = db.read_medoid();
     let metric = db.read_metric().get_fn::<f32>();
-    Vamana::new(Self { db }, metric, medoid, cfg)
+    let pq = db.read_pq_model();
+    Vamana::new(
+      Self {
+        db,
+        pq,
+        pq_vec_cache: DashMap::new(),
+      },
+      metric,
+      medoid,
+      cfg,
+    )
   }
 }

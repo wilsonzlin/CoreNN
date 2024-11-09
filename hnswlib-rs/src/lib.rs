@@ -277,8 +277,8 @@ impl GreedySearchable<f32> for HnswIndex {
     Array1::from_vec(self.get_data_by_label(id))
   }
 
-  fn get_out_neighbors(&self, id: Id) -> Vec<Id> {
-    self.get_merged_neighbors(id, 0).into_iter().collect()
+  fn get_out_neighbors(&self, id: Id) -> (Vec<Id>, Option<Array1<f32>>) {
+    (self.get_merged_neighbors(id, 0).into_iter().collect(), None)
   }
 }
 
@@ -302,7 +302,7 @@ impl<'a> GreedySearchable<f32> for HnswLevelIndex<'a> {
     Array1::from_vec(self.hnsw.get_data_by_label(id))
   }
 
-  fn get_out_neighbors(&self, id: Id) -> Vec<Id> {
-    self.graph[&id].clone()
+  fn get_out_neighbors(&self, id: Id) -> (Vec<Id>, Option<Array1<f32>>) {
+    (self.graph[&id].clone(), None)
   }
 }
