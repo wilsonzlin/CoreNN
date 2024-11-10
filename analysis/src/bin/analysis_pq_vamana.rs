@@ -1,13 +1,9 @@
-use ahash::HashMap;
-use ahash::HashMapExt;
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use clap::Parser;
 use dashmap::DashMap;
 use itertools::Itertools;
 use libroxanne::pq::ProductQuantizer;
-use libroxanne::vamana::calc_approx_medoid;
-use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaDatastore;
 use libroxanne::vamana::VamanaParams;
@@ -16,14 +12,9 @@ use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
 use ndarray::stack;
 use ndarray::Array1;
-use ndarray::Array2;
 use ndarray::Axis;
-use roxanne_analysis::analyse_index;
 use roxanne_analysis::eval;
 use roxanne_analysis::read_vectors;
-use roxanne_analysis::read_vectors_dims;
-use std::fs;
-use std::fs::File;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]

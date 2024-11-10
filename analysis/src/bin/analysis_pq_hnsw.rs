@@ -1,5 +1,3 @@
-use ahash::HashMap;
-use ahash::HashMapExt;
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use clap::Parser;
@@ -7,7 +5,6 @@ use dashmap::DashMap;
 use hnswlib_rs::HnswIndex;
 use itertools::Itertools;
 use libroxanne::pq::ProductQuantizer;
-use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaDatastore;
 use libroxanne::vamana::VamanaParams;
@@ -16,11 +13,9 @@ use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
 use ndarray::Array1;
 use ndarray::Array2;
-use roxanne_analysis::analyse_index;
 use roxanne_analysis::eval;
 use roxanne_analysis::read_vectors;
 use roxanne_analysis::read_vectors_dims;
-use std::fs;
 use std::fs::File;
 
 #[derive(Parser, Debug)]
@@ -77,7 +72,7 @@ fn main() {
   let dim = read_vectors_dims("base.fvecs");
   let queries = read_vectors("query.fvecs", LittleEndian::read_f32_into);
   let ground_truth = read_vectors("groundtruth.ivecs", LittleEndian::read_u32_into);
-  let k = ground_truth[0].dims();
+  let k = ground_truth[0].dim();
 
   let hnsw = HnswIndex::load(
     dim,
