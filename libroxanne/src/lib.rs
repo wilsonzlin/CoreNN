@@ -62,4 +62,8 @@ impl RoxanneDbReadOnly {
       cfg,
     )
   }
+
+  pub fn raw_db(&self) -> &Db {
+    &self.db
+  }
 }
