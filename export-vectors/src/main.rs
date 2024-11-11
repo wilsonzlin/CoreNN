@@ -6,6 +6,7 @@ use libroxanne::db::NodeData;
 use libroxanne_search::Id;
 use rocksdb::Direction;
 use rocksdb::IteratorMode;
+use std::fs::create_dir_all;
 use std::fs::File;
 use std::io::BufWriter;
 use std::io::Write;
@@ -29,6 +30,8 @@ fn main() {
 
   let db = Db::open(&args.path);
   let dim = db.read_dim();
+
+  create_dir_all(&args.out).unwrap();
 
   let out_ids = File::create(args.out.join("ids.bin")).unwrap();
   let mut out_ids = BufWriter::new(out_ids);

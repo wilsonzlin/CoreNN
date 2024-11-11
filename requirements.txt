@@ -1,3 +1,4 @@
+cupy-cuda12x
 hnswlib
 matplotlib
 msgpack
@@ -5,6 +6,7 @@ numpy
 scikit-learn
 scipy
 seaborn
+tqdm
 umap-learn
 
 
