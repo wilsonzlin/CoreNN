@@ -40,6 +40,7 @@ impl<T: linfa::Float> ProductQuantizer<T> {
         // Shuffling is important to Mini-Batch K-means (see documentation above).
         let obs = DatasetBase::from(submat.to_owned()).shuffle(&mut thread_rng());
         // Use KMeansPara as it's faster for larger datasets. (See its comment.)
+        // TODO Allow tuning `tolerance` and `n_runs`. `max_n_iterations` is not applicable to Mini-Batch K-means.
         let clf = KMeans::params(256).init_method(KMeansInit::KMeansPara);
 
         let mut cur: Option<KMeans<T, L2Dist>> = None;

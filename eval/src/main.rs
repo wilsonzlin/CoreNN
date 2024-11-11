@@ -4,7 +4,7 @@ use byteorder::LittleEndian;
 use clap::Parser;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
-use libroxanne::InMemoryRoxanneDbReadOnly;
+use libroxanne::RoxanneDbReadOnly;
 use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
 use rayon::iter::IndexedParallelIterator;
@@ -33,6 +33,14 @@ struct Args {
   /// Override query search list cap.
   #[arg(long)]
   query_search_list_cap: Option<usize>,
+
+  /// Override k (must be less than or equal to KNN vector dimensions).
+  #[arg(long)]
+  k: Option<usize>,
+
+  /// Load as in-memory index.
+  #[arg(long)]
+  in_memory: bool,
 }
 
 fn new_pb(len: usize) -> ProgressBar {
@@ -50,7 +58,8 @@ fn new_pb(len: usize) -> ProgressBar {
 fn main() {
   let args = Args::parse();
 
-  let mut idx = InMemoryRoxanneDbReadOnly::open(&args.path);
+  // TODO in_memory.
+  let mut idx = RoxanneDbReadOnly::open(&args.path);
   println!("Loaded index");
 
   let query_ids = {
@@ -76,7 +85,7 @@ fn main() {
       .collect::<Vec<_>>()
   };
   println!("Loaded KNN IDs");
-  let k = knn_ids[0].len();
+  let k = args.k.unwrap_or(knn_ids[0].len());
   if let Some(q) = args.query_search_list_cap {
     idx.params_mut().query_search_list_cap = q;
   }
@@ -92,6 +101,7 @@ fn main() {
 
       let knn_expected = knn_expected
         .into_iter()
+        .take(k)
         .map(|id| Id::try_from(id).unwrap())
         .collect::<HashSet<_>>();
       let knn_got = idx
