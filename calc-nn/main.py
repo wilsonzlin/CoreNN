@@ -1,7 +1,11 @@
 from tqdm import tqdm
 import argparse
-import cupy as cp
+import torch
 import numpy as np
+
+"""
+We use PyTorch instead of cupy because it supports the latest versions of both ROCm and CUDA.
+"""
 
 parser = argparse.ArgumentParser(
     description="Perform similarity search on vectors using the GPU and save the results."
@@ -20,8 +24,10 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+# Set device to GPU if available (works with both CUDA and ROCm).
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load IDs and vectors from disk
+# Load IDs and vectors from disk.
 print("Loading data from disk...")
 with open(args.ids, "rb") as f:
     ids = np.frombuffer(f.read(), dtype=np.uint64)  # Shape: (N,)
@@ -41,7 +47,7 @@ with open("query_ids.bin", "wb") as f:
 # Transfer data to GPU.
 print("Transferring data to GPU...")
 # Transpose before GPU to avoid doubling GPU memory usage.
-vectors_t_gpu = cp.asarray(vectors.T, dtype="float32")
+vectors_t_gpu = torch.from_numpy(vectors.T).to(device=device, dtype=torch.float32)
 out_knn = open("knn_ids.bin", "wb")
 
 pb = tqdm(total=args.n_samples)
@@ -53,14 +59,16 @@ for i in range(0, args.n_samples, args.batch_size):
     query_vectors_gpu = vectors_t_gpu[:, batch_indices].T
     assert query_vectors_gpu.shape == (batch_n, D)
 
-    # Calculate cosine similarity
-    similarities = cp.dot(query_vectors_gpu, vectors_t_gpu)  # Shape: (batch_size, N)
+    # Disable gradient computation for efficiency
+    with torch.no_grad():
+        # Calculate cosine similarity
+        similarities = torch.mm(query_vectors_gpu, vectors_t_gpu)  # Shape: (batch_size, N)
 
-    # Get top k nearest neighbors
-    top_k_indices = cp.argsort(-similarities, axis=1)[:, : args.k]
+        # Get top k nearest neighbors
+        _, top_k_indices = torch.topk(similarities, k=args.k, dim=1)
 
     # Convert indices back to IDs
-    result_ids = ids[cp.asnumpy(top_k_indices)]
+    result_ids = ids[top_k_indices.numpy(force=True)]
     assert result_ids.shape == (batch_n, args.k)
     assert result_ids.dtype == np.uint64
     out_knn.write(result_ids.tobytes())
