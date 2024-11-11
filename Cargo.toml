@@ -4,6 +4,7 @@ members = [
   "analysis",
   "eval",
   "export-vectors",
+  "fix-nan",
   "hnsw-sharded-to-roxanne",
   "hnsw-to-roxanne",
   "hnswlib-rs",

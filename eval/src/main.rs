@@ -4,7 +4,7 @@ use byteorder::LittleEndian;
 use clap::Parser;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
-use libroxanne::RoxanneDbReadOnly;
+use libroxanne::InMemoryRoxanneDbReadOnly;
 use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
 use rayon::iter::IndexedParallelIterator;
@@ -29,6 +29,10 @@ struct Args {
   /// Path to packed matrix of u64 vectors representing ID of nearest neighbors for each query.
   #[arg(long)]
   knn: PathBuf,
+
+  /// Override query search list cap.
+  #[arg(long)]
+  query_search_list_cap: Option<usize>,
 }
 
 fn new_pb(len: usize) -> ProgressBar {
@@ -46,7 +50,8 @@ fn new_pb(len: usize) -> ProgressBar {
 fn main() {
   let args = Args::parse();
 
-  let mut idx = RoxanneDbReadOnly::open(&args.path);
+  let mut idx = InMemoryRoxanneDbReadOnly::open(&args.path);
+  println!("Loaded index");
 
   let query_ids = {
     let raw = fs::read(&args.queries).unwrap();
@@ -55,6 +60,7 @@ fn main() {
     LittleEndian::read_u64_into(&raw, &mut out);
     out
   };
+  println!("Loaded query IDs");
   let knn_ids = {
     let raw = fs::read(&args.knn).unwrap();
     assert_eq!(raw.len() % (8 * query_ids.len()), 0);
@@ -69,8 +75,11 @@ fn main() {
       })
       .collect::<Vec<_>>()
   };
+  println!("Loaded KNN IDs");
   let k = knn_ids[0].len();
-  idx.params_mut().query_search_list_cap = (k as f64 * 1.33) as usize;
+  if let Some(q) = args.query_search_list_cap {
+    idx.params_mut().query_search_list_cap = q;
+  }
 
   let pb = new_pb(query_ids.len());
   let correct = AtomicUsize::new(0);

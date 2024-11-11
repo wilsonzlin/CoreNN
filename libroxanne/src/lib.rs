@@ -1,5 +1,7 @@
+use ahash::HashMap;
 use dashmap::DashMap;
 use db::Db;
+use db::NodeData;
 use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
 use ndarray::Array1;
@@ -65,5 +67,40 @@ impl RoxanneDbReadOnly {
 
   pub fn raw_db(&self) -> &Db {
     &self.db
+  }
+}
+
+pub struct InMemoryRoxanneDbReadOnly {
+  nodes: HashMap<Id, NodeData>,
+}
+
+impl GreedySearchable<f32> for InMemoryRoxanneDbReadOnly {
+  fn get_point(&self, id: Id) -> Array1<f32> {
+    Array1::from_vec(self.nodes[&id].vector.clone())
+  }
+
+  fn get_out_neighbors(&self, id: Id) -> (Vec<Id>, Option<Array1<f32>>) {
+    (self.nodes[&id].neighbors.clone(), None)
+  }
+}
+
+impl VamanaDatastore<f32> for InMemoryRoxanneDbReadOnly {
+  fn set_point(&self, _id: Id, _point: Array1<f32>) {
+    panic!("read only");
+  }
+
+  fn set_out_neighbors(&self, _id: Id, _neighbors: Vec<Id>) {
+    panic!("read only");
+  }
+}
+
+impl InMemoryRoxanneDbReadOnly {
+  pub fn open(dir: impl AsRef<Path>) -> Vamana<f32, Self> {
+    let db = Db::open(dir);
+    let cfg = db.read_cfg();
+    let medoid = db.read_medoid();
+    let metric = db.read_metric().get_fn::<f32>();
+    let nodes = db.iter_nodes().collect();
+    Vamana::new(Self { nodes }, metric, medoid, cfg)
   }
 }

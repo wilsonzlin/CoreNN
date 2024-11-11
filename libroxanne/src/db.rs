@@ -5,8 +5,11 @@ use bitcode::Encode;
 use libroxanne_search::Id;
 use libroxanne_search::StdMetric;
 use rocksdb::BlockBasedOptions;
+use rocksdb::Direction;
+use rocksdb::IteratorMode;
 use serde::Serialize;
 use std::path::Path;
+use std::str::from_utf8;
 
 // We store both in one DB entry to leverage one disk page read to get both, as specified in the DiskANN paper. (If we store them as separate DB entries, they are unlikely to be stored in the same disk page.) We don't have to store the embedding.
 // Why we chose Bitcode:
@@ -68,6 +71,20 @@ impl Db {
 
   pub fn inner(&self) -> &rocksdb::DB {
     &self.db
+  }
+
+  pub fn iter_nodes(&self) -> impl Iterator<Item = (Id, NodeData)> + '_ {
+    self
+      .db
+      .full_iterator(IteratorMode::From(b"node/", Direction::Forward))
+      .map(|e| e.unwrap())
+      .take_while(|(k, _)| k.starts_with(b"node/"))
+      .map(|(k, v)| {
+        let id_raw = k.strip_prefix(b"node/").unwrap();
+        let id = Id::from_str_radix(from_utf8(id_raw).unwrap(), 10).unwrap();
+        let node = NodeData::deserialize(&v);
+        (id, node)
+      })
   }
 
   pub fn flush(&self) {
