@@ -1,8 +1,9 @@
+#![feature(f16)]
+
 use ahash::HashMap;
 use ahash::HashSet;
-use byteorder::ByteOrder;
-use byteorder::LittleEndian;
-use byteorder::ReadBytesExt;
+use bytemuck::cast_slice;
+use bytemuck::Pod;
 use itertools::Itertools;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::Vamana;
@@ -10,52 +11,106 @@ use libroxanne::vamana::VamanaDatastore;
 use libroxanne_search::metric_euclidean;
 use libroxanne_search::Id;
 use libroxanne_search::SearchMetrics;
-use ndarray::Array1;
-use rayon::iter::IndexedParallelIterator;
+use ndarray::Array2;
+use ndarray::ArrayView2;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
+use serde::Deserialize;
 use std::fs;
 use std::fs::File;
+use std::io::Read;
 use std::io::Write;
 use std::mem::size_of;
+use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-pub fn read_vectors_dims(filename: &str) -> usize {
-  let dataset = std::env::var("DS").unwrap();
-  let mut f = File::open(format!("dataset/{dataset}/{filename}")).unwrap();
-  f.read_u32::<LittleEndian>().unwrap() as usize
+#[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum DatasetDtype {
+  F16,
+  F32,
+  F64,
+  U8,
+  U16,
+  U32,
+  U64,
+  I8,
+  I16,
+  I32,
+  I64,
 }
 
-pub fn read_vectors<T: Copy + Default + Send, Reader: Fn(&[u8], &mut [T]) + Sync>(
-  filename: &str,
-  reader: Reader,
-) -> Vec<Array1<T>> {
-  let dataset = std::env::var("DS").unwrap();
-  let raw = std::fs::read(format!("dataset/{dataset}/{filename}")).unwrap();
-  let dims = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+#[derive(Deserialize)]
+pub struct DatasetInfo {
+  pub dtype: DatasetDtype,
+  pub dim: usize,
+  pub n: usize,
+  pub q: usize,
+  pub k: usize,
+}
 
-  let bytes_per_vec = 4 + dims * size_of::<T>();
-  assert_eq!(raw.len() % bytes_per_vec, 0);
-  let n = raw.len() / bytes_per_vec;
+pub struct Dataset {
+  pub name: String,
+  pub dir: String,
+  pub info: DatasetInfo,
+}
 
-  (0..n)
-    .into_par_iter()
-    .map(|i| {
-      let start = i * bytes_per_vec;
-      let end = (i + 1) * bytes_per_vec;
-      let raw = &raw[start..end];
-      let (dims_raw, raw) = raw.split_at(4);
-      assert_eq!(
-        u32::from_le_bytes(dims_raw.try_into().unwrap()) as usize,
-        dims
-      );
-      let mut vec = vec![T::default(); dims];
-      reader(raw, vec.as_mut_slice());
-      Array1::from_vec(vec)
-    })
-    .collect::<Vec<_>>()
+fn read_raw<T: Pod>(path: impl AsRef<Path>) -> Vec<T> {
+  let t_size = size_of::<T>();
+  let mut f = File::open(path).unwrap();
+  let f_size = f.metadata().unwrap().len() as usize;
+  assert_eq!(f_size % t_size, 0);
+  let mut arr = Vec::new();
+  loop {
+    let mut raw = vec![0u8; 1024 * 1024 * 1024];
+    let n = f.read(&mut raw).unwrap();
+    if n == 0 {
+      break;
+    };
+    raw.truncate(n);
+    // TODO Support interrupted/partial reads.
+    assert_eq!(raw.len() % t_size, 0);
+    let as_t: &[T] = cast_slice(&raw);
+    arr.extend_from_slice(as_t);
+  }
+  arr
+}
+
+impl Dataset {
+  pub fn init() -> Self {
+    let name = std::env::var("DS").unwrap();
+    let dir = format!("dataset/{name}");
+    let info_raw = fs::read_to_string(format!("{dir}/info.toml")).unwrap();
+    let info: DatasetInfo = toml::from_str(&info_raw).unwrap();
+    // TODO Anything other than f32 for vectors is currently unsupported, due to Rust generics complexity.
+    assert_eq!(info.dtype, DatasetDtype::F32);
+    Dataset { name, dir, info }
+  }
+
+  pub fn read_vectors(&self) -> Array2<f32> {
+    let path = format!("{}/vectors.bin", self.dir);
+    let raw = read_raw::<f32>(path);
+    Array2::from_shape_vec((self.info.n, self.info.dim), raw).unwrap()
+  }
+
+  pub fn read_dists(&self) -> Vec<f16> {
+    let path = format!("{}/dists.bin", self.dir);
+    read_raw::<f16>(path)
+  }
+
+  pub fn read_queries(&self) -> Array2<f32> {
+    let path = format!("{}/queries.bin", self.dir);
+    let raw = read_raw::<f32>(path);
+    Array2::from_shape_vec((self.info.q, self.info.dim), raw).unwrap()
+  }
+
+  pub fn read_results(&self) -> Array2<u32> {
+    let path = format!("{}/results.bin", self.dir);
+    let raw = read_raw::<u32>(path);
+    Array2::from_shape_vec((self.info.q, self.info.k), raw).unwrap()
+  }
 }
 
 pub struct Eval {
@@ -72,17 +127,17 @@ impl Eval {
 
 pub fn eval<DS: VamanaDatastore<f32>>(
   index: &Vamana<f32, DS>,
-  queries: &[Array1<f32>],
-  ground_truth: &[Array1<u32>],
+  queries: &ArrayView2<f32>,
+  ground_truth: &ArrayView2<u32>,
 ) -> Eval {
-  let k = ground_truth[0].len();
+  let q = queries.shape()[0];
+  let k = ground_truth.shape()[1];
   let correct = AtomicUsize::new(0);
-  let query_metrics = queries
+  let query_metrics = (0..q)
     .into_par_iter()
-    .zip(ground_truth)
-    .map(|(vec, knn_expected)| {
-      let knn_expected = HashSet::from_iter(knn_expected.mapv(|v| v as Id));
-      let (res, metrics) = index.query_with_metrics(&vec.view(), k, Some(&knn_expected));
+    .map(|i| {
+      let knn_expected = HashSet::from_iter(ground_truth.row(i).mapv(|v| v as Id));
+      let (res, metrics) = index.query_with_metrics(&queries.row(i), k, Some(&knn_expected));
       let knn_got = res.into_iter().map(|pd| pd.id).collect::<HashSet<_>>();
       correct.fetch_add(
         knn_expected.intersection(&knn_got).count(),
@@ -99,15 +154,14 @@ pub fn eval<DS: VamanaDatastore<f32>>(
   }
 }
 
-pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
-  let ds = std::env::var("DS").unwrap();
-  let vecs = read_vectors("base.fvecs", LittleEndian::read_f32_into);
-  let qs = read_vectors("query.fvecs", LittleEndian::read_f32_into);
-  let knns = read_vectors("groundtruth.ivecs", LittleEndian::read_u32_into);
+pub fn analyse_index(ds: &Dataset, out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
+  let vecs = ds.read_vectors();
+  let qs = ds.read_queries();
+  let knns = ds.read_results();
 
   let graph = index.datastore().graph();
   fs::write(
-    format!("dataset/{ds}/out/{out_dir}/graph.msgpack"),
+    format!("dataset/{}/out/{out_dir}/graph.msgpack", ds.name),
     rmp_serde::to_vec_named(&graph).unwrap(),
   )
   .unwrap();
@@ -121,7 +175,7 @@ pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
         .value()
         .par_iter()
         .map(|&j| {
-          let dist = metric_euclidean(&vecs[i].view(), &vecs[j].view());
+          let dist = metric_euclidean(&vecs.row(i), &vecs.row(j));
           (j, dist)
         })
         .collect::<HashMap<_, _>>();
@@ -130,31 +184,35 @@ pub fn analyse_index(out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
     .collect::<HashMap<_, _>>();
   println!("Calculated edge dists");
   fs::write(
-    format!("dataset/{ds}/out/{out_dir}/edge_dists.msgpack"),
+    format!("dataset/{}/out/{out_dir}/edge_dists.msgpack", ds.name),
     rmp_serde::to_vec_named(&ann_dists).unwrap(),
   )
   .unwrap();
   println!("Exported edge dists");
 
-  let medoid_dists = vecs
-    .par_iter()
-    .map(|vec_i| metric_euclidean(&vecs[index.medoid()].view(), &vec_i.view()))
+  let medoid_vec = vecs.row(index.medoid());
+  let medoid_dists = (0..vecs.shape()[0])
+    .into_par_iter()
+    .map(|i| metric_euclidean(&medoid_vec, &vecs.row(i)))
     .collect::<Vec<_>>();
   println!("Calculated medoid dists");
-  File::create(format!("dataset/{ds}/out/{out_dir}/medoid_dists.mat"))
-    .unwrap()
-    .write_all(
-      &medoid_dists
-        .into_iter()
-        .flat_map(|d| (d as f32).to_le_bytes())
-        .collect_vec(),
-    )
-    .unwrap();
+  File::create(format!(
+    "dataset/{}/out/{out_dir}/medoid_dists.mat",
+    ds.name
+  ))
+  .unwrap()
+  .write_all(
+    &medoid_dists
+      .into_iter()
+      .flat_map(|d| (d as f32).to_le_bytes())
+      .collect_vec(),
+  )
+  .unwrap();
   println!("Exported medoid dists");
 
-  let e = eval(&index, &qs, &knns);
+  let e = eval(&index, &qs.view(), &knns.view());
   fs::write(
-    format!("dataset/{ds}/out/{out_dir}/query_metrics.msgpack"),
+    format!("dataset/{}/out/{out_dir}/query_metrics.msgpack", ds.name),
     rmp_serde::to_vec_named(&e.query_metrics).unwrap(),
   )
   .unwrap();

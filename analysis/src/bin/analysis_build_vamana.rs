@@ -5,9 +5,9 @@ use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::VamanaParams;
 use libroxanne_search::metric_euclidean;
 use roxanne_analysis::analyse_index;
-use roxanne_analysis::read_vectors;
-use roxanne_analysis::read_vectors_dims;
+use roxanne_analysis::Dataset;
 use std::fs;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -29,14 +29,18 @@ struct Args {
 }
 
 fn main() {
-  let ds = std::env::var("DS").unwrap();
+  let ds = Dataset::init();
 
   let args = Args::parse();
 
-  fs::create_dir_all(format!("dataset/{ds}/out/vamana")).unwrap();
+  fs::create_dir_all(format!("dataset/{}/out/vamana", ds.name)).unwrap();
 
-  let vecs = read_vectors("base.fvecs", LittleEndian::read_f32_into);
-  let k = read_vectors_dims("groundtruth.ivecs");
+  let vecs = ds.read_vectors();
+  println!("Loaded vectors");
+  let n = ds.info.n;
+  let k = ds.info.k;
+  let precomputed_dists = ds.read_dists();
+  println!("Loaded dists");
 
   let params = VamanaParams {
     beam_width: args.beam_width,
@@ -49,17 +53,21 @@ fn main() {
   println!("Params: {params:?}");
 
   let index = InMemoryVamana::build_index(
-    vecs.into_iter().enumerate().collect(),
+    (0..n).map(|i| (i, vecs.row(i).to_owned())).collect(),
     metric_euclidean,
     params,
     10_000,
+    Some(Arc::new((
+      (0..vecs.len()).map(|i| (i, i)).collect(),
+      precomputed_dists,
+    ))),
   );
   fs::write(
-    format!("dataset/{ds}/out/vamana/vamana.medoid.txt"),
+    format!("dataset/{}/out/vamana/vamana.medoid.txt", ds.name),
     index.medoid().to_string(),
   )
   .unwrap();
   println!("Built graph");
 
-  analyse_index("vamana", &index);
+  analyse_index(&ds, "vamana", &index);
 }

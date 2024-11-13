@@ -1,3 +1,6 @@
+#![feature(f16)]
+
+use ahash::HashMap;
 use ahash::HashSet;
 use ahash::HashSetExt;
 use dashmap::DashSet;
@@ -16,11 +19,18 @@ use std::collections::BinaryHeap;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use strum_macros::Display;
 use strum_macros::EnumString;
 
 pub type Id = usize;
 pub type Metric<T> = fn(&ArrayView1<T>, &ArrayView1<T>) -> f64;
+
+#[derive(Clone, Copy)]
+pub enum IdOrVec<'a, 'b, T: Scalar> {
+  Id(Id),
+  Vec(&'a ArrayView1<'b, T>),
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PointDist {
@@ -153,7 +163,7 @@ pub fn greedy_search_fast1<T: Scalar + Send + Sync>(
 // Filtered nodes will be visited and expanded but not considered for the final set of neighbors.
 pub fn greedy_search<T: Scalar + Send + Sync>(
   graph: &impl GreedySearchable<T>,
-  query: &ArrayView1<T>,
+  query: IdOrVec<T>,
   k: usize,
   search_list_cap: usize,
   beam_width: usize,
@@ -161,6 +171,8 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
   start: Id,
   filter: impl Fn(PointDist) -> bool,
   mut out_visited: Option<&mut HashSet<Id>>,
+  // (map from ID to row/col no, matrix of dists flattened).
+  precomputed_dists: Option<Arc<(HashMap<Id, usize>, Vec<f16>)>>,
   mut out_metrics: Option<&mut SearchMetrics>,
   ground_truth: Option<&HashSet<Id>>,
 ) -> Vec<PointDist> {
@@ -168,6 +180,19 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
     search_list_cap >= k,
     "search list capacity must be greater than or equal to k"
   );
+  let calc_dist = |a: Id| match query {
+    IdOrVec::Id(b) => match precomputed_dists.as_ref() {
+      None => metric(&graph.get_point(a).view(), &graph.get_point(b).view()),
+      Some(pd) => {
+        let (id_to_no, dists) = pd.as_ref();
+        let n = id_to_no.len();
+        let ia = id_to_no[&a];
+        let ib = id_to_no[&b];
+        dists[ia * n + ib] as f64
+      }
+    },
+    IdOrVec::Vec(v) => metric(v, &graph.get_point(a).view()),
+  };
 
   // It's too inefficient to calculate L\V repeatedly.
   // Since we need both L (return value) and L\V (each iteration), we split L into V and ¬V.
@@ -181,7 +206,7 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
   let mut all_visited = HashSet::new();
   l_unvisited.push_back(PointDist {
     id: start,
-    dist: metric(&graph.get_point(start).view(), query),
+    dist: calc_dist(start),
   });
   let ground_truth_found = AtomicUsize::new(0);
   while !l_unvisited.is_empty() {
@@ -192,7 +217,10 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
     new_visited.par_iter_mut().for_each(|p_star| {
       let (p_neighbors, full_vec) = graph.get_out_neighbors(p_star.id);
       if let Some(v) = full_vec {
-        p_star.dist = metric(&v.view(), query);
+        p_star.dist = match query {
+          IdOrVec::Id(id) => metric(&v.view(), &graph.get_point(id).view()),
+          IdOrVec::Vec(o) => metric(&v.view(), o),
+        };
       }
       for j in p_neighbors {
         neighbors.insert(j);
@@ -221,7 +249,7 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
         }
         Some(PointDist {
           id: neighbor,
-          dist: metric(&graph.get_point(neighbor).view(), query),
+          dist: calc_dist(neighbor),
         })
       })
       .collect::<VecDeque<_>>();

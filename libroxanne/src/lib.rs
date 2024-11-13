@@ -1,3 +1,5 @@
+#![feature(f16)]
+
 use ahash::HashMap;
 use dashmap::DashMap;
 use db::Db;

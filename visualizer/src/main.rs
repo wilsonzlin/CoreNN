@@ -45,6 +45,7 @@ fn main() {
       update_search_list_cap: search_list_cap,
     },
     10_000,
+    None,
   );
 
   // Test k-NN of every point.

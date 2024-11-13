@@ -1,3 +1,4 @@
+use ahash::HashMap;
 use ahash::HashSet;
 use ahash::HashSetExt;
 use dashmap::DashMap;
@@ -5,6 +6,7 @@ use itertools::Itertools;
 use libroxanne_search::greedy_search;
 use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
+use libroxanne_search::IdOrVec;
 use libroxanne_search::Metric;
 use libroxanne_search::PointDist;
 use libroxanne_search::SearchMetrics;
@@ -21,6 +23,7 @@ use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 pub fn calc_approx_medoid<T: Scalar + Send + Sync>(
   id_to_point: &DashMap<Id, Array1<T>>,
@@ -105,6 +108,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     params: VamanaParams,
     // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
     medoid_sample_size: usize,
+    precomputed_dists: Option<Arc<(HashMap<Id, usize>, Vec<f16>)>>,
   ) -> Vamana<T, Self> {
     // Initialise to R-regular graph with random edges.
     let adj_list = DashMap::new();
@@ -127,7 +131,11 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
       adj_list,
       id_to_point,
     };
-    let graph = Vamana::new(ds, metric, medoid, params);
+    let mut graph = Vamana::new(ds, metric, medoid, params);
+
+    if let Some(pd) = precomputed_dists {
+      graph.set_precomputed_dists(pd);
+    };
 
     graph
   }
@@ -138,11 +146,18 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     params: VamanaParams,
     // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
     medoid_sample_size: usize,
+    precomputed_dists: Option<Arc<(HashMap<Id, usize>, Vec<f16>)>>,
   ) -> Vamana<T, Self> {
     let mut ids_random = dataset.iter().map(|e| e.0).collect_vec();
     ids_random.shuffle(&mut thread_rng());
 
-    let graph = Self::init_random_index(dataset, metric, params, medoid_sample_size);
+    let graph = Self::init_random_index(
+      dataset,
+      metric,
+      params,
+      medoid_sample_size,
+      precomputed_dists,
+    );
 
     graph.optimize(ids_random, None);
 
@@ -173,6 +188,7 @@ pub struct Vamana<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> {
   metric: Metric<T>,
   medoid: Id,
   params: VamanaParams,
+  precomputed_dists: Option<Arc<(HashMap<Id, usize>, Vec<f16>)>>,
 }
 
 impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
@@ -182,6 +198,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       metric,
       medoid,
       params,
+      precomputed_dists: None,
     }
   }
 
@@ -205,6 +222,10 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     &mut self.params
   }
 
+  pub fn set_precomputed_dists(&mut self, precomputed_dists: Arc<(HashMap<Id, usize>, Vec<f16>)>) {
+    self.precomputed_dists = Some(precomputed_dists);
+  }
+
   fn greedy_search(
     &self,
     query: &ArrayView1<T>,
@@ -217,7 +238,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     let mut visited = HashSet::<Id>::new();
     let knn = greedy_search(
       &self.ds,
-      query,
+      IdOrVec::Vec(query),
       k,
       search_list_cap,
       self.params.beam_width,
@@ -225,6 +246,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
       self.medoid,
       filter,
       Some(&mut visited),
+      self.precomputed_dists.clone(),
       metrics,
       ground_truth,
     );

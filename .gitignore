@@ -1,6 +1,8 @@
 __pycache__/
 .venv/
-/dataset/
 Cargo.lock
 target/
 visualizer.data.json
+
+/dataset/*
+!/dataset/README.md

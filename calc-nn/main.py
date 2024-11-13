@@ -10,7 +10,7 @@ We use PyTorch instead of cupy because it supports the latest versions of both R
 parser = argparse.ArgumentParser(
     description="Perform similarity search on vectors using the GPU and save the results."
 )
-parser.add_argument("--ids", type=str, help="Path to packed array of u64 IDs")
+parser.add_argument("--ids", type=str, help="Path to packed array of u32 IDs; if omitted, will use [0, N-1]")
 parser.add_argument("--vectors", type=str, help="Path to packed array of f32 vectors")
 parser.add_argument("--dim", type=int, help="Dimension of vectors")
 parser.add_argument("--n-samples", type=int, help="Number of vectors to sample")
@@ -29,26 +29,30 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load IDs and vectors from disk.
 print("Loading data from disk...")
-with open(args.ids, "rb") as f:
-    ids = np.frombuffer(f.read(), dtype=np.uint64)  # Shape: (N,)
 with open(args.vectors, "rb") as f:
     vectors = np.frombuffer(f.read(), dtype=np.float32).reshape(
         (-1, args.dim)
     )  # Shape: (N, D)
 N, D = vectors.shape
-assert N == ids.shape[0]
 print(f"Loaded {N} vectors of dimension {D}")
+
+if args.ids is not None:
+    with open(args.ids, "rb") as f:
+        ids = np.frombuffer(f.read(), dtype=np.uint32)
+else:
+    ids = np.arange(N, dtype=np.uint32)  # Shape: (N,)
+assert (N,) == ids.shape
 
 # Sample random indices.
 sample_indices = np.random.choice(N, size=args.n_samples, replace=False)
-with open("query_ids.bin", "wb") as f:
-    f.write(ids[sample_indices].tobytes())
+with open("queries.bin", "wb") as f:
+    f.write(vectors[sample_indices].tobytes())
 
 # Transfer data to GPU.
 print("Transferring data to GPU...")
 # Transpose before GPU to avoid doubling GPU memory usage.
 vectors_t_gpu = torch.from_numpy(vectors.T).to(device=device, dtype=torch.float32)
-out_knn = open("knn_ids.bin", "wb")
+out_knn = open("results.bin", "wb")
 
 pb = tqdm(total=args.n_samples)
 for i in range(0, args.n_samples, args.batch_size):
@@ -70,7 +74,7 @@ for i in range(0, args.n_samples, args.batch_size):
     # Convert indices back to IDs
     result_ids = ids[top_k_indices.numpy(force=True)]
     assert result_ids.shape == (batch_n, args.k)
-    assert result_ids.dtype == np.uint64
+    assert result_ids.dtype == np.uint32
     out_knn.write(result_ids.tobytes())
     pb.update(batch_n)
 pb.close()
