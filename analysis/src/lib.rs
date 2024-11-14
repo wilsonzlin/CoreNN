@@ -4,8 +4,8 @@ use ahash::HashMap;
 use ahash::HashSet;
 use bytemuck::cast_slice;
 use bytemuck::Pod;
+use dashmap::DashMap;
 use itertools::Itertools;
-use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaDatastore;
 use libroxanne_search::metric_euclidean;
@@ -150,19 +150,21 @@ pub fn eval<DS: VamanaDatastore<f32>>(
   Eval {
     correct: correct.load(Ordering::Relaxed),
     query_metrics,
-    total: queries.len() * k,
+    total: q * k,
   }
 }
 
-pub fn analyse_index(ds: &Dataset, out_dir: &str, index: &Vamana<f32, InMemoryVamana<f32>>) {
+pub fn export_index(ds: &Dataset, out_dir: &str, graph: &DashMap<Id, Vec<Id>>, medoid: Id) {
   let vecs = ds.read_vectors();
-  let qs = ds.read_queries();
-  let knns = ds.read_results();
 
-  let graph = index.datastore().graph();
   fs::write(
     format!("dataset/{}/out/{out_dir}/graph.msgpack", ds.name),
     rmp_serde::to_vec_named(&graph).unwrap(),
+  )
+  .unwrap();
+  fs::write(
+    format!("dataset/{}/out/{out_dir}/medoid.txt", ds.name),
+    medoid.to_string(),
   )
   .unwrap();
   println!("Exported graph");
@@ -190,7 +192,7 @@ pub fn analyse_index(ds: &Dataset, out_dir: &str, index: &Vamana<f32, InMemoryVa
   .unwrap();
   println!("Exported edge dists");
 
-  let medoid_vec = vecs.row(index.medoid());
+  let medoid_vec = vecs.row(medoid);
   let medoid_dists = (0..vecs.shape()[0])
     .into_par_iter()
     .map(|i| metric_euclidean(&medoid_vec, &vecs.row(i)))
@@ -209,19 +211,4 @@ pub fn analyse_index(ds: &Dataset, out_dir: &str, index: &Vamana<f32, InMemoryVa
   )
   .unwrap();
   println!("Exported medoid dists");
-
-  let e = eval(&index, &qs.view(), &knns.view());
-  fs::write(
-    format!("dataset/{}/out/{out_dir}/query_metrics.msgpack", ds.name),
-    rmp_serde::to_vec_named(&e.query_metrics).unwrap(),
-  )
-  .unwrap();
-  println!("Exported query metrics");
-
-  println!(
-    "Correct: {:.2}% ({}/{})",
-    e.ratio() * 100.0,
-    e.correct,
-    e.total,
-  );
 }

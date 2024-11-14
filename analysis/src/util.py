@@ -2,24 +2,7 @@ from matplotlib.colors import to_rgba
 import colorsys
 import matplotlib.pyplot as plt
 import numpy as np
-import numpy.typing as npt
 import seaborn as sns
-
-
-def read_vectors(path: str, dtype: npt.DTypeLike) -> np.ndarray:
-    elem_bytes = np.dtype(dtype).itemsize
-    with open(path, "rb") as f:
-        raw = f.read()
-    dim = int.from_bytes(raw[:4], byteorder="little")
-    raw_vec_len = 4 + dim * elem_bytes
-    n = len(raw) // raw_vec_len
-    return np.vstack(
-        [
-            # Add 4 to skip past leading dim. uint32.
-            np.frombuffer(raw, dtype=dtype, count=dim, offset=raw_vec_len * i + 4)
-            for i in range(n)
-        ]
-    )
 
 
 def plot_distribution(

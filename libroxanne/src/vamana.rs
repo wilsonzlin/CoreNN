@@ -470,6 +470,8 @@ mod tests {
         update_search_list_cap: search_list_cap,
       },
       10_000,
+      None,
+      |_, _| {},
     );
 
     // First, test ANN of every point.

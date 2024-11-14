@@ -46,6 +46,7 @@ fn main() {
     },
     10_000,
     None,
+    |_, _| {},
   );
 
   // Test k-NN of every point.

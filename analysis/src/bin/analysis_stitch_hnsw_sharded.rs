@@ -1,7 +1,5 @@
 use ahash::HashSet;
 use ahash::HashSetExt;
-use byteorder::ByteOrder;
-use byteorder::LittleEndian;
 use clap::Parser;
 use dashmap::DashMap;
 use hnswlib_rs::HnswIndex;
@@ -17,14 +15,15 @@ use libroxanne_search::GreedySearchable;
 use libroxanne_search::Id;
 use libroxanne_search::PointDist;
 use ndarray::Array1;
+use ndarray::Array2;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
-use roxanne_analysis::analyse_index;
 use roxanne_analysis::eval;
-use roxanne_analysis::read_vectors;
+use roxanne_analysis::export_index;
+use roxanne_analysis::Dataset;
 use std::cmp::Reverse;
 use std::fs;
 use std::fs::File;
@@ -46,12 +45,12 @@ struct Args {
 }
 
 struct Ctx {
-  ground_truths: Vec<Array1<u32>>,
+  ground_truths: Array2<u32>,
   k: usize,
   level_to_shard_to_nodes: DashMap<usize, DashMap<usize, Vec<Id>>>,
   medoid: Id,
   node_to_level: DashMap<Id, usize>,
-  queries: Vec<Array1<f32>>,
+  queries: Array2<f32>,
   shards: Vec<HnswIndex>,
 }
 
@@ -75,7 +74,7 @@ fn baseline_build_from_scratch(
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
   for (i, batch) in ids.chunks(batch_size).enumerate() {
     let mut metrics = OptimizeMetrics::default();
-    index.optimize(batch.to_vec(), Some(&mut metrics));
+    index.optimize(batch.to_vec(), Some(&mut metrics), |_, _| {});
     cumulative_updated_nodes.extend(metrics.updated_nodes.iter().copied());
     let touched_msg = metrics
       .updated_nodes
@@ -85,7 +84,7 @@ fn baseline_build_from_scratch(
       .sorted_unstable_by_key(|e| e.0)
       .map(|(lvl, n)| format!("l{}={}", lvl, n.len()))
       .join(" ");
-    let e = eval(&index, &ctx.queries, &ctx.ground_truths);
+    let e = eval(&index, &ctx.queries.view(), &ctx.ground_truths.view());
     println!("[Iteration {i}, {} nodes] Correct: {:.2}% ({}/{}) | Updated {} nodes ({} cumulatively): {touched_msg}", (i + 1) * batch_size, e.ratio() * 100.0, e.correct, e.total, metrics.updated_nodes.len(), cumulative_updated_nodes.len());
     if e.ratio() > 0.95 {
       break;
@@ -103,7 +102,7 @@ fn strategy_reinsert_randomly(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
   for (i, batch) in ids.chunks(batch_size).enumerate() {
     let mut metrics = OptimizeMetrics::default();
-    index.optimize(batch.to_vec(), Some(&mut metrics));
+    index.optimize(batch.to_vec(), Some(&mut metrics), |_, _| {});
     cumulative_updated_nodes.extend(metrics.updated_nodes.iter().copied());
     let touched_msg = metrics
       .updated_nodes
@@ -113,7 +112,7 @@ fn strategy_reinsert_randomly(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
       .sorted_unstable_by_key(|e| e.0)
       .map(|(lvl, n)| format!("l{}={}", lvl, n.len()))
       .join(" ");
-    let e = eval(&index, &ctx.queries, &ctx.ground_truths);
+    let e = eval(&index, &ctx.queries.view(), &ctx.ground_truths.view());
     println!("[Iteration {i}, {} nodes] Correct: {:.2}% ({}/{}) | Updated {} nodes ({} cumulatively): {touched_msg}", (i + 1) * batch_size, e.ratio() * 100.0, e.correct, e.total, metrics.updated_nodes.len(), cumulative_updated_nodes.len());
     if e.ratio() > 0.95 {
       break;
@@ -138,7 +137,7 @@ fn strategy_reinsert_by_level(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
     let nodes = ent.iter().flat_map(|e| e.to_vec()).collect_vec();
     let n = nodes.len();
     let mut metrics = OptimizeMetrics::default();
-    index.optimize(nodes, Some(&mut metrics));
+    index.optimize(nodes, Some(&mut metrics), |_, _| {});
     cumulative_updated_nodes.extend(metrics.updated_nodes.iter().copied());
     let touched_msg = metrics
       .updated_nodes
@@ -148,7 +147,7 @@ fn strategy_reinsert_by_level(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
       .sorted_unstable_by_key(|e| e.0)
       .map(|(lvl, n)| format!("l{}={}", lvl, n.len()))
       .join(" ");
-    let e = eval(&index, &ctx.queries, &ctx.ground_truths);
+    let e = eval(&index, &ctx.queries.view(), &ctx.ground_truths.view());
     println!("[Level {level} with {n} nodes] Correct: {:.2}% ({}/{}) | Updated {} nodes ({} cumulatively): {touched_msg}", e.ratio() * 100.0, e.correct, e.total, metrics.updated_nodes.len(), cumulative_updated_nodes.len());
   }
 }
@@ -251,7 +250,7 @@ fn strategy_stitch_cliques(
       }
     }
 
-    let e = eval(&index, &ctx.queries, &ctx.ground_truths);
+    let e = eval(&index, &ctx.queries.view(), &ctx.ground_truths.view());
     println!(
       "[Level {level} with {total_node_count} nodes] Correct: {:.2}% ({}/{})",
       e.ratio() * 100.0,
@@ -264,22 +263,24 @@ fn strategy_stitch_cliques(
 }
 
 fn main() {
-  let ds = std::env::var("DS").unwrap();
-  let args = Args::parse();
+  let ds = Dataset::init();
 
-  fs::create_dir_all(format!("dataset/{ds}/out/hnsw-sharded")).unwrap();
-  let shard_files = fs::read_dir(format!("dataset/{ds}/out/hnsw-sharded/indices"))
+  let args = Args::parse();
+  let out_dir = "hnsw-sharded";
+
+  let shard_files = fs::read_dir(format!("dataset/{}/out/{out_dir}/indices", ds.name))
     .unwrap()
     .map(|e| e.unwrap().path())
     .collect_vec();
 
-  let queries = read_vectors("query.fvecs", LittleEndian::read_f32_into);
-  let ground_truths = read_vectors("groundtruth.ivecs", LittleEndian::read_u32_into);
-  let k = ground_truths[0].len();
+  let queries = ds.read_queries();
+  let ground_truths = ds.read_results();
+  let dim = ds.info.dim;
+  let k = ds.info.k;
 
   let hnsws = shard_files
     .par_iter()
-    .map(|f| HnswIndex::load(queries[0].len(), File::open(f).unwrap()))
+    .map(|f| HnswIndex::load(dim, File::open(f).unwrap()))
     .collect::<Vec<_>>();
   let level_to_shard_to_nodes = DashMap::<usize, DashMap<usize, Vec<Id>>>::new();
   let node_to_level = DashMap::<Id, usize>::new();
@@ -318,7 +319,7 @@ fn main() {
   };
 
   // TODO Eval score should be based on distance, as it's more important for a near neighbor to be present than a far one.
-  let ds = InMemoryVamana::new(adj_list, id_to_point);
+  let src = InMemoryVamana::new(adj_list, id_to_point);
 
   // TODO Investigate (degree_bound, insert_search_list_cap, query_search_list_cap) variations.
   let params = VamanaParams {
@@ -332,25 +333,30 @@ fn main() {
 
   println!("strategy_stitch_cliques");
   println!("============");
-  let index = strategy_stitch_cliques(&ctx, ds.clone(), params.clone());
+  let index = strategy_stitch_cliques(&ctx, src.clone(), params.clone());
   println!();
 
-  analyse_index("hnsw-sharded", &index);
+  export_index(
+    &ds,
+    "hnsw-sharded",
+    index.datastore().graph(),
+    index.medoid(),
+  );
   println!();
 
   // Other worse strategies, provided for reference. Ctrl+C (SIGINT) at this point if not useful.
   println!("baseline_build_from_scratch");
   println!("============");
-  baseline_build_from_scratch(&args, &ctx, ds.clone(), params.clone());
+  baseline_build_from_scratch(&args, &ctx, src.clone(), params.clone());
   println!();
 
   println!("strategy_reinsert_by_level");
   println!("============");
-  strategy_reinsert_by_level(&ctx, ds.clone(), params.clone());
+  strategy_reinsert_by_level(&ctx, src.clone(), params.clone());
   println!();
 
   println!("strategy_reinsert_randomly");
   println!("============");
-  strategy_reinsert_randomly(&ctx, ds.clone(), params.clone());
+  strategy_reinsert_randomly(&ctx, src.clone(), params.clone());
   println!();
 }
