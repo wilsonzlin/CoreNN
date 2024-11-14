@@ -120,7 +120,14 @@ fn main() {
   let e = eval(&index, &qs.view(), &knns.view());
   println!("Evaluated all queries");
   fs::write(
-    format!("dataset/{}/out/{out_dir}/query_metrics{}.msgpack", ds.name, args.subspaces.map(|s| format!("_pq{s}"))),
+    format!(
+      "dataset/{}/out/{out_dir}/query_metrics{}.msgpack",
+      ds.name,
+      args
+        .subspaces
+        .map(|s| format!("_pq{s}"))
+        .unwrap_or_default()
+    ),
     rmp_serde::to_vec_named(&e.query_metrics).unwrap(),
   )
   .unwrap();
