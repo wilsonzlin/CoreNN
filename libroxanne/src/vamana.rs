@@ -267,21 +267,20 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   fn compute_robust_pruned(
     &self,
     node_id: Id,
-    candidate_ids: impl IntoParallelIterator<Item = Id>,
+    candidate_ids: impl IntoIterator<Item = Id>,
   ) -> Vec<Id> {
     let dist_thresh = self.params.distance_threshold;
     let degree_bound = self.params.degree_bound;
 
+    // WARNING: Do not use into_par_iter as most callers are already threaded and this will cause extreme contention which slows down performance dramatically.
     let mut candidates = candidate_ids
-      .into_par_iter()
+      .into_iter()
       .map(|candidate_id| PointDist {
         id: candidate_id,
         dist: self.dist(node_id, candidate_id),
       })
+      .sorted_unstable_by_key(|s| OrderedFloat(s.dist))
       .collect::<VecDeque<_>>();
-    candidates
-      .make_contiguous()
-      .sort_unstable_by_key(|s| OrderedFloat(s.dist));
 
     let mut new_neighbors = Vec::new();
     // Even though the algorithm in the paper doesn't actually pop, the later pruning of the candidates at the end of the loop guarantees it will always be removed because d(p*, p') will always be zero for itself (p* == p').

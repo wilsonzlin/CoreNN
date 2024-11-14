@@ -8,10 +8,7 @@ use ndarray::Array1;
 use ndarray::ArrayView1;
 use ndarray_linalg::Scalar;
 use ordered_float::OrderedFloat;
-use parking_lot::Mutex;
 use rayon::iter::IntoParallelIterator;
-use rayon::iter::IntoParallelRefIterator;
-use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
@@ -108,54 +105,50 @@ pub fn greedy_search_fast1<T: Scalar + Send + Sync>(
   start: Id,
   filter: impl (Fn(Id) -> bool) + Send + Sync,
 ) -> Option<PointDist> {
-  struct State {
-    cur: PointDist,
-    optima: Option<PointDist>,
-  }
   // We traverse filtered nodes but don't allow them as the answer. This is better than ignoring them while traversing, as that breaks the graph (poor/no navigability). However, it's not as exhaustive as a typical search as we do not backtrack if we have found a local optima but it's filtered, as that may cause excessive backtracking and a regression to a full graph scan (e.g. consider a scenario where the only node left is one that is actually the furtherest from the query). For our usages, it's fine to be "approximate" and even if not the most accurate node is returned (or None is returned), as overall it still works out.
   // TODO Study impact of performance and accuracy compared to full exhaustive search with backtracking while filtered.
-  let state = Mutex::new(State {
-    cur: PointDist {
-      id: start,
-      dist: metric(&graph.get_point(start).view(), query),
-    },
-    // The optima cannot default to `start` as it may be filtered.
-    optima: None,
-  });
-  let seen = DashSet::<Id>::new();
+  let mut cur = PointDist {
+    id: start,
+    dist: metric(&graph.get_point(start).view(), query),
+  };
+  // The optima cannot default to `start` as it may be filtered.
+  let mut optima: Option<PointDist> = None;
+  let mut seen = HashSet::<Id>::new();
   seen.insert(start);
   loop {
-    let cur = state.lock().cur.id;
-    let (neighbors, full_vec) = graph.get_out_neighbors(cur);
+    let cur_id = cur.id;
+    let (neighbors, full_vec) = graph.get_out_neighbors(cur_id);
     if let Some(v) = full_vec {
-      state.lock().cur.dist = metric(&v.view(), query);
+      cur.dist = metric(&v.view(), query);
     };
-    neighbors
-      .into_par_iter()
-      .filter(|n| !seen.contains(n))
-      .map(|n| PointDist {
-        id: n,
-        dist: metric(&graph.get_point(cur).view(), &graph.get_point(n).view()),
-      })
-      .for_each(|n| {
-        // If this node is a neighbor of a future expanded node, we don't need to compare the distance to this node, as if it's not the shortest now, it won't be then either.
-        seen.insert(n.id);
-        // Call filter before lock to reduce contention.
-        let not_filtered = filter(n.id);
-        let mut s = state.lock();
-        if not_filtered && !s.optima.is_some_and(|o| o.dist <= n.dist) {
-          s.optima = Some(n);
-        }
-        if n.dist < s.cur.dist {
-          s.cur = n;
-        }
-      });
-    if state.lock().cur.id == cur {
+    // WARNING: Do not use into_par_iter as most callers are already threaded and this will cause extreme contention which slows down performance dramatically.
+    for n_id in neighbors {
+      // If this node is a neighbor of a future expanded node, we don't need to compare the distance to this node, as if it's not the shortest now, it won't be then either.
+      if !seen.insert(n_id) {
+        continue;
+      };
+      let n = PointDist {
+        id: n_id,
+        dist: metric(
+          &graph.get_point(cur_id).view(),
+          &graph.get_point(n_id).view(),
+        ),
+      };
+      // Call filter before lock to reduce contention.
+      let not_filtered = filter(n.id);
+      if not_filtered && !optima.is_some_and(|o| o.dist <= n.dist) {
+        optima = Some(n);
+      }
+      if n.dist < cur.dist {
+        cur = n;
+      }
+    }
+    if cur.id == cur_id {
       // No change, reached local optima.
       break;
     }
   }
-  state.into_inner().optima
+  optima
 }
 
 // DiskANN paper, Algorithm 1: GreedySearch.
@@ -214,7 +207,8 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
       .filter_map(|_| l_unvisited.pop_front())
       .collect::<Vec<_>>();
     let neighbors = DashSet::new();
-    new_visited.par_iter_mut().for_each(|p_star| {
+    // Don't use par_iter_mut as the work unit and overall count is too small that Rayon overhead is high.
+    new_visited.iter_mut().for_each(|p_star| {
       let (p_neighbors, full_vec) = graph.get_out_neighbors(p_star.id);
       if let Some(v) = full_vec {
         p_star.dist = match query {
@@ -233,8 +227,9 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
       .make_contiguous()
       .sort_unstable_by_key(|s| OrderedFloat(s.dist));
 
+    // WARNING: Do not use par_iter as most callers are already threaded and this will cause extreme contention which slows down performance dramatically.
     let new_unvisited = neighbors
-      .par_iter()
+      .iter()
       .filter_map(|neighbor| {
         let neighbor = *neighbor;
         // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.

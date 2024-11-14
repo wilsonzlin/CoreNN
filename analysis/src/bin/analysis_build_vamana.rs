@@ -22,10 +22,13 @@ struct Args {
   distance_threshold: f64,
 
   #[arg(long, default_value_t = 64)]
-  insert_batch_size: usize,
+  update_batch_size: usize,
 
   #[arg(long)]
   search_list_cap: usize,
+
+  #[arg(long, default_value_t = 10_000)]
+  medoid_sample_size: usize,
 
   #[arg(long)]
   load_precomputed_dists: bool,
@@ -53,7 +56,7 @@ fn main() {
     degree_bound: args.degree_bound,
     distance_threshold: args.distance_threshold,
     query_search_list_cap: 1, // Irrelevant.
-    update_batch_size: args.insert_batch_size,
+    update_batch_size: args.update_batch_size,
     update_search_list_cap: args.search_list_cap,
   };
   println!("Params: {params:?}");
@@ -80,7 +83,7 @@ fn main() {
     (0..n).map(|i| (i, vecs.row(i).to_owned())).collect(),
     metric_euclidean,
     params,
-    10_000,
+    args.medoid_sample_size,
     precomputed_dists.map(|pd| Arc::new(((0..n).map(|i| (i, i)).collect(), pd))),
     |completed, _metrics| pb.set_position(completed as u64),
   );
