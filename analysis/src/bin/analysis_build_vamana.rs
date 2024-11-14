@@ -1,6 +1,8 @@
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use clap::Parser;
+use indicatif::ProgressBar;
+use indicatif::ProgressStyle;
 use libroxanne::vamana::InMemoryVamana;
 use libroxanne::vamana::VamanaParams;
 use libroxanne_search::metric_euclidean;
@@ -26,6 +28,21 @@ struct Args {
 
   #[arg(long, default_value_t = 1.33)]
   search_list_cap_mul: f64,
+
+  #[arg(long)]
+  load_precomputed_dists: bool,
+}
+
+fn new_pb(len: usize) -> ProgressBar {
+  let pb = ProgressBar::new(len.try_into().unwrap());
+  pb.set_style(
+    ProgressStyle::with_template(
+      "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
+    )
+    .unwrap()
+    .progress_chars("#>-"),
+  );
+  pb
 }
 
 fn main() {
@@ -39,8 +56,13 @@ fn main() {
   println!("Loaded vectors");
   let n = ds.info.n;
   let k = ds.info.k;
-  let precomputed_dists = ds.read_dists();
-  println!("Loaded dists");
+  let precomputed_dists = if args.load_precomputed_dists {
+    let dists = ds.read_dists();
+    println!("Loaded dists");
+    Some(dists)
+  } else {
+    None
+  };
 
   let params = VamanaParams {
     beam_width: args.beam_width,
@@ -52,21 +74,24 @@ fn main() {
   };
   println!("Params: {params:?}");
 
+  let pb = new_pb(n);
   let index = InMemoryVamana::build_index(
     (0..n).map(|i| (i, vecs.row(i).to_owned())).collect(),
     metric_euclidean,
     params,
     10_000,
-    Some(Arc::new((
-      (0..vecs.len()).map(|i| (i, i)).collect(),
-      precomputed_dists,
+    precomputed_dists.map(|pd| Arc::new((
+      (0..n).map(|i| (i, i)).collect(),
+      pd,
     ))),
+    |completed, _metrics| pb.set_position(completed as u64),
   );
   fs::write(
     format!("dataset/{}/out/vamana/vamana.medoid.txt", ds.name),
     index.medoid().to_string(),
   )
   .unwrap();
+  pb.finish();
   println!("Built graph");
 
   analyse_index(&ds, "vamana", &index);

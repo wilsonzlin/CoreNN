@@ -147,6 +147,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
     // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
     medoid_sample_size: usize,
     precomputed_dists: Option<Arc<(HashMap<Id, usize>, Vec<f16>)>>,
+    on_progress: impl Fn(usize, Option<&OptimizeMetrics>),
   ) -> Vamana<T, Self> {
     let mut ids_random = dataset.iter().map(|e| e.0).collect_vec();
     ids_random.shuffle(&mut thread_rng());
@@ -159,7 +160,7 @@ impl<T: Scalar + Send + Sync> InMemoryVamana<T> {
       precomputed_dists,
     );
 
-    graph.optimize(ids_random, None);
+    graph.optimize(ids_random, None, on_progress);
 
     graph
   }
@@ -203,7 +204,16 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   }
 
   fn dist(&self, a: Id, b: Id) -> f64 {
-    (self.metric)(&self.ds.get_point(a).view(), &self.ds.get_point(b).view())
+    match self.precomputed_dists.as_ref() {
+      None => (self.metric)(&self.ds.get_point(a).view(), &self.ds.get_point(b).view()),
+      Some(pd) => {
+        let (id_to_no, dists) = pd.as_ref();
+        let n = id_to_no.len();
+        let ia = id_to_no[&a];
+        let ib = id_to_no[&b];
+        dists[ia * n + ib] as f64
+      }
+    }
   }
 
   pub fn medoid(&self) -> Id {
@@ -293,9 +303,15 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
   // This is used when inserting, but also during initialization, so this is a separate function from `insert`.
   // WARNING: The graph must not be mutated while this function is executing, but it is up to the caller to ensure this.
   /// WARNING: This is publicly exposed, but use this only if you know what you're doing. There are no guarantees of API stability.
-  pub fn optimize(&self, mut ids: Vec<Id>, mut metrics: Option<&mut OptimizeMetrics>) {
+  pub fn optimize(
+    &self,
+    mut ids: Vec<Id>,
+    mut metrics: Option<&mut OptimizeMetrics>,
+    on_progress: impl Fn(usize, Option<&OptimizeMetrics>),
+  ) {
     // Shuffle to reduce chance of inserting around the same area in latent space.
     ids.shuffle(&mut thread_rng());
+    let mut completed = 0;
     for batch in ids.chunks(self.params.update_batch_size) {
       #[derive(Default)]
       struct Update {
@@ -355,6 +371,8 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
         };
         self.ds.set_out_neighbors(id, new_neighbors);
       });
+      completed += batch.len();
+      on_progress(completed, metrics.as_ref().map(|m| &**m));
     }
   }
 
@@ -363,7 +381,7 @@ impl<T: Scalar + Send + Sync, DS: VamanaDatastore<T>> Vamana<T, DS> {
     points
       .into_par_iter()
       .for_each(|(id, point)| self.ds.set_point(id, point));
-    self.optimize(ids, None);
+    self.optimize(ids, None, |_, _| {});
   }
 
   pub fn query_with_filter(
