@@ -4,6 +4,7 @@ use ahash::HashMap;
 use ahash::HashSet;
 use ahash::HashSetExt;
 use dashmap::DashSet;
+use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::ArrayView1;
 use ndarray_linalg::Scalar;
@@ -14,6 +15,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BinaryHeap;
 use std::collections::VecDeque;
+use std::convert::identity;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -56,6 +58,24 @@ pub fn metric_cosine<T: Scalar>(a: &ArrayView1<T>, b: &ArrayView1<T>) -> f64 {
     1.0
   } else {
     1.0 - dot_product / denominator
+  }
+}
+
+pub fn insert_into_ordered_vecdeque<T: Clone, K: Ord>(
+  dest: &mut VecDeque<T>,
+  src: &[T],
+  key: impl Fn(&T) -> K,
+) {
+  let mut positions = Vec::new();
+  for (i, v) in src.into_iter().enumerate() {
+    let pos = dest
+      .binary_search_by(|s| key(s).cmp(&key(v)))
+      .map_or_else(identity, identity);
+    positions.push((pos, i));
+  }
+  positions.sort_unstable();
+  for (dest_i, src_i) in positions.into_iter().rev() {
+    dest.insert(dest_i, src[src_i].clone());
   }
 }
 
@@ -206,7 +226,7 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
     let mut new_visited = (0..beam_width)
       .filter_map(|_| l_unvisited.pop_front())
       .collect::<Vec<_>>();
-    let neighbors = DashSet::new();
+    let mut neighbors = HashSet::new();
     // Don't use par_iter_mut as the work unit and overall count is too small that Rayon overhead is high.
     new_visited.iter_mut().for_each(|p_star| {
       let (p_neighbors, full_vec) = graph.get_out_neighbors(p_star.id);
@@ -222,16 +242,20 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
     });
     // Move to visited section.
     all_visited.extend(new_visited.iter().map(|e| e.id));
-    l_visited.extend(new_visited.iter().filter(|e| filter(**e)));
-    l_visited
-      .make_contiguous()
-      .sort_unstable_by_key(|s| OrderedFloat(s.dist));
+    insert_into_ordered_vecdeque(
+      &mut l_visited,
+      &new_visited
+        .iter()
+        .filter(|e| filter(**e))
+        .cloned()
+        .collect_vec(),
+      |s| OrderedFloat(s.dist),
+    );
 
     // WARNING: Do not use par_iter as most callers are already threaded and this will cause extreme contention which slows down performance dramatically.
     let new_unvisited = neighbors
       .iter()
-      .filter_map(|neighbor| {
-        let neighbor = *neighbor;
+      .filter_map(|&neighbor| {
         // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
         if all_visited.contains(&neighbor) {
           return None;
@@ -247,12 +271,9 @@ pub fn greedy_search<T: Scalar + Send + Sync>(
           dist: calc_dist(neighbor),
         })
       })
-      .collect::<VecDeque<_>>();
+      .collect_vec();
     l_unvisited_set.extend(new_unvisited.iter().map(|e| e.id));
-    l_unvisited.extend(&new_unvisited);
-    l_unvisited
-      .make_contiguous()
-      .sort_unstable_by_key(|s| OrderedFloat(s.dist));
+    insert_into_ordered_vecdeque(&mut l_unvisited, &new_unvisited, |s| OrderedFloat(s.dist));
 
     let mut dropped_unvisited = 0;
     let mut dropped_visited = 0;
