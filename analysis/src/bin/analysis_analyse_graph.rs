@@ -6,7 +6,6 @@ use libroxanne::common::Metric;
 use libroxanne::common::PrecomputedDists;
 use libroxanne::pq::ProductQuantizer;
 use libroxanne::search::GreedySearchable;
-use libroxanne::vamana::Vamana;
 use ndarray::Array1;
 use ndarray::Array2;
 use roxanne_analysis::eval;

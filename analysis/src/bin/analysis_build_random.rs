@@ -31,6 +31,7 @@ fn main() {
     &(0..n).map(|id| (id, vecs.row(id).to_owned())).collect(),
     metric_euclidean,
     10_000,
+    None,
   );
 
   export_index(&ds, &out_dir, &graph, medoid);

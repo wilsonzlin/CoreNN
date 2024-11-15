@@ -24,6 +24,7 @@ pub fn calc_approx_medoid<T: Dtype>(
   id_to_point: &DashMap<Id, Array1<T>>,
   metric: Metric<T>,
   sample_size: usize,
+  precomputed_dists: Option<&PrecomputedDists>,
 ) -> Id {
   let mut rng = thread_rng();
   let sample_ids = id_to_point
@@ -38,10 +39,12 @@ pub fn calc_approx_medoid<T: Dtype>(
         sample_ids
           .par_iter()
           .map(|&j| {
-            metric(
-              &id_to_point.get(&i).unwrap().view(),
-              &id_to_point.get(&j).unwrap().view(),
-            )
+            precomputed_dists.map(|pd| pd.get(i, j)).unwrap_or_else(|| {
+              metric(
+                &id_to_point.get(&i).unwrap().view(),
+                &id_to_point.get(&j).unwrap().view(),
+              )
+            })
           })
           .sum::<f64>(),
       )
@@ -135,7 +138,12 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
     let vectors = zip(ids.clone(), vectors).collect::<DashMap<_, _>>();
 
     // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
-    let medoid = calc_approx_medoid(&vectors, metric, medoid_sample_size);
+    let medoid = calc_approx_medoid(
+      &vectors,
+      metric,
+      medoid_sample_size,
+      precomputed_dists.as_ref().map(|pd| pd.as_ref()),
+    );
 
     let index = InMemoryIndex {
       graph,

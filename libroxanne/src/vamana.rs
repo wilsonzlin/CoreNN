@@ -47,7 +47,6 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
     let dist_thresh = self.params().distance_threshold;
     let degree_bound = self.params().degree_bound;
 
-    // WARNING: Do not use into_par_iter as most callers are already threaded and this will cause extreme contention which slows down performance dramatically.
     let mut candidates = candidate_ids
       .into_iter()
       .map(|candidate_id| PointDist {
@@ -96,8 +95,6 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
       let updates = DashMap::<Id, Update>::new();
 
       batch.into_par_iter().for_each(|&id| {
-        // TODO Delete if already exists.
-
         // Initial GreedySearch.
         let mut candidates = HashSet::new();
         self.greedy_search(

@@ -207,7 +207,6 @@ pub trait GreedySearchable<'a, T: Dtype>: Sized {
       if let Some(v) = full_vec {
         cur.dist = self.dist3(&v.borrow().view(), query);
       };
-      // WARNING: Do not use into_par_iter as most callers are already threaded and this will cause extreme contention which slows down performance dramatically.
       for &n_id in neighbors.borrow() {
         // If this node is a neighbor of a future expanded node, we don't need to compare the distance to this node, as if it's not the shortest now, it won't be then either.
         if !seen.insert(n_id) {
@@ -275,7 +274,6 @@ pub trait GreedySearchable<'a, T: Dtype>: Sized {
         .filter_map(|_| l_unvisited.pop_front())
         .collect::<Vec<_>>();
       let mut neighbors = HashSet::new();
-      // Don't use par_iter_mut as the work unit and overall count is too small that Rayon overhead is high.
       new_visited.iter_mut().for_each(|p_star| {
         let (p_neighbors, full_vec) = self.get_out_neighbors(p_star.id);
         if let Some(v) = full_vec {
@@ -297,7 +295,6 @@ pub trait GreedySearchable<'a, T: Dtype>: Sized {
         |s| OrderedFloat(s.dist),
       );
 
-      // WARNING: Do not use par_iter as most callers are already threaded and this will cause extreme contention which slows down performance dramatically.
       let new_unvisited = neighbors
         .iter()
         .filter_map(|&neighbor| {
@@ -389,7 +386,6 @@ pub trait GreedySearchable<'a, T: Dtype>: Sized {
       path.push((from, to));
 
       // Move on to neighbors of `to` in the base shard.
-      // Do not use par_iter, the work unit is too tiny so Rayon overhead will be too high.
       let new = self
         .get_out_neighbors(to)
         .0

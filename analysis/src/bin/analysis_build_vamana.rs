@@ -1,10 +1,8 @@
 use clap::Parser;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
-use libroxanne::common::metric_euclidean;
 use libroxanne::common::PrecomputedDists;
 use libroxanne::in_memory::InMemoryIndex;
-use libroxanne::vamana::VamanaParams;
 use roxanne_analysis::export_index;
 use roxanne_analysis::Dataset;
 use std::fs;
@@ -61,7 +59,10 @@ fn main() {
   let precomputed_dists = if args.load_precomputed_dists {
     let dists = ds.read_dists();
     println!("Loaded dists");
-    Some(dists)
+    Some(Arc::new(PrecomputedDists::new(
+      (0..n).map(|i| (i, i)).collect(),
+      dists,
+    )))
   } else {
     None
   };
@@ -76,10 +77,7 @@ fn main() {
   .update_batch_size(args.update_batch_size)
   .update_search_list_cap(args.search_list_cap)
   .medoid_sample_size(args.medoid_sample_size)
-  .precomputed_dists(
-    precomputed_dists
-      .map(|pd| Arc::new(PrecomputedDists::new((0..n).map(|i| (i, i)).collect(), pd))),
-  )
+  .precomputed_dists(precomputed_dists)
   .on_progress(|completed, _metrics| pb.set_position(completed as u64))
   .build();
   pb.finish();
