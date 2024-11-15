@@ -5,10 +5,13 @@ use crate::common::PointDist;
 use crate::common::PrecomputedDists;
 use ahash::HashSet;
 use ahash::HashSetExt;
+use dashmap::DashSet;
 use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::ArrayView1;
 use ordered_float::OrderedFloat;
+use rayon::iter::IntoParallelRefMutIterator;
+use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
 use std::borrow::Borrow;
@@ -137,7 +140,7 @@ pub struct SearchMetrics {
 }
 
 // These generics allow for owned and borrowed variants in various forms (e.g. DashMap::Ref, slice, ArrayView, &Array); the complexity allows for avoiding copying where possible, which gets really expensive for in-memory usages, while supporting copied owned data for reading from disk.
-pub trait GreedySearchable<'a, T: Dtype>: Sized {
+pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
   type Point: Borrow<Array1<T>>;
   type Neighbors: Borrow<Vec<Id>>;
   type FullVec: Borrow<Array1<T>>;
@@ -168,7 +171,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Sized {
       })
   }
 
-  /// Calculate the distance between a point and a query
+  /// Calculate the distance between a point and a query.
   fn dist2(&'a self, a: Id, b: Query<T>) -> f64 {
     match b {
       Query::Id(b) => self.dist(a, b),
@@ -216,7 +219,6 @@ pub trait GreedySearchable<'a, T: Dtype>: Sized {
           id: n_id,
           dist: self.dist2(n_id, query),
         };
-        // Call filter before lock to reduce contention.
         let not_filtered = filter(n.id);
         if not_filtered && !optima.is_some_and(|o| o.dist <= n.dist) {
           optima = Some(n);
@@ -273,8 +275,9 @@ pub trait GreedySearchable<'a, T: Dtype>: Sized {
       let mut new_visited = (0..beam_width)
         .filter_map(|_| l_unvisited.pop_front())
         .collect::<Vec<_>>();
-      let mut neighbors = HashSet::new();
-      new_visited.iter_mut().for_each(|p_star| {
+      let neighbors = DashSet::new();
+      // Parallelize as the purpose of beam width > 1 is to read from disk in parallel.
+      new_visited.par_iter_mut().for_each(|p_star| {
         let (p_neighbors, full_vec) = self.get_out_neighbors(p_star.id);
         if let Some(v) = full_vec {
           p_star.dist = self.dist3(&v.borrow().view(), query);
@@ -297,7 +300,8 @@ pub trait GreedySearchable<'a, T: Dtype>: Sized {
 
       let new_unvisited = neighbors
         .iter()
-        .filter_map(|&neighbor| {
+        .filter_map(|neighbor| {
+          let neighbor = *neighbor;
           // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
           if all_visited.contains(&neighbor) {
             return None;
