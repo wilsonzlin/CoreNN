@@ -20,6 +20,7 @@ pub struct PointDist {
 }
 
 // A metric implementation of the Euclidean distance.
+// Casting vectors to f64 will improve precision during intermediate calculations, but might slow down computation (e.g. fp16 can fit more into single AVX512 instruction over fp32). Since it's a tossup, let the caller cast to f64 if they want more precision.
 pub fn metric_euclidean<T: Dtype>(a: &ArrayView1<T>, b: &ArrayView1<T>) -> f64 {
   let diff = a - b;
   let squared_diff = &diff * &diff;
@@ -28,6 +29,7 @@ pub fn metric_euclidean<T: Dtype>(a: &ArrayView1<T>, b: &ArrayView1<T>) -> f64 {
 }
 
 // A metric implementation of the cosine distance (NOT similarity).
+// Casting vectors to f64 will improve precision during intermediate calculations, but might slow down computation (e.g. fp16 can fit more into single AVX512 instruction over fp32). Since it's a tossup, let the caller cast to f64 if they want more precision.
 pub fn metric_cosine<T: Dtype>(a: &ArrayView1<T>, b: &ArrayView1<T>) -> f64 {
   let dot_product = a.dot(b).to_f64().unwrap();
 

@@ -47,7 +47,7 @@ for i in range(0, N, args.batch_size):
     # Disable gradient computation for efficiency
     with torch.no_grad():
         # Calculate Euclidean distance (works like cosine distance for normalized vectors too).
-        dists = torch.cdist(query_vectors_gpu, vectors_gpu)  # Shape: (batch_size, N)
+        dists = torch.cdist(query_vectors_gpu, vectors_gpu)  # Shape: (batch_n, N)
 
     out_dists.write(dists.numpy(force=True).astype(np.float16).tobytes())
     pb.update(batch_n)
