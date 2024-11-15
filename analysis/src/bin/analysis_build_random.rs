@@ -1,7 +1,8 @@
 use clap::Parser;
-use libroxanne::vamana::InMemoryVamana;
-use libroxanne::vamana::VamanaParams;
-use libroxanne_search::metric_euclidean;
+use itertools::Itertools;
+use libroxanne::common::metric_euclidean;
+use libroxanne::in_memory::calc_approx_medoid;
+use libroxanne::in_memory::random_r_regular_graph;
 use roxanne_analysis::export_index;
 use roxanne_analysis::Dataset;
 use std::fs;
@@ -15,6 +16,7 @@ struct Args {
 
 fn main() {
   let ds = Dataset::init();
+  let n = ds.info.n;
 
   let args = Args::parse();
 
@@ -23,24 +25,13 @@ fn main() {
 
   let vecs = ds.read_vectors();
 
-  let params = VamanaParams {
-    beam_width: 1, // Irrelevant.
-    degree_bound: args.degree_bound,
-    distance_threshold: 1.0,   // Irrelevant.
-    query_search_list_cap: 1,  // Irrelevant.
-    update_batch_size: 1,      // Irrelevant.
-    update_search_list_cap: 1, // Irrelevant.
-  };
+  let graph = random_r_regular_graph(&(0..ds.info.n).collect_vec(), args.degree_bound);
 
-  let index = InMemoryVamana::init_random_index(
-    (0..ds.info.n)
-      .map(|i| (i, vecs.row(i).to_owned()))
-      .collect(),
+  let medoid = calc_approx_medoid(
+    &(0..n).map(|id| (id, vecs.row(id).to_owned())).collect(),
     metric_euclidean,
-    params,
     10_000,
-    None,
   );
 
-  export_index(&ds, &out_dir, index.datastore().graph(), index.medoid());
+  export_index(&ds, &out_dir, &graph, medoid);
 }

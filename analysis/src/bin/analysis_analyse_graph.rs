@@ -1,12 +1,12 @@
 use ahash::HashMap;
 use clap::Parser;
+use libroxanne::common::metric_euclidean;
+use libroxanne::common::Id;
+use libroxanne::common::Metric;
+use libroxanne::common::PrecomputedDists;
 use libroxanne::pq::ProductQuantizer;
+use libroxanne::search::GreedySearchable;
 use libroxanne::vamana::Vamana;
-use libroxanne::vamana::VamanaDatastore;
-use libroxanne::vamana::VamanaParams;
-use libroxanne_search::metric_euclidean;
-use libroxanne_search::GreedySearchable;
-use libroxanne_search::Id;
 use ndarray::Array1;
 use ndarray::Array2;
 use roxanne_analysis::eval;
@@ -34,9 +34,26 @@ struct EvalGraph {
   vectors: Array2<f32>,
   pq: Option<ProductQuantizer<f32>>,
   vectors_pq: Option<Array2<u8>>,
+  medoid: Id,
 }
 
-impl GreedySearchable<f32> for EvalGraph {
+impl<'a> GreedySearchable<'a, f32> for EvalGraph {
+  type FullVec = Array1<f32>;
+  type Neighbors = Vec<Id>;
+  type Point = Array1<f32>;
+
+  fn medoid(&self) -> Id {
+    self.medoid
+  }
+
+  fn metric(&self) -> Metric<f32> {
+    metric_euclidean::<f32>
+  }
+
+  fn precomputed_dists(&self) -> Option<&PrecomputedDists> {
+    None
+  }
+
   fn get_point(&self, id: Id) -> Array1<f32> {
     match self.vectors_pq.as_ref() {
       Some(vecs) => self.pq.as_ref().unwrap().decode_1(&vecs.row(id)),
@@ -48,16 +65,6 @@ impl GreedySearchable<f32> for EvalGraph {
     let neighbors = self.adj_list.get(&id).unwrap().clone();
     let full_vec = self.pq.as_ref().map(|_| self.vectors.row(id).to_owned());
     (neighbors, full_vec)
-  }
-}
-
-impl VamanaDatastore<f32> for EvalGraph {
-  fn set_point(&self, _id: Id, _point: Array1<f32>) {
-    panic!("read only");
-  }
-
-  fn set_out_neighbors(&self, _id: Id, _neighbors: Vec<Id>) {
-    panic!("read only");
   }
 }
 
@@ -100,24 +107,21 @@ fn main() {
     None => (None, None),
   };
 
-  let params = VamanaParams {
-    beam_width: args.beam_width,
-    degree_bound: 1,         // Irrelevant.
-    distance_threshold: 1.0, // Irrelevant.
-    query_search_list_cap: args.search_list_cap,
-    update_batch_size: 1,      // Irrelevant.
-    update_search_list_cap: 1, // Irrelevant.
-  };
-
   let index = EvalGraph {
     adj_list: graph,
     pq,
     vectors_pq,
     vectors: vecs,
+    medoid,
   };
-  let index = Vamana::new(index, metric_euclidean, medoid, params);
 
-  let e = eval(&index, &qs.view(), &knns.view());
+  let e = eval(
+    &index,
+    &qs.view(),
+    &knns.view(),
+    args.search_list_cap,
+    args.beam_width,
+  );
   println!("Evaluated all queries");
   fs::write(
     format!(

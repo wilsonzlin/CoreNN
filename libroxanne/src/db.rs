@@ -1,9 +1,9 @@
+use crate::common::Id;
+use crate::common::StdMetric;
 use crate::pq::ProductQuantizer;
 use crate::vamana::VamanaParams;
 use bitcode::Decode;
 use bitcode::Encode;
-use libroxanne_search::Id;
-use libroxanne_search::StdMetric;
 use rocksdb::BlockBasedOptions;
 use rocksdb::Direction;
 use rocksdb::IteratorMode;

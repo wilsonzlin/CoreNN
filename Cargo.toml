@@ -10,7 +10,6 @@ members = [
   "hnswlib-rs",
   "libroxanne",
   "pqify",
-  "search",
   "visualizer",
 ]
 

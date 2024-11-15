@@ -4,16 +4,16 @@ use clap::Parser;
 use dashmap::DashMap;
 use hnswlib_rs::HnswIndex;
 use itertools::Itertools;
-use libroxanne::vamana::InMemoryVamana;
+use libroxanne::common::metric_euclidean;
+use libroxanne::common::Id;
+use libroxanne::common::PointDist;
+use libroxanne::hnsw::HnswLevelIndex;
+use libroxanne::in_memory::InMemoryIndex;
+use libroxanne::search::GreedySearchable;
+use libroxanne::search::Query;
 use libroxanne::vamana::OptimizeMetrics;
 use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaParams;
-use libroxanne_search::find_shortest_spanning_tree;
-use libroxanne_search::greedy_search_fast1;
-use libroxanne_search::metric_euclidean;
-use libroxanne_search::GreedySearchable;
-use libroxanne_search::Id;
-use libroxanne_search::PointDist;
 use ndarray::Array1;
 use ndarray::Array2;
 use rand::seq::SliceRandom;
@@ -24,6 +24,7 @@ use rayon::iter::ParallelIterator;
 use roxanne_analysis::eval;
 use roxanne_analysis::export_index;
 use roxanne_analysis::Dataset;
+use roxanne_analysis::Eval;
 use std::cmp::Reverse;
 use std::fs;
 use std::fs::File;
@@ -46,29 +47,35 @@ struct Args {
 
 struct Ctx {
   ground_truths: Array2<u32>,
-  k: usize,
   level_to_shard_to_nodes: DashMap<usize, DashMap<usize, Vec<Id>>>,
-  medoid: Id,
   node_to_level: DashMap<Id, usize>,
   queries: Array2<f32>,
   shards: Vec<HnswIndex>,
+  beam_width: usize,
+  query_search_list_cap: usize,
+}
+
+impl Ctx {
+  pub fn eval(&self, index: &InMemoryIndex<f32>) -> Eval {
+    eval(
+      index,
+      &self.queries.view(),
+      &self.ground_truths.view(),
+      self.query_search_list_cap,
+      self.beam_width,
+    )
+  }
 }
 
 // This is somewhat of an ablation test: to see if other more-sophisticated strategies are actually doing anything better.
-fn baseline_build_from_scratch(
-  args: &Args,
-  ctx: &Ctx,
-  ds: InMemoryVamana<f32>,
-  params: VamanaParams,
-) {
+fn baseline_build_from_scratch(args: &Args, ctx: &Ctx, index: InMemoryIndex<f32>) {
   let mut ids = ctx.node_to_level.iter().map(|e| *e.key()).collect_vec();
   ids.shuffle(&mut thread_rng());
-  ds.graph().par_iter_mut().for_each(|mut e| {
+  index.graph.par_iter_mut().for_each(|mut e| {
     let neighbors = e.value_mut();
     neighbors.clear();
     neighbors.extend(ids.choose_multiple(&mut thread_rng(), args.degree_bound));
   });
-  let index = Vamana::new(ds, metric_euclidean, ctx.medoid, params);
 
   let batch_size = 500;
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
@@ -84,7 +91,7 @@ fn baseline_build_from_scratch(
       .sorted_unstable_by_key(|e| e.0)
       .map(|(lvl, n)| format!("l{}={}", lvl, n.len()))
       .join(" ");
-    let e = eval(&index, &ctx.queries.view(), &ctx.ground_truths.view());
+    let e = ctx.eval(&index);
     println!("[Iteration {i}, {} nodes] Correct: {:.2}% ({}/{}) | Updated {} nodes ({} cumulatively): {touched_msg}", (i + 1) * batch_size, e.ratio() * 100.0, e.correct, e.total, metrics.updated_nodes.len(), cumulative_updated_nodes.len());
     if e.ratio() > 0.95 {
       break;
@@ -93,10 +100,9 @@ fn baseline_build_from_scratch(
 }
 
 // This is somewhat of an ablation test: to see if other more-sophisticated strategies are actually doing anything better.
-fn strategy_reinsert_randomly(ctx: &Ctx, ds: InMemoryVamana<f32>, params: VamanaParams) {
+fn strategy_reinsert_randomly(ctx: &Ctx, index: InMemoryIndex<f32>) {
   let mut ids = ctx.node_to_level.iter().map(|e| *e.key()).collect_vec();
   ids.shuffle(&mut thread_rng());
-  let index = Vamana::new(ds, metric_euclidean, ctx.medoid, params);
 
   let batch_size = 500;
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
@@ -112,7 +118,7 @@ fn strategy_reinsert_randomly(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
       .sorted_unstable_by_key(|e| e.0)
       .map(|(lvl, n)| format!("l{}={}", lvl, n.len()))
       .join(" ");
-    let e = eval(&index, &ctx.queries.view(), &ctx.ground_truths.view());
+    let e = ctx.eval(&index);
     println!("[Iteration {i}, {} nodes] Correct: {:.2}% ({}/{}) | Updated {} nodes ({} cumulatively): {touched_msg}", (i + 1) * batch_size, e.ratio() * 100.0, e.correct, e.total, metrics.updated_nodes.len(), cumulative_updated_nodes.len());
     if e.ratio() > 0.95 {
       break;
@@ -120,9 +126,7 @@ fn strategy_reinsert_randomly(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
   }
 }
 
-fn strategy_reinsert_by_level(ctx: &Ctx, ds: InMemoryVamana<f32>, params: VamanaParams) {
-  let index = Vamana::new(ds, metric_euclidean, ctx.medoid, params);
-
+fn strategy_reinsert_by_level(ctx: &Ctx, index: InMemoryIndex<f32>) {
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
   for ent in ctx
     .level_to_shard_to_nodes
@@ -147,7 +151,7 @@ fn strategy_reinsert_by_level(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
       .sorted_unstable_by_key(|e| e.0)
       .map(|(lvl, n)| format!("l{}={}", lvl, n.len()))
       .join(" ");
-    let e = eval(&index, &ctx.queries.view(), &ctx.ground_truths.view());
+    let e = ctx.eval(&index);
     println!("[Level {level} with {n} nodes] Correct: {:.2}% ({}/{}) | Updated {} nodes ({} cumulatively): {touched_msg}", e.ratio() * 100.0, e.correct, e.total, metrics.updated_nodes.len(), cumulative_updated_nodes.len());
   }
 }
@@ -159,13 +163,7 @@ fn strategy_reinsert_by_level(ctx: &Ctx, ds: InMemoryVamana<f32>, params: Vamana
 // - Find random pair/clique (not closest) across shards and merge edges.
 // - Stitch across all levels, not level-by-level.
 // - Stitch subset of neighbors.
-fn strategy_stitch_cliques(
-  ctx: &Ctx,
-  ds: InMemoryVamana<f32>,
-  params: VamanaParams,
-) -> Vamana<f32, InMemoryVamana<f32>> {
-  let index = Vamana::new(ds, metric_euclidean, ctx.medoid, params);
-
+fn strategy_stitch_cliques(ctx: &Ctx, index: InMemoryIndex<f32>) -> InMemoryIndex<f32> {
   // We want to go by level as nodes on different levels have different edge length and count distributions, which is probably ideal to preserve.
   for ent in ctx
     .level_to_shard_to_nodes
@@ -178,7 +176,7 @@ fn strategy_stitch_cliques(
       .iter()
       .map(|e| {
         let hnsw = &ctx.shards[*e.key()];
-        hnsw.build_level_index(level, e.value())
+        HnswLevelIndex::new(&hnsw, metric_euclidean, level, e.value())
       })
       .collect_vec();
 
@@ -192,16 +190,12 @@ fn strategy_stitch_cliques(
     // Map from base node ID to map from shard number to shard node ID.
     let cliques = DashMap::<Id, DashMap<usize, Id>>::new();
     // We can't just pick the entry point as the start that may not exist on our level.
-    let base_path = find_shortest_spanning_tree(
-      &graphs[0],
-      metric_euclidean,
-      *graphs[0].level_graph().keys().next().unwrap(),
-    );
+    let base_path = graphs[0].find_shortest_spanning_tree(graphs[0].ids().next().unwrap());
 
     // In the base shard, the closest to `to` is from `from`.
     // Therefore, in every other shard, we query for the equivalent to `to` starting from the equivalent to the base `from` in the shard for faster convergence.
     graphs.par_iter().enumerate().skip(1).for_each(|(i, o)| {
-      let mut available = o.level_graph().keys().cloned().collect::<HashSet<_>>();
+      let mut available = o.ids().collect::<HashSet<_>>();
       for (from, to) in base_path.iter().cloned() {
         let to_emb = graphs[0].get_point(to);
 
@@ -214,7 +208,7 @@ fn strategy_stitch_cliques(
           // NOTE: We cannot just use the HNSW entry node as it isn't available on this level (unless we're at the top level).
           .or_else(|| available.iter().cloned().next())
           .and_then(|start| {
-            greedy_search_fast1(o, &to_emb.view(), metric_euclidean, start, |n| {
+            o.greedy_search_fast1(Query::Vec(&to_emb.view()), start, |n| {
               available.contains(&n)
             })
           })
@@ -238,19 +232,13 @@ fn strategy_stitch_cliques(
       }
 
       // Update neighbors of all nodes in this clique.
-      index
-        .datastore()
-        .graph()
-        .insert(base_id, combined_neighbors.clone());
+      index.graph.insert(base_id, combined_neighbors.clone());
       for (_, o) in others {
-        index
-          .datastore()
-          .graph()
-          .insert(o, combined_neighbors.clone());
+        index.graph.insert(o, combined_neighbors.clone());
       }
     }
 
-    let e = eval(&index, &ctx.queries.view(), &ctx.ground_truths.view());
+    let e = ctx.eval(&index);
     println!(
       "[Level {level} with {total_node_count} nodes] Correct: {:.2}% ({}/{})",
       e.ratio() * 100.0,
@@ -310,53 +298,53 @@ fn main() {
   }
   let ctx = Ctx {
     ground_truths,
-    k,
     level_to_shard_to_nodes,
-    medoid: hnsws[0].entry_label(),
     node_to_level,
     queries,
     shards: hnsws,
+    beam_width: args.beam_width,
+    query_search_list_cap: (k as f64 * args.query_search_list_cap_mul) as usize,
   };
-
-  // TODO Eval score should be based on distance, as it's more important for a near neighbor to be present than a far one.
-  let src = InMemoryVamana::new(adj_list, id_to_point);
 
   // TODO Investigate (degree_bound, insert_search_list_cap, query_search_list_cap) variations.
   let params = VamanaParams {
-    beam_width: args.beam_width,
     degree_bound: args.degree_bound,
     distance_threshold: 1.1,
-    query_search_list_cap: (ctx.k as f64 * args.query_search_list_cap_mul) as usize,
     update_batch_size: num_cpus::get(),
-    update_search_list_cap: (ctx.k as f64 * args.update_search_list_cap_mul) as usize,
+    update_search_list_cap: (k as f64 * args.update_search_list_cap_mul) as usize,
+  };
+
+  // TODO Eval score should be based on distance, as it's more important for a near neighbor to be present than a far one.
+  let src = InMemoryIndex {
+    graph: adj_list,
+    medoid: entrypoints[0],
+    metric: metric_euclidean,
+    params,
+    precomputed_dists: None,
+    vectors: id_to_point,
   };
 
   println!("strategy_stitch_cliques");
   println!("============");
-  let index = strategy_stitch_cliques(&ctx, src.clone(), params.clone());
+  let index = strategy_stitch_cliques(&ctx, src.clone());
   println!();
 
-  export_index(
-    &ds,
-    "hnsw-sharded",
-    index.datastore().graph(),
-    index.medoid(),
-  );
+  export_index(&ds, "hnsw-sharded", &index.graph, index.medoid);
   println!();
 
   // Other worse strategies, provided for reference. Ctrl+C (SIGINT) at this point if not useful.
   println!("baseline_build_from_scratch");
   println!("============");
-  baseline_build_from_scratch(&args, &ctx, src.clone(), params.clone());
+  baseline_build_from_scratch(&args, &ctx, src.clone());
   println!();
 
   println!("strategy_reinsert_by_level");
   println!("============");
-  strategy_reinsert_by_level(&ctx, src.clone(), params.clone());
+  strategy_reinsert_by_level(&ctx, src.clone());
   println!();
 
   println!("strategy_reinsert_randomly");
   println!("============");
-  strategy_reinsert_randomly(&ctx, src.clone(), params.clone());
+  strategy_reinsert_randomly(&ctx, src.clone());
   println!();
 }

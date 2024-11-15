@@ -3,10 +3,10 @@ use hnswlib_rs::HnswIndex;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use itertools::Itertools;
+use libroxanne::common::StdMetric;
 use libroxanne::db::Db;
 use libroxanne::db::NodeData;
 use libroxanne::vamana::VamanaParams;
-use libroxanne_search::StdMetric;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use std::fs::File;
@@ -81,11 +81,10 @@ fn main() {
   let index = load_hnsw(args.dim, args.path);
 
   // Allow custom params for new graph that will be stored on disk, which means the params might be different from the HNSW index (so don't just copy existing).
+  // TODO beam_width, query_search_list_cap.
   let cfg = VamanaParams {
-    beam_width: args.beam_width,
     degree_bound: args.degree_bound,
     distance_threshold: args.distance_threshold,
-    query_search_list_cap: args.query_search_list_cap,
     update_batch_size: args.update_batch_size,
     update_search_list_cap: args.update_search_list_cap,
   };

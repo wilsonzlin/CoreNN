@@ -1,7 +1,7 @@
+use crate::common::Id;
+use crate::common::PointDist;
 use ahash::HashSet;
 use ahash::HashSetExt;
-use libroxanne_search::Id;
-use libroxanne_search::PointDist;
 use std::collections::VecDeque;
 
 // It's too inefficient to calculate argmin(dist(P, query)) repeatedly.

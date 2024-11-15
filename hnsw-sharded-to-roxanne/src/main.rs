@@ -7,16 +7,15 @@ use hnswlib_rs::HnswIndex;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use itertools::Itertools;
+use libroxanne::common::Id;
+use libroxanne::common::PointDist;
+use libroxanne::common::StdMetric;
 use libroxanne::db::Db;
 use libroxanne::db::NodeData;
+use libroxanne::hnsw::HnswLevelIndex;
+use libroxanne::search::GreedySearchable;
+use libroxanne::search::Query;
 use libroxanne::vamana::VamanaParams;
-use libroxanne_search::find_shortest_spanning_tree;
-use libroxanne_search::greedy_search_fast1;
-use libroxanne_search::metric_euclidean;
-use libroxanne_search::GreedySearchable;
-use libroxanne_search::Id;
-use libroxanne_search::PointDist;
-use libroxanne_search::StdMetric;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
@@ -150,9 +149,9 @@ fn main() {
 
     let (base_file, base_level_nodes) = &shards[0];
     let base = load_hnsw(args.dim, base_file);
-    let base_graph = base.build_level_index(level, base_level_nodes);
+    let base_graph = HnswLevelIndex::new(&base, metric, level, base_level_nodes);
     // We can't just pick the entry point as the start that may not exist on our level.
-    let base_path = find_shortest_spanning_tree(&base_graph, metric, base_level_nodes[0]);
+    let base_path = base_graph.find_shortest_spanning_tree(base_level_nodes[0]);
     if medoid.is_none() {
       medoid = Some(base.entry_label());
     };
@@ -169,7 +168,7 @@ fn main() {
     for batch in (&shards[1..]).chunks(args.parallel - 1) {
       batch.into_par_iter().for_each(|(path, shard_level_nodes)| {
         let other = load_hnsw(args.dim, path);
-        let other_graph = other.build_level_index(level, &shard_level_nodes);
+        let other_graph = HnswLevelIndex::new(&other, metric, level, &shard_level_nodes);
         let mut available = shard_level_nodes.iter().cloned().collect::<HashSet<_>>();
 
         for (base_id_from, base_id) in base_path.iter().cloned() {
@@ -184,13 +183,9 @@ fn main() {
             // NOTE: We cannot just use the HNSW entry node as it isn't available on this level (unless we're at the top level).
             .or_else(|| available.iter().cloned().next())
             .and_then(|start| {
-              greedy_search_fast1(
-                &other_graph,
-                &base_vec.view(),
-                metric_euclidean,
-                start,
-                |n| available.contains(&n),
-              )
+              other_graph.greedy_search_fast1(Query::Vec(&base_vec.view()), start, |n| {
+                available.contains(&n)
+              })
             });
           let Some(PointDist { id: other_node, .. }) = other_node else {
             continue;
@@ -216,11 +211,10 @@ fn main() {
   println!("Processed shards: {nodes_touched} of {total_n} nodes updated");
 
   // Allow custom params for new super graph that will likely be stored on disk, which means the params might be different from a single HNSW shard's (so don't just copy existing).
+  // TODO beam_width, query_search_list_cap.
   let cfg = VamanaParams {
-    beam_width: args.beam_width,
     degree_bound: args.degree_bound,
     distance_threshold: args.distance_threshold,
-    query_search_list_cap: args.query_search_list_cap,
     update_batch_size: args.update_batch_size,
     update_search_list_cap: args.update_search_list_cap,
   };

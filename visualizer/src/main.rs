@@ -1,20 +1,19 @@
 use ahash::HashSet;
 use itertools::Itertools;
-use libroxanne::vamana::InMemoryVamana;
-use libroxanne::vamana::VamanaParams;
-use libroxanne_search::metric_euclidean;
-use libroxanne_search::Id;
+use libroxanne::common::metric_euclidean;
+use libroxanne::common::Id;
+use libroxanne::in_memory::InMemoryIndex;
+use libroxanne::search::GreedySearchable;
 use ndarray::array;
 use ordered_float::OrderedFloat;
 use rand::thread_rng;
 use rand::Rng;
 use serde::Serialize;
 use std::fs::File;
-use std::iter::zip;
 
 fn main() {
   let mut rng = thread_rng();
-  let metric = metric_euclidean;
+  let metric = metric_euclidean::<f32>;
   // Let's plot points such that it fits comfortably spread across a widescreen display, useful for when we visualise this.
   let x_range = 0.0f32..1200.0f32;
   let y_range = 0.0f32..700.0f32;
@@ -31,23 +30,12 @@ fn main() {
       ]
     })
     .collect_vec();
-  let dataset = zip(ids.clone(), points.clone()).collect_vec();
 
-  let vamana = InMemoryVamana::build_index(
-    dataset,
-    metric,
-    VamanaParams {
-      beam_width: 1,
-      degree_bound: r,
-      distance_threshold: 1.1,
-      query_search_list_cap: search_list_cap,
-      update_batch_size: 64,
-      update_search_list_cap: search_list_cap,
-    },
-    10_000,
-    None,
-    |_, _| {},
-  );
+  let vamana = InMemoryIndex::builder(ids.clone(), points.clone())
+    .metric(metric)
+    .degree_bound(r)
+    .update_search_list_cap(search_list_cap)
+    .build();
 
   // Test k-NN of every point.
   let mut correct = 0;
@@ -61,7 +49,8 @@ fn main() {
       .take(k)
       .collect::<HashSet<_>>();
     let approx = vamana
-      .query(&a_pt.view(), k + 1) // +1 because the query point itself should be in the result.
+      .query_builder(&a_pt.view(), k + 1) // +1 because the query point itself should be in the result.
+      .query()
       .into_iter()
       .map(|pd| pd.id)
       .filter(|&b| b != a)
@@ -87,7 +76,8 @@ fn main() {
     .map(|&id| {
       let point = &points[id];
       let knn = vamana
-        .query(&point.view(), k)
+        .query_builder(&point.view(), k)
+        .query()
         .into_iter()
         .map(|pd| pd.id)
         .collect();
@@ -106,7 +96,7 @@ fn main() {
   }
 
   serde_json::to_writer_pretty(File::create("visualizer.data.json").unwrap(), &Data {
-    medoid: vamana.medoid(),
+    medoid: vamana.medoid,
     nodes,
   })
   .unwrap();

@@ -11,6 +11,5 @@ hnswlib-rs = { path = "../hnswlib-rs" }
 indicatif = "0.17.8"
 itertools = "0.13.0"
 libroxanne = { path = "../libroxanne" }
-libroxanne-search = { version = "0.2.0", path = "../search" }
 rayon = "1.10.0"
 serde = "1.0.214"

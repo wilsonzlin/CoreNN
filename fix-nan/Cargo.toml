@@ -6,4 +6,3 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.5.20", features = ["derive"] }
 libroxanne = { version = "0.2.0", path = "../libroxanne" }
-libroxanne-search = { version = "0.2.0", path = "../search" }

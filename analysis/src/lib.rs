@@ -6,11 +6,11 @@ use bytemuck::cast_slice;
 use bytemuck::Pod;
 use dashmap::DashMap;
 use itertools::Itertools;
-use libroxanne::vamana::Vamana;
-use libroxanne::vamana::VamanaDatastore;
-use libroxanne_search::metric_euclidean;
-use libroxanne_search::Id;
-use libroxanne_search::SearchMetrics;
+use libroxanne::common::metric_euclidean;
+use libroxanne::common::Id;
+use libroxanne::search::GreedySearchable;
+use libroxanne::search::Query;
+use libroxanne::search::SearchMetrics;
 use ndarray::Array2;
 use ndarray::ArrayView2;
 use rayon::iter::IntoParallelIterator;
@@ -125,10 +125,12 @@ impl Eval {
   }
 }
 
-pub fn eval<DS: VamanaDatastore<f32>>(
-  index: &Vamana<f32, DS>,
+pub fn eval<'a, 'g: 'a, G: GreedySearchable<'a, f32> + Send + Sync>(
+  index: &'g G,
   queries: &ArrayView2<f32>,
   ground_truth: &ArrayView2<u32>,
+  search_list_cap: usize,
+  beam_width: usize,
 ) -> Eval {
   let q = queries.shape()[0];
   let k = ground_truth.shape()[1];
@@ -137,7 +139,18 @@ pub fn eval<DS: VamanaDatastore<f32>>(
     .into_par_iter()
     .map(|i| {
       let knn_expected = HashSet::from_iter(ground_truth.row(i).mapv(|v| v as Id));
-      let (res, metrics) = index.query_with_metrics(&queries.row(i), k, Some(&knn_expected));
+      let mut metrics = SearchMetrics::default();
+      let res = index.greedy_search(
+        Query::Vec(&queries.row(i)),
+        k,
+        search_list_cap,
+        beam_width,
+        index.medoid(),
+        |_| true,
+        None,
+        Some(&mut metrics),
+        Some(&knn_expected),
+      );
       let knn_got = res.into_iter().map(|pd| pd.id).collect::<HashSet<_>>();
       correct.fetch_add(
         knn_expected.intersection(&knn_got).count(),
