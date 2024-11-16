@@ -81,7 +81,12 @@ fn baseline_build_from_scratch(args: &Args, ctx: &Ctx, index: InMemoryIndex<f32>
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
   for (i, batch) in ids.chunks(batch_size).enumerate() {
     let mut metrics = OptimizeMetrics::default();
-    index.optimize(batch.to_vec(), Some(&mut metrics), |_, _| {});
+    index.optimize(
+      batch.to_vec(),
+      index.params.distance_threshold,
+      Some(&mut metrics),
+      |_, _| {},
+    );
     cumulative_updated_nodes.extend(metrics.updated_nodes.iter().copied());
     let touched_msg = metrics
       .updated_nodes
@@ -108,7 +113,12 @@ fn strategy_reinsert_randomly(ctx: &Ctx, index: InMemoryIndex<f32>) {
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
   for (i, batch) in ids.chunks(batch_size).enumerate() {
     let mut metrics = OptimizeMetrics::default();
-    index.optimize(batch.to_vec(), Some(&mut metrics), |_, _| {});
+    index.optimize(
+      batch.to_vec(),
+      index.params.distance_threshold,
+      Some(&mut metrics),
+      |_, _| {},
+    );
     cumulative_updated_nodes.extend(metrics.updated_nodes.iter().copied());
     let touched_msg = metrics
       .updated_nodes
@@ -141,7 +151,12 @@ fn strategy_reinsert_by_level(ctx: &Ctx, index: InMemoryIndex<f32>) {
     let nodes = ent.iter().flat_map(|e| e.to_vec()).collect_vec();
     let n = nodes.len();
     let mut metrics = OptimizeMetrics::default();
-    index.optimize(nodes, Some(&mut metrics), |_, _| {});
+    index.optimize(
+      nodes,
+      index.params.distance_threshold,
+      Some(&mut metrics),
+      |_, _| {},
+    );
     cumulative_updated_nodes.extend(metrics.updated_nodes.iter().copied());
     let touched_msg = metrics
       .updated_nodes

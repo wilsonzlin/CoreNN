@@ -11,6 +11,24 @@ use serde::Serialize;
 use std::path::Path;
 use std::str::from_utf8;
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+#[repr(u8)]
+pub enum DbKey {
+  Cfg,
+  Deleted, // (Id)
+  Dim,
+  Id,  // (Vec<u8>)
+  Key, // (Id)
+  Medoid,
+  Metric,
+  NextId,
+  Node,      // (Id)
+  NodeCount, // Does not include deleted.
+  PqModel,
+  PqVec, // (Id)
+  TempIndexOffsets,
+}
+
 // We store both in one DB entry to leverage one disk page read to get both, as specified in the DiskANN paper. (If we store them as separate DB entries, they are unlikely to be stored in the same disk page.) We don't have to store the embedding.
 // Why we chose Bitcode:
 // - It's really fast: https://github.com/djkoloski/rust_serialization_benchmark.
