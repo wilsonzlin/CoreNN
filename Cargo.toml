@@ -10,7 +10,6 @@ members = [
   "hnswlib-rs",
   "libroxanne",
   "pqify",
-  "visualizer",
 ]
 
 [profile.release]
