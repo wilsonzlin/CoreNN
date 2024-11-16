@@ -141,9 +141,65 @@ def plot_distributions(
     plt.close()
 
 
+def plot_distributions_as_lines(
+    datasets,
+    output_path,
+    labels=None,
+    colors=None,
+    bins=200,
+    title="Distribution Comparison",
+    xlabel="Value",
+    ylabel="Density",
+):
+    plt.figure(figsize=(10, 6))
+
+    # Default labels if none provided
+    if labels is None:
+        labels = [f"Dataset {i+1}" for i in range(len(datasets))]
+
+    # Default colors if none provided
+    if colors is None:
+        colors = plt.cm.viridis(np.linspace(0, 1, len(datasets)))
+
+    # Find global min and max for consistent x-range
+    all_data = np.concatenate(datasets)
+    global_min = np.min(all_data)
+    global_max = np.max(all_data)
+
+    # Create consistent bin edges for all datasets
+    bin_edges = np.linspace(global_min, global_max, bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    # Plot each distribution
+    for data, label, color in zip(datasets, labels, colors):
+        # Calculate histogram
+        hist, _ = np.histogram(data, bins=bin_edges)
+
+        # Plot the histogram as a smooth line
+        plt.plot(
+            bin_centers,
+            hist,
+            label=label,
+            color=color,
+            linewidth=2,
+        )
+
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Save the plot
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
 def plot_time_series(
     arrays,
     output_path,
+    average=True,
+    labels=None,
     title="Time Series Plot",
     dpi=300,
     xlabel="Time",
@@ -161,21 +217,26 @@ def plot_time_series(
 
     # Plot individual series with reduced opacity
     for i, arr in enumerate(arrays):
-        plt.plot(time_points[: len(arr)], arr, alpha=0.3)
-
-    # Calculate and plot the average
-    # First, pad shorter arrays with NaN to handle different lengths
-    padded_arrays = [
-        np.pad(
-            arr.astype(np.float64), (0, max_length - len(arr)), constant_values=np.nan
+        plt.plot(
+            time_points[: len(arr)], arr, alpha=0.3, label=labels[i] if labels else None
         )
-        for arr in arrays
-    ]
-    stacked_arrays = np.stack(padded_arrays)
-    average = np.nanmean(stacked_arrays, axis=0)
 
-    # Plot average line
-    plt.plot(time_points, average, "r-", linewidth=2, label="Average")
+    if average:
+        # Calculate and plot the average
+        # First, pad shorter arrays with NaN to handle different lengths
+        padded_arrays = [
+            np.pad(
+                arr.astype(np.float64),
+                (0, max_length - len(arr)),
+                constant_values=np.nan,
+            )
+            for arr in arrays
+        ]
+        stacked_arrays = np.stack(padded_arrays)
+        average = np.nanmean(stacked_arrays, axis=0)
+
+        # Plot average line
+        plt.plot(time_points, average, "r-", linewidth=2, label="Average")
 
     # Add labels and title
     plt.xlabel(xlabel)

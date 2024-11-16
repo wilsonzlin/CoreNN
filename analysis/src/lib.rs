@@ -180,7 +180,6 @@ pub fn export_index(ds: &Dataset, out_dir: &str, graph: &DashMap<Id, Vec<Id>>, m
     medoid.to_string(),
   )
   .unwrap();
-  println!("Exported graph");
 
   let ann_dists = graph
     .par_iter()
@@ -197,20 +196,17 @@ pub fn export_index(ds: &Dataset, out_dir: &str, graph: &DashMap<Id, Vec<Id>>, m
       (i, dists)
     })
     .collect::<HashMap<_, _>>();
-  println!("Calculated edge dists");
   fs::write(
     format!("dataset/{}/out/{out_dir}/edge_dists.msgpack", ds.name),
     rmp_serde::to_vec_named(&ann_dists).unwrap(),
   )
   .unwrap();
-  println!("Exported edge dists");
 
   let medoid_vec = vecs.row(medoid);
   let medoid_dists = (0..vecs.shape()[0])
     .into_par_iter()
     .map(|i| metric_euclidean(&medoid_vec, &vecs.row(i)))
     .collect::<Vec<_>>();
-  println!("Calculated medoid dists");
   File::create(format!(
     "dataset/{}/out/{out_dir}/medoid_dists.mat",
     ds.name
@@ -223,5 +219,4 @@ pub fn export_index(ds: &Dataset, out_dir: &str, graph: &DashMap<Id, Vec<Id>>, m
       .collect_vec(),
   )
   .unwrap();
-  println!("Exported medoid dists");
 }

@@ -122,6 +122,8 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
     self
   }
 
+  // The paper mentions running two passes, one with a=1.0. If you find that it gives more accuracy, you can do so by building initially with a=1.0, then updating a=$target and running optimize() again.
+  // We won't do this here by default as it's costly.
   pub fn build(self) -> InMemoryIndex<T> {
     let InMemoryIndexBuilder {
       ids,
@@ -133,9 +135,7 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
       vectors,
     } = self;
 
-    let n = ids.len();
     let graph = random_r_regular_graph(&ids, params.degree_bound);
-    let dist_thresh = params.distance_threshold;
     let vectors = zip(ids.clone(), vectors).collect::<DashMap<_, _>>();
 
     // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
@@ -155,22 +155,9 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
       precomputed_dists,
     };
 
-    // Given alpha > 1 (esp. alpha > 1.1), without two passes:
-    // - It takes a much longer time to build the graph.
-    // - The resulting graph is not as optimized (less accuracy).
-    // (This is mentioned in the paper, and reproducable here.)
-
-    // First pass with alpha=1.
-    index.optimize(ids.clone(), 1.0, None, |completed, _metrics| {
+    index.optimize(ids.clone(), None, |completed, _metrics| {
       if let Some(op) = on_progress.as_ref() {
         op(completed);
-      }
-    });
-
-    // Second pass.
-    index.optimize(ids, dist_thresh, None, |completed, _metrics| {
-      if let Some(op) = on_progress.as_ref() {
-        op(n + completed);
       }
     });
 

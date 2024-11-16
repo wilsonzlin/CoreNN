@@ -43,9 +43,9 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
     &'a self,
     node_id: Id,
     candidate_ids: impl IntoIterator<Item = Id>,
-    dist_thresh: f64,
   ) -> Vec<Id> {
     let degree_bound = self.params().degree_bound;
+    let dist_thresh = self.params().distance_threshold;
 
     let mut candidates = candidate_ids
       .into_iter()
@@ -79,7 +79,6 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
   fn optimize(
     &'a self,
     mut ids: Vec<Id>,
-    dist_thresh: f64,
     mut metrics: Option<&mut OptimizeMetrics>,
     on_progress: impl Fn(usize, Option<&OptimizeMetrics>),
   ) {
@@ -120,7 +119,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
         // It's tempting to do this at the end once only, in case other points in this batch will add an edge to us (which means another round of RobustPrune),
         // but that means `new_neighbors` will be a lot bigger (it'll just be the unpruned raw candidate set),
         // which means dirtying a lot more other nodes (and also adding a lot of poor edges), ultimately spending more compute.
-        let new_neighbors = self.compute_robust_pruned(id, candidates, dist_thresh);
+        let new_neighbors = self.compute_robust_pruned(id, candidates);
         for &j in new_neighbors.iter() {
           updates.entry(j).or_default().additional_edges.insert(id);
         }
@@ -141,7 +140,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
           };
         }
         if new_neighbors.len() > self.params().degree_bound {
-          new_neighbors = self.compute_robust_pruned(id, new_neighbors, dist_thresh);
+          new_neighbors = self.compute_robust_pruned(id, new_neighbors);
         };
         self.set_out_neighbors(id, new_neighbors);
       });

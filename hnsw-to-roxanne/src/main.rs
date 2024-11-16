@@ -95,23 +95,37 @@ fn main() {
   txn.write_next_id(index.cur_element_count);
   txn.write_node_count(index.cur_element_count);
   txn.write_temp_index_offsets(&[]);
+  txn.commit(&db);
 
   let pb = new_pb(index.cur_element_count);
-  let label_to_id = index.labels().enumerate().map(|(id, l)| (l, id)).collect::<HashMap<_, _>>();
+  let label_to_id = index
+    .labels()
+    .enumerate()
+    .map(|(id, l)| (l, id))
+    .collect::<HashMap<_, _>>();
   // Collect to Vec so we can use into_par_iter, which is much faster than par_bridge.
-  index.labels().collect_vec().into_par_iter().for_each(|label| {
-    let node_data = NodeData {
-      neighbors: index.get_merged_neighbors(label, 0).into_iter().map(|label| label_to_id[&label]).collect_vec(),
-      vector: index.get_data_by_label(label),
-    };
-    let id = label_to_id[&label];
-    let key = format!("{}", id);
-    txn.write_id(&key, id);
-    txn.write_key(id, &key);
-    txn.write_node(id, &node_data);
-    pb.inc(1);
-  });
-  txn.commit(&db);
+  index
+    .labels()
+    .collect_vec()
+    .into_par_iter()
+    .for_each(|label| {
+      let node_data = NodeData {
+        neighbors: index
+          .get_merged_neighbors(label, 0)
+          .into_iter()
+          .map(|label| label_to_id[&label])
+          .collect_vec(),
+        vector: index.get_data_by_label(label),
+      };
+      let id = label_to_id[&label];
+      let key = format!("{}", id);
+      let mut txn = DbTransaction::new();
+      txn.write_id(&key, id);
+      txn.write_key(id, &key);
+      txn.write_node(id, &node_data);
+      txn.commit(&db);
+      pb.inc(1);
+    });
   pb.finish();
   println!("Finalizing database");
 
