@@ -7,7 +7,7 @@ use itertools::Itertools;
 use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
 use libroxanne::common::PointDist;
-use libroxanne::hnsw::HnswLevelIndex;
+use libroxanne::hnsw::HnswGraph;
 use libroxanne::in_memory::InMemoryIndex;
 use libroxanne::search::GreedySearchable;
 use libroxanne::search::Query;
@@ -174,6 +174,89 @@ fn strategy_reinsert_by_level(ctx: &Ctx, index: InMemoryIndex<f32>) {
   }
 }
 
+// Helper function used by strategy_stitch_cliques*.
+fn find_cliques_and_stitch_graphs(index: &InMemoryIndex<f32>, graphs: &[HnswGraph]) {
+  // Idea for faster finding of closest neighbor in another shard:
+  // - Find closest node A' in shard 2 to base shard's start node A.
+  // - Assumption: A ~= A', so neighbors(A) ~= neighbors(A').
+  // - Traverse using Dijkstra, so we visit a node (B) only when we reach them by (hopefully) their closest neighbor (A) as other longer ways would not get queue-popped as soon.
+  // - Let one neighbor of A be B. Query B from A' to find B'.
+  // TODO Ablation study: just pick random node to start from for every query in another shard, instead of specifically the closest.
+
+  // Map from base node ID to map from shard number to shard node ID.
+  let cliques = DashMap::<Id, DashMap<usize, Id>>::new();
+  // We can't just pick the entry point as the start that may not exist on our level.
+  let base_path = graphs[0].find_shortest_spanning_tree(graphs[0].ids().next().unwrap());
+
+  // In the base shard, the closest to `to` is from `from`.
+  // Therefore, in every other shard, we query for the equivalent to `to` starting from the equivalent to the base `from` in the shard for faster convergence.
+  graphs.par_iter().enumerate().skip(1).for_each(|(i, o)| {
+    let mut available = o.ids().collect::<HashSet<_>>();
+    for (from, to) in base_path.iter().cloned() {
+      let to_emb = graphs[0].get_point(to);
+
+      // If None: we're at the start.
+      cliques
+        .get(&from)
+        // If None: no eqivalent to `from` in this shard was found previously.
+        .and_then(|c| c.get(&i).map(|e| *e))
+        // We'll just use any point still available as the start. If there's not even a point available, we'll have to skip this shard.
+        // NOTE: We cannot just use the HNSW entry node as it isn't available on this level (unless we're at the top level).
+        .or_else(|| available.iter().cloned().next())
+        .and_then(|start| {
+          o.greedy_search_fast1(Query::Vec(&to_emb.view()), start, |n| {
+            available.contains(&n)
+          })
+        })
+        .inspect(|&PointDist { id: other_node, .. }| {
+          cliques.entry(to).or_default().insert(i, other_node);
+          assert!(available.remove(&other_node));
+        });
+    }
+  });
+
+  for (base_id, others) in cliques {
+    // Get all neighbors, not just same-level ones.
+    // No need for HashSet, as nodes can't exist across multiple shards.
+    let mut combined_neighbors = graphs[0]
+      .base()
+      .get_merged_neighbors(base_id, 0)
+      .into_iter()
+      .collect_vec();
+    for (i, o) in others.clone() {
+      combined_neighbors.extend(graphs[i].base().get_merged_neighbors(o, 0));
+    }
+
+    // Update neighbors of all nodes in this clique.
+    index.graph.insert(base_id, combined_neighbors.clone());
+    for (_, o) in others {
+      index.graph.insert(o, combined_neighbors.clone());
+    }
+  }
+}
+
+// Ablation study for strategy_stitch_cliques_by_level, by not inserting by level. Preliminary results show that going level-by-level has no effect.
+// See strategy_stitch_cliques_by_level for more details.
+fn strategy_stitch_cliques(ctx: &Ctx, index: InMemoryIndex<f32>) -> InMemoryIndex<f32> {
+  let graphs = ctx
+    .shards
+    .iter()
+    .map(|hnsw| HnswGraph::new(hnsw, metric_euclidean, None))
+    .collect_vec();
+
+  find_cliques_and_stitch_graphs(&index, &graphs);
+
+  let e = ctx.eval(&index);
+  println!(
+    "Correct: {:.2}% ({}/{})",
+    e.ratio() * 100.0,
+    e.correct,
+    e.total
+  );
+
+  index
+}
+
 // This is just a fast approximation to something like k-means; it's not always accurate because it's unlikely that there are exactly N/S k-clusters of exactly S size, but hopefully it still works reasonably well.
 // TODO Ablation studies:
 // - Insert edges randomly across any levels.
@@ -181,7 +264,7 @@ fn strategy_reinsert_by_level(ctx: &Ctx, index: InMemoryIndex<f32>) {
 // - Find random pair/clique (not closest) across shards and merge edges.
 // - Stitch across all levels, not level-by-level.
 // - Stitch subset of neighbors.
-fn strategy_stitch_cliques(ctx: &Ctx, index: InMemoryIndex<f32>) -> InMemoryIndex<f32> {
+fn strategy_stitch_cliques_by_level(ctx: &Ctx, index: InMemoryIndex<f32>) -> InMemoryIndex<f32> {
   // We want to go by level as nodes on different levels have different edge length and count distributions, which is probably ideal to preserve.
   for ent in ctx
     .level_to_shard_to_nodes
@@ -194,67 +277,11 @@ fn strategy_stitch_cliques(ctx: &Ctx, index: InMemoryIndex<f32>) -> InMemoryInde
       .iter()
       .map(|e| {
         let hnsw = &ctx.shards[*e.key()];
-        HnswLevelIndex::new(&hnsw, metric_euclidean, level, e.value())
+        HnswGraph::new(&hnsw, metric_euclidean, Some(level))
       })
       .collect_vec();
 
-    // Idea for faster finding of closest neighbor in another shard:
-    // - Find closest node A' in shard 2 to base shard's start node A.
-    // - Assumption: A ~= A', so neighbors(A) ~= neighbors(A').
-    // - Traverse using Dijkstra, so we visit a node (B) only when we reach them by (hopefully) their closest neighbor (A) as other longer ways would not get queue-popped as soon.
-    // - Let one neighbor of A be B. Query B from A' to find B'.
-    // TODO Ablation study: just pick random node to start from for every query in another shard, instead of specifically the closest.
-
-    // Map from base node ID to map from shard number to shard node ID.
-    let cliques = DashMap::<Id, DashMap<usize, Id>>::new();
-    // We can't just pick the entry point as the start that may not exist on our level.
-    let base_path = graphs[0].find_shortest_spanning_tree(graphs[0].ids().next().unwrap());
-
-    // In the base shard, the closest to `to` is from `from`.
-    // Therefore, in every other shard, we query for the equivalent to `to` starting from the equivalent to the base `from` in the shard for faster convergence.
-    graphs.par_iter().enumerate().skip(1).for_each(|(i, o)| {
-      let mut available = o.ids().collect::<HashSet<_>>();
-      for (from, to) in base_path.iter().cloned() {
-        let to_emb = graphs[0].get_point(to);
-
-        // If None: we're at the start.
-        cliques
-          .get(&from)
-          // If None: no eqivalent to `from` in this shard was found previously.
-          .and_then(|c| c.get(&i).map(|e| *e))
-          // We'll just use any point still available as the start. If there's not even a point available, we'll have to skip this shard.
-          // NOTE: We cannot just use the HNSW entry node as it isn't available on this level (unless we're at the top level).
-          .or_else(|| available.iter().cloned().next())
-          .and_then(|start| {
-            o.greedy_search_fast1(Query::Vec(&to_emb.view()), start, |n| {
-              available.contains(&n)
-            })
-          })
-          .inspect(|&PointDist { id: other_node, .. }| {
-            cliques.entry(to).or_default().insert(i, other_node);
-            assert!(available.remove(&other_node));
-          });
-      }
-    });
-
-    for (base_id, others) in cliques {
-      // Get all neighbors, not just same-level ones.
-      // No need for HashSet, as nodes can't exist across multiple shards.
-      let mut combined_neighbors = graphs[0]
-        .base()
-        .get_merged_neighbors(base_id, 0)
-        .into_iter()
-        .collect_vec();
-      for (i, o) in others.clone() {
-        combined_neighbors.extend(graphs[i].base().get_merged_neighbors(o, 0));
-      }
-
-      // Update neighbors of all nodes in this clique.
-      index.graph.insert(base_id, combined_neighbors.clone());
-      for (_, o) in others {
-        index.graph.insert(o, combined_neighbors.clone());
-      }
-    }
+    find_cliques_and_stitch_graphs(&index, &graphs);
 
     let e = ctx.eval(&index);
     println!(
@@ -348,6 +375,11 @@ fn main() {
   println!();
 
   export_index(&ds, &out_dir, &index.graph, index.medoid);
+  println!();
+
+  println!("strategy_stitch_cliques_by_level");
+  println!("============");
+  strategy_stitch_cliques_by_level(&ctx, src.clone());
   println!();
 
   // Other worse strategies, provided for reference. Ctrl+C (SIGINT) at this point if not useful.
