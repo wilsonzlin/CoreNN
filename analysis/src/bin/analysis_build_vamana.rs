@@ -67,7 +67,7 @@ fn main() {
     None
   };
 
-  let pb = new_pb(n);
+  let pb = new_pb(n * 2); // There are two passes.
   let index = InMemoryIndex::builder(
     (0..n).collect(),
     (0..n).map(|i| vecs.row(i).to_owned()).collect(),
@@ -78,7 +78,7 @@ fn main() {
   .update_search_list_cap(args.search_list_cap)
   .medoid_sample_size(args.medoid_sample_size)
   .precomputed_dists(precomputed_dists)
-  .on_progress(|completed, _metrics| pb.set_position(completed as u64))
+  .on_progress(|completed| pb.set_position(completed as u64))
   .build();
   pb.finish();
   println!("Built graph");

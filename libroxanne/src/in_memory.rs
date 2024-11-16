@@ -4,7 +4,6 @@ use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PrecomputedDists;
 use crate::search::GreedySearchable;
-use crate::vamana::OptimizeMetrics;
 use crate::vamana::Vamana;
 use crate::vamana::VamanaParams;
 use dashmap::mapref::one::Ref;
@@ -75,7 +74,7 @@ pub struct InMemoryIndexBuilder<'a, T: Dtype> {
   // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
   medoid_sample_size: usize,
   precomputed_dists: Option<Arc<PrecomputedDists>>,
-  on_progress: Option<Box<dyn Fn(usize, Option<&OptimizeMetrics>) + 'a>>,
+  on_progress: Option<Box<dyn Fn(usize) + 'a>>,
   params: VamanaParams,
 }
 
@@ -100,7 +99,7 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
     self
   }
 
-  pub fn on_progress(mut self, on_progress: impl Fn(usize, Option<&OptimizeMetrics>) + 'a) -> Self {
+  pub fn on_progress(mut self, on_progress: impl Fn(usize) + 'a) -> Self {
     self.on_progress = Some(Box::new(on_progress));
     self
   }
@@ -134,7 +133,9 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
       vectors,
     } = self;
 
+    let n = ids.len();
     let graph = random_r_regular_graph(&ids, params.degree_bound);
+    let dist_thresh = params.distance_threshold;
     let vectors = zip(ids.clone(), vectors).collect::<DashMap<_, _>>();
 
     // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
@@ -154,9 +155,22 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
       precomputed_dists,
     };
 
-    index.optimize(ids, None, |completed, metrics| {
+    // Given alpha > 1 (esp. alpha > 1.1), without two passes:
+    // - It takes a much longer time to build the graph.
+    // - The resulting graph is not as optimized (less accuracy).
+    // (This is mentioned in the paper, and reproducable here.)
+
+    // First pass with alpha=1.
+    index.optimize(ids.clone(), 1.0, None, |completed, _metrics| {
       if let Some(op) = on_progress.as_ref() {
-        op(completed, metrics);
+        op(completed);
+      }
+    });
+
+    // Second pass.
+    index.optimize(ids, dist_thresh, None, |completed, _metrics| {
+      if let Some(op) = on_progress.as_ref() {
+        op(n + completed);
       }
     });
 
