@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hnswlib-rs = { path = "../hnswlib-rs" }
+ahash = "0.8.11"
 clap = { version = "4.5.20", features = ["derive"] }
 dashmap = { version = "6.1.0", features = ["rayon"] }
-libroxanne = { path = "../libroxanne" }
+hnswlib-rs = { path = "../hnswlib-rs" }
 indicatif = "0.17.8"
 itertools = "0.13.0"
+libroxanne = { path = "../libroxanne" }
 rayon = "1.10.0"
 serde = "1.0.214"

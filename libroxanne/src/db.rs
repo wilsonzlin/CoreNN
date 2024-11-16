@@ -15,8 +15,10 @@ use std::path::Path;
 #[derive(PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum DbKeyT {
+  CfgBeamWidth,
   CfgDegreeBound,
   CfgDistanceThreshold,
+  CfgQuerySearchListCap,
   CfgUpdateBatchSize,
   CfgUpdateSearchListCap,
   Deleted, // (Id)
@@ -86,12 +88,20 @@ impl DbTransaction {
     self.write_raw(k, to_vec_named(v).unwrap());
   }
 
+  pub fn write_cfg_beam_width(&mut self, width: usize) {
+    self.write(DbKeyT::CfgBeamWidth, &width);
+  }
+
   pub fn write_cfg_degree_bound(&mut self, dim: usize) {
     self.write(DbKeyT::CfgDegreeBound, &dim);
   }
 
   pub fn write_cfg_distance_threshold(&mut self, dist: f64) {
     self.write(DbKeyT::CfgDistanceThreshold, &dist);
+  }
+
+  pub fn write_cfg_query_search_list_cap(&mut self, cap: usize) {
+    self.write(DbKeyT::CfgQuerySearchListCap, &cap);
   }
 
   pub fn write_cfg_update_batch_size(&mut self, size: usize) {
@@ -144,6 +154,10 @@ impl DbTransaction {
 
   pub fn write_pq_vec(&mut self, id: Id, vec: Vec<u8>) {
     self.write_raw((DbKeyT::PqVec, id), vec);
+  }
+
+  pub fn write_temp_index_offsets(&mut self, offsets: &[usize]) {
+    self.write(DbKeyT::TempIndexOffsets, &offsets);
   }
 
   pub fn commit(self, db: &Db) {
@@ -247,6 +261,11 @@ impl Db {
     self.maybe_read_raw(k).unwrap()
   }
 
+  pub fn read_cfg_beam_width(&self) -> usize {
+    let raw = self.read_raw(DbKeyT::CfgBeamWidth);
+    rmp_serde::from_slice(&raw).unwrap()
+  }
+
   pub fn read_cfg_degree_bound(&self) -> usize {
     let raw = self.read_raw(DbKeyT::CfgDegreeBound);
     rmp_serde::from_slice(&raw).unwrap()
@@ -254,6 +273,11 @@ impl Db {
 
   pub fn read_cfg_distance_threshold(&self) -> f64 {
     let raw = self.read_raw(DbKeyT::CfgDistanceThreshold);
+    rmp_serde::from_slice(&raw).unwrap()
+  }
+
+  pub fn read_cfg_query_search_list_cap(&self) -> usize {
+    let raw = self.read_raw(DbKeyT::CfgQuerySearchListCap);
     rmp_serde::from_slice(&raw).unwrap()
   }
 
@@ -319,5 +343,10 @@ impl Db {
   pub fn read_pq_vec(&self, id: Id) -> Vec<u8> {
     let raw = self.read_raw((DbKeyT::PqVec, id));
     raw.to_vec()
+  }
+
+  pub fn read_temp_index_offsets(&self) -> Vec<usize> {
+    let raw = self.read_raw(DbKeyT::TempIndexOffsets);
+    rmp_serde::from_slice(&raw).unwrap()
   }
 }

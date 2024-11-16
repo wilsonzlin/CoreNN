@@ -1,3 +1,4 @@
+use ahash::HashMap;
 use clap::Parser;
 use hnswlib_rs::HnswIndex;
 use indicatif::ProgressBar;
@@ -5,8 +6,8 @@ use indicatif::ProgressStyle;
 use itertools::Itertools;
 use libroxanne::common::StdMetric;
 use libroxanne::db::Db;
+use libroxanne::db::DbTransaction;
 use libroxanne::db::NodeData;
-use libroxanne::vamana::VamanaParams;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use std::fs::File;
@@ -81,29 +82,36 @@ fn main() {
   let index = load_hnsw(args.dim, args.path);
 
   // Allow custom params for new graph that will be stored on disk, which means the params might be different from the HNSW index (so don't just copy existing).
-  // TODO beam_width, query_search_list_cap.
-  let cfg = VamanaParams {
-    degree_bound: args.degree_bound,
-    distance_threshold: args.distance_threshold,
-    update_batch_size: args.update_batch_size,
-    update_search_list_cap: args.update_search_list_cap,
-  };
-
-  db.write_cfg(&cfg);
-  db.write_dim(args.dim);
-  db.write_medoid(index.entry_label());
-  db.write_metric(args.metric);
+  let mut txn = DbTransaction::new();
+  txn.write_cfg_beam_width(args.beam_width);
+  txn.write_cfg_degree_bound(args.degree_bound);
+  txn.write_cfg_distance_threshold(args.distance_threshold);
+  txn.write_cfg_query_search_list_cap(args.query_search_list_cap);
+  txn.write_cfg_update_batch_size(args.update_batch_size);
+  txn.write_cfg_update_search_list_cap(args.update_search_list_cap);
+  txn.write_dim(args.dim);
+  txn.write_medoid(index.entry_label());
+  txn.write_metric(args.metric);
+  txn.write_next_id(index.cur_element_count);
+  txn.write_node_count(index.cur_element_count);
+  txn.write_temp_index_offsets(&[]);
 
   let pb = new_pb(index.cur_element_count);
+  let label_to_id = index.labels().enumerate().map(|(id, l)| (l, id)).collect::<HashMap<_, _>>();
   // Collect to Vec so we can use into_par_iter, which is much faster than par_bridge.
-  index.labels().collect_vec().into_par_iter().for_each(|id| {
+  index.labels().collect_vec().into_par_iter().for_each(|label| {
     let node_data = NodeData {
-      neighbors: index.get_merged_neighbors(id, 0).into_iter().collect_vec(),
-      vector: index.get_data_by_label(id),
+      neighbors: index.get_merged_neighbors(label, 0).into_iter().map(|label| label_to_id[&label]).collect_vec(),
+      vector: index.get_data_by_label(label),
     };
-    db.write_node(id, &node_data);
+    let id = label_to_id[&label];
+    let key = format!("{}", id);
+    txn.write_id(&key, id);
+    txn.write_key(id, &key);
+    txn.write_node(id, &node_data);
     pb.inc(1);
   });
+  txn.commit(&db);
   pb.finish();
   println!("Finalizing database");
 
