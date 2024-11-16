@@ -5,6 +5,7 @@ numpy
 scikit-learn
 scipy
 seaborn
+toml
 torch
 tqdm
 umap-learn

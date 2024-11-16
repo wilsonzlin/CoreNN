@@ -32,6 +32,9 @@ use std::fs::File;
 #[derive(Parser, Debug)]
 #[command(author, version)]
 struct Args {
+  #[arg()]
+  variant: String,
+
   #[arg(long, default_value_t = 1)]
   beam_width: usize,
 
@@ -269,7 +272,7 @@ fn main() {
   let ds = Dataset::init();
 
   let args = Args::parse();
-  let out_dir = "hnsw-sharded";
+  let out_dir = args.variant.clone();
 
   let shard_files = fs::read_dir(format!("dataset/{}/out/{out_dir}/indices", ds.name))
     .unwrap()
@@ -344,7 +347,7 @@ fn main() {
   let index = strategy_stitch_cliques(&ctx, src.clone());
   println!();
 
-  export_index(&ds, "hnsw-sharded", &index.graph, index.medoid);
+  export_index(&ds, &out_dir, &index.graph, index.medoid);
   println!();
 
   // Other worse strategies, provided for reference. Ctrl+C (SIGINT) at this point if not useful.
