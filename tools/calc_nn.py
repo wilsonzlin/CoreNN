@@ -2,6 +2,7 @@ from tqdm import tqdm
 import argparse
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 """
 We use PyTorch instead of cupy because it supports the latest versions of both ROCm and CUDA.
@@ -19,6 +20,9 @@ parser.add_argument("--vectors", type=str, help="Path to packed array of f32 vec
 parser.add_argument("--out-queries", type=str, help="Path to queries output")
 parser.add_argument("--out-results", type=str, help="Path to results output")
 parser.add_argument("--dim", type=int, help="Dimension of vectors")
+parser.add_argument(
+    "--cosine", action=argparse.BooleanOptionalAction, help="Use cosine metric"
+)
 parser.add_argument("--n-samples", type=int, help="Number of vectors to sample")
 parser.add_argument(
     "--batch-size",
@@ -57,6 +61,8 @@ with open(args.out_queries, "wb") as f:
 # Transfer data to GPU.
 print("Transferring data to GPU...")
 vectors_gpu = torch.from_numpy(vectors).to(device=device, dtype=torch.float32)
+if args.cosine:
+    vectors_gpu = F.normalize(vectors_gpu)
 out_knn = open(args.out_results, "wb")
 
 pb = tqdm(total=args.n_samples)
@@ -70,10 +76,10 @@ for i in range(0, args.n_samples, args.batch_size):
 
     # Disable gradient computation for efficiency
     with torch.no_grad():
-        # Calculate Euclidean distance (works like cosine distance for normalized vectors too).
-        distances = torch.cdist(
-            query_vectors_gpu, vectors_gpu
-        )  # Shape: (batch_size, N)
+        if args.cosine:
+            distances = 1 - torch.matmul(query_vectors_gpu, vectors_gpu.T)
+        else:
+            distances = torch.cdist(query_vectors_gpu, vectors_gpu)
 
         # Get top k nearest neighbors
         _, top_k_indices = torch.topk(distances, k=args.k, dim=1, largest=False)

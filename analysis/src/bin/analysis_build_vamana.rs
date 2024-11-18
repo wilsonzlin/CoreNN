@@ -2,6 +2,7 @@ use clap::Parser;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use libroxanne::common::PrecomputedDists;
+use libroxanne::common::StdMetric;
 use libroxanne::in_memory::InMemoryIndex;
 use roxanne_analysis::export_index;
 use roxanne_analysis::Dataset;
@@ -25,6 +26,9 @@ struct Args {
 
   #[arg(long, default_value_t = 10_000)]
   medoid_sample_size: usize,
+
+  #[arg(long, default_value_t = StdMetric::L2)]
+  metric: StdMetric,
 
   #[arg(long)]
   load_precomputed_dists: bool,
@@ -72,6 +76,7 @@ fn main() {
     (0..n).collect(),
     (0..n).map(|i| vecs.row(i).to_owned()).collect(),
   )
+  .metric(args.metric.get_fn())
   .degree_bound(args.degree_bound)
   .distance_threshold(args.distance_threshold)
   .update_batch_size(args.update_batch_size)
