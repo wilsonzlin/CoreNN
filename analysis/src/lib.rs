@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use itertools::Itertools;
 use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
+use libroxanne::common::StdMetric;
 use libroxanne::search::GreedySearchable;
 use libroxanne::search::Query;
 use libroxanne::search::SearchMetrics;
@@ -45,6 +46,7 @@ pub enum DatasetDtype {
 #[derive(Deserialize)]
 pub struct DatasetInfo {
   pub dtype: DatasetDtype,
+  pub metric: StdMetric,
   pub dim: usize,
   pub n: usize,
   pub q: usize,

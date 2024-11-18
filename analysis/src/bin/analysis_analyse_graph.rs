@@ -4,6 +4,7 @@ use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
 use libroxanne::common::Metric;
 use libroxanne::common::PrecomputedDists;
+use libroxanne::common::StdMetric;
 use libroxanne::pq::ProductQuantizer;
 use libroxanne::search::GreedySearchable;
 use ndarray::Array1;
@@ -32,6 +33,7 @@ struct EvalGraph {
   adj_list: HashMap<Id, Vec<Id>>,
   vectors: Array2<f32>,
   pq: Option<ProductQuantizer<f32>>,
+  metric: Metric<f32>,
   vectors_pq: Option<Array2<u8>>,
   medoid: Id,
 }
@@ -46,7 +48,7 @@ impl<'a> GreedySearchable<'a, f32> for EvalGraph {
   }
 
   fn metric(&self) -> Metric<f32> {
-    metric_euclidean::<f32>
+    self.metric
   }
 
   fn precomputed_dists(&self) -> Option<&PrecomputedDists> {
@@ -108,10 +110,11 @@ fn main() {
 
   let index = EvalGraph {
     adj_list: graph,
+    medoid,
+    metric: ds.info.metric.get_fn(),
     pq,
     vectors_pq,
     vectors: vecs,
-    medoid,
   };
 
   let e = eval(
