@@ -1,6 +1,7 @@
 use linfa::traits::FitWith;
 use linfa::traits::Predict;
 use linfa::DatasetBase;
+use linfa::Float;
 use linfa_clustering::IncrKMeansError;
 use linfa_clustering::KMeans;
 use linfa_clustering::KMeansInit;
@@ -17,12 +18,12 @@ use serde::Deserialize;
 use serde::Serialize;
 
 #[derive(Serialize, Deserialize)]
-pub struct ProductQuantizer<T: linfa::Float> {
+pub struct ProductQuantizer<T: Float> {
   dims: usize,
   subspace_codebooks: Vec<KMeans<T, L2Dist>>,
 }
 
-impl<T: linfa::Float> ProductQuantizer<T> {
+impl<T: Float> ProductQuantizer<T> {
   pub fn train(mat: &ArrayView2<T>, subspaces: usize) -> Self {
     // TODO Tune or allow config of this hyperparameter.
     let batch_size = 128;

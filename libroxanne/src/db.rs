@@ -1,8 +1,9 @@
+use crate::common::Dtype;
 use crate::common::Id;
 use crate::common::StdMetric;
-use crate::pq::ProductQuantizer;
 use bitcode::Decode;
 use bitcode::Encode;
+use bytemuck::cast_slice;
 use rmp_serde::to_vec_named;
 use rocksdb::BlockBasedOptions;
 use rocksdb::DBPinnableSlice;
@@ -28,11 +29,10 @@ pub enum DbKeyT {
   Medoid,
   Metric,
   NextId,
-  Node,      // (Id)
-  NodeCount, // Does not include deleted.
-  PqModel,
-  PqVec, // (Id)
-  TempIndexOffsets,
+  Node,                // (Id)
+  NodeCount,           // Does not include deleted.
+  PqVec,               // (Id)
+  WriteAheadLogVector, // (Id)
 }
 
 pub trait DbKey {
@@ -148,16 +148,15 @@ impl DbTransaction {
     self.write(DbKeyT::NodeCount, &count);
   }
 
-  pub fn write_pq_model(&mut self, pq: &ProductQuantizer<f32>) {
-    self.write(DbKeyT::PqModel, pq);
-  }
-
   pub fn write_pq_vec(&mut self, id: Id, vec: Vec<u8>) {
     self.write_raw((DbKeyT::PqVec, id), vec);
   }
 
-  pub fn write_temp_index_offsets(&mut self, offsets: &[usize]) {
-    self.write(DbKeyT::TempIndexOffsets, &offsets);
+  pub fn write_write_ahead_log_vector<T: Dtype>(&mut self, id: Id, vec: Vec<T>) {
+    self.write_raw(
+      (DbKeyT::WriteAheadLogVector, id),
+      cast_slice(vec.as_slice()).to_vec(),
+    );
   }
 
   pub fn commit(self, db: &Db) {
@@ -335,18 +334,13 @@ impl Db {
     rmp_serde::from_slice(&raw).unwrap()
   }
 
-  pub fn read_pq_model(&self) -> ProductQuantizer<f32> {
-    let raw = self.read_raw(DbKeyT::PqModel);
-    rmp_serde::from_slice(&raw).unwrap()
-  }
-
   pub fn read_pq_vec(&self, id: Id) -> Vec<u8> {
     let raw = self.read_raw((DbKeyT::PqVec, id));
     raw.to_vec()
   }
 
-  pub fn read_temp_index_offsets(&self) -> Vec<usize> {
-    let raw = self.read_raw(DbKeyT::TempIndexOffsets);
-    rmp_serde::from_slice(&raw).unwrap()
+  pub fn read_write_ahead_log_vector<T: Dtype>(&self, id: Id) -> Vec<T> {
+    let raw = self.read_raw((DbKeyT::WriteAheadLogVector, id));
+    cast_slice(&raw).to_vec()
   }
 }

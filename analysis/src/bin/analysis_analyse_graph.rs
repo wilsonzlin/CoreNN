@@ -1,10 +1,8 @@
 use ahash::HashMap;
 use clap::Parser;
-use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
 use libroxanne::common::Metric;
 use libroxanne::common::PrecomputedDists;
-use libroxanne::common::StdMetric;
 use libroxanne::pq::ProductQuantizer;
 use libroxanne::search::GreedySearchable;
 use ndarray::Array1;

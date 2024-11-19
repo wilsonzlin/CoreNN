@@ -1,4 +1,5 @@
 use ahash::HashMap;
+use bytemuck::Pod;
 use ndarray::ArrayView1;
 use ndarray_linalg::Scalar;
 use serde::Deserialize;
@@ -9,7 +10,8 @@ use strum_macros::EnumString;
 pub type Id = usize;
 pub type Metric<T> = fn(&ArrayView1<T>, &ArrayView1<T>) -> f64;
 
-pub trait Dtype: Scalar + Send + Sync {}
+pub trait Dtype: Pod + Scalar + Send + Sync {}
+// TODO Support f16 once ndarray_linalg::Scalar supports it.
 impl Dtype for f32 {}
 impl Dtype for f64 {}
 

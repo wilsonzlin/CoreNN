@@ -1,6 +1,7 @@
 #![feature(f16)]
 
 pub mod bf;
+pub mod blob;
 pub mod common;
 pub mod db;
 pub mod hnsw;
