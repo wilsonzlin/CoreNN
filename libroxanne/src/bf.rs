@@ -29,10 +29,11 @@ impl<T: Dtype> BruteForceIndex<T> {
     self.id_to_point.remove(&id);
   }
 
-  pub fn query(&self, q: &ArrayView1<T>, k: usize) -> Vec<PointDist> {
+  pub fn query(&self, q: &ArrayView1<T>, k: usize, filter: impl Fn(Id) -> bool) -> Vec<PointDist> {
     self
       .id_to_point
       .iter()
+      .filter(|e| filter(*e.key()))
       .map(|e| PointDist {
         id: *e.key(),
         dist: (self.metric)(&e.view(), q),

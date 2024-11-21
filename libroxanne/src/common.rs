@@ -55,6 +55,22 @@ pub fn metric_cosine<T: Dtype>(a: &ArrayView1<T>, b: &ArrayView1<T>) -> f64 {
   }
 }
 
+// Inspired by https://numpy.org/doc/stable/reference/generated/numpy.nan_to_num.html.
+pub fn nan_to_num<T: Dtype>(v: T) -> T {
+  if v.is_nan() {
+    T::zero()
+  } else if v.is_infinite() {
+    if v.is_sign_positive() {
+      T::max_value()
+    } else {
+      // WARNING: This is not the same as f32::MIN_VALUE.
+      -T::max_value()
+    }
+  } else {
+    v
+  }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Display, EnumString, Serialize, Deserialize)]
 pub enum StdMetric {
   L2,

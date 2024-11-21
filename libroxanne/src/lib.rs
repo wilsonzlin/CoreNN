@@ -6,6 +6,7 @@ use ahash::HashSetExt;
 use arbitrary_lock::ArbitraryLock;
 use bf::BruteForceIndex;
 use blob::BlobStore;
+use common::nan_to_num;
 use common::Dtype;
 use common::Id;
 use common::Metric;
@@ -32,6 +33,7 @@ use rand::thread_rng;
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use search::GreedySearchable;
@@ -237,7 +239,7 @@ impl<T: Dtype> RoxanneDb<T> {
         continue;
       };
 
-      // From now on, we must work with a consistent, static set of deleted elements.
+      // From now on, we must work with a consistent, immutable set of deleted elements.
       let deleted = self.deleted.iter().map(|e| *e).collect_vec();
 
       enum PostAction<T: Dtype> {
@@ -624,7 +626,7 @@ impl<T: Dtype> RoxanneDb<T> {
   ) -> Vec<PointDist> {
     match &indices.current {
       TempIndex::ANN(idx) => self.greedy_search(idx, q, k),
-      TempIndex::BF(index) => index.query(q, k),
+      TempIndex::BF(index) => index.query(q, k, |id| !self.deleted.contains(&id)),
     }
   }
 
@@ -696,21 +698,25 @@ impl<T: Dtype> RoxanneDb<T> {
     let ids_base = self.next_id.fetch_add(n, Ordering::Relaxed);
     let ids = (0..n).map(|i| ids_base + i).collect_vec();
 
-    let entries = entries.into_iter().collect_vec();
+    let mut entries = entries.into_iter().collect_vec();
 
     let ex_ids = Mutex::new(Vec::new());
-    entries.par_iter().enumerate().for_each(|(i, (k, v))| {
+    entries.par_iter_mut().enumerate().for_each(|(i, (k, v))| {
+      // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
+      v.mapv_inplace(nan_to_num);
+
       let id = ids_base + i;
       let locker = self.key_locks.get(k.clone());
       let _lock = locker.lock();
       let mut txn = DbTransaction::new();
       if let Some(ex_id) = self.db.maybe_read_id(&k) {
         txn.write_deleted(ex_id);
+        txn.delete_key(ex_id);
         ex_ids.lock().push(ex_id);
       };
       txn.write_key(id, &k);
       txn.write_id(&k, id);
-      txn.write_write_ahead_log_vector(id, v.to_vec());
+      txn.write_write_ahead_log_vector(id, v.as_slice().unwrap());
       txn.commit(&self.db);
     });
 

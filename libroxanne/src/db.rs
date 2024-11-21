@@ -112,7 +112,7 @@ impl DbTransaction {
     self.delete_raw((DbKeyT::WriteAheadLogVector, id));
   }
 
-  fn write_raw(&mut self, k: impl DbKey, v: Vec<u8>) {
+  fn write_raw(&mut self, k: impl DbKey, v: impl AsRef<[u8]>) {
     self.batch.put(k.bytes(), v);
   }
 
@@ -133,7 +133,7 @@ impl DbTransaction {
   }
 
   pub fn write_key(&mut self, id: Id, key: &str) {
-    self.write_raw((DbKeyT::Key, id), key.as_bytes().to_vec());
+    self.write_raw((DbKeyT::Key, id), key.as_bytes());
   }
 
   pub fn write_medoid(&mut self, medoid: Id) {
@@ -152,11 +152,8 @@ impl DbTransaction {
     self.write(DbKeyT::TempIndexCount, &count);
   }
 
-  pub fn write_write_ahead_log_vector<T: Dtype>(&mut self, id: Id, vec: Vec<T>) {
-    self.write_raw(
-      (DbKeyT::WriteAheadLogVector, id),
-      cast_slice(vec.as_slice()).to_vec(),
-    );
+  pub fn write_write_ahead_log_vector<T: Dtype>(&mut self, id: Id, vec: &[T]) {
+    self.write_raw((DbKeyT::WriteAheadLogVector, id), cast_slice(vec));
   }
 
   pub fn commit(self, db: &Db) {
