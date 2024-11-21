@@ -1,19 +1,20 @@
 use ahash::HashMap;
 use clap::Parser;
 use hnswlib_rs::HnswIndex;
-use indicatif::ProgressBar;
-use indicatif::ProgressStyle;
 use itertools::Itertools;
+use libroxanne::blob::BlobStore;
+use libroxanne::blob::InMemoryIndexBlob;
+use libroxanne::cfg::RoxanneDbCfg;
 use libroxanne::common::StdMetric;
 use libroxanne::db::Db;
 use libroxanne::db::DbTransaction;
-use libroxanne::db::NodeData;
-use rayon::iter::IntoParallelIterator;
-use rayon::iter::ParallelIterator;
+use ndarray::Array1;
+use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -59,76 +60,84 @@ fn load_hnsw(dim: usize, path: impl AsRef<Path>) -> HnswIndex {
   HnswIndex::load(dim, &mut rd)
 }
 
-fn new_pb(len: usize) -> ProgressBar {
-  let pb = ProgressBar::new(len.try_into().unwrap());
-  pb.set_style(
-    ProgressStyle::with_template(
-      "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
-    )
-    .unwrap()
-    .progress_chars("#>-"),
-  );
-  pb
-}
-
-// We don't perform PQ here, as it's expensive and not specifically related to this task; use the general `pqify` tool afterwards.
 fn main() {
   let args = Args::parse();
 
   // Make sure database can be created before we do long expensive work.
-  let db = Db::create(&args.out);
+  let db = Db::open(args.out.join("db"));
   println!("Created database");
+
+  let blobs = BlobStore::open(args.out.join("blobs"));
 
   let index = load_hnsw(args.dim, args.path);
 
   // Allow custom params for new graph that will be stored on disk, which means the params might be different from the HNSW index (so don't just copy existing).
-  let mut txn = DbTransaction::new();
-  txn.write_cfg_beam_width(args.beam_width);
-  txn.write_cfg_degree_bound(args.degree_bound);
-  txn.write_cfg_distance_threshold(args.distance_threshold);
-  txn.write_cfg_query_search_list_cap(args.query_search_list_cap);
-  txn.write_cfg_update_batch_size(args.update_batch_size);
-  txn.write_cfg_update_search_list_cap(args.update_search_list_cap);
-  txn.write_dim(args.dim);
-  txn.write_medoid(index.entry_label());
-  txn.write_metric(args.metric);
-  txn.write_next_id(index.cur_element_count);
-  txn.write_node_count(index.cur_element_count);
-  txn.write_temp_index_offsets(&[]);
-  txn.commit(&db);
+  let cfg = RoxanneDbCfg {
+    beam_width: args.beam_width,
+    degree_bound: args.degree_bound,
+    dim: args.dim,
+    distance_threshold: args.distance_threshold,
+    metric: args.metric,
+    query_search_list_cap: args.query_search_list_cap,
+    update_batch_size: args.update_batch_size,
+    update_search_list_cap: args.update_search_list_cap,
+    ..Default::default()
+  };
+  fs::write(
+    args.out.join("roxanne.toml"),
+    toml::to_string(&cfg).unwrap(),
+  )
+  .unwrap();
 
-  let pb = new_pb(index.cur_element_count);
+  // In HNSW, "labels" are the external ID that the builder has defined for each vector.
+  // To port to Roxanne, they will become the keys. We'll assign each a new internal Roxanne ID.
   let label_to_id = index
     .labels()
     .enumerate()
     .map(|(id, l)| (l, id))
     .collect::<HashMap<_, _>>();
-  // Collect to Vec so we can use into_par_iter, which is much faster than par_bridge.
-  index
-    .labels()
-    .collect_vec()
-    .into_par_iter()
-    .for_each(|label| {
-      let node_data = NodeData {
-        neighbors: index
+  let vectors = Arc::new(
+    index
+      .labels()
+      .map(|label| {
+        (
+          label_to_id[&label],
+          Array1::from_vec(index.get_data_by_label(label)),
+        )
+      })
+      .collect(),
+  );
+  let graph = Arc::new(
+    index
+      .labels()
+      .map(|label| {
+        let neighbors = index
           .get_merged_neighbors(label, 0)
           .into_iter()
           .map(|label| label_to_id[&label])
-          .collect_vec(),
-        vector: index.get_data_by_label(label),
-      };
-      let id = label_to_id[&label];
-      let key = format!("{}", id);
-      let mut txn = DbTransaction::new();
-      txn.write_id(&key, id);
-      txn.write_key(id, &key);
-      txn.write_node(id, &node_data);
-      txn.commit(&db);
-      pb.inc(1);
-    });
-  pb.finish();
-  println!("Finalizing database");
+          .collect_vec();
+        let id = label_to_id[&label];
+        (id, neighbors)
+      })
+      .collect(),
+  );
 
+  let blob = InMemoryIndexBlob {
+    graph,
+    medoid: label_to_id[&index.entry_label()],
+    vectors,
+  };
+  blobs.write_temp_index(0, &blob);
+  println!("Saved temp index");
+
+  let mut txn = DbTransaction::new();
+  txn.write_temp_index_count(1);
+  for (label, id) in label_to_id {
+    let key = label.to_string();
+    txn.write_id(&key, id);
+    txn.write_key(id, &key);
+  }
+  txn.commit(&db);
   db.flush();
   drop(db);
   println!("All done!");

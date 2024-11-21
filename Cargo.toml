@@ -8,7 +8,6 @@ members = [
   "hnsw-to-roxanne",
   "hnswlib-rs",
   "libroxanne",
-  "pqify",
 ]
 
 [profile.release]

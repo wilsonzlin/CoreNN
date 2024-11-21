@@ -28,6 +28,7 @@ use roxanne_analysis::Eval;
 use std::cmp::Reverse;
 use std::fs;
 use std::fs::File;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -84,12 +85,7 @@ fn baseline_build_from_scratch(args: &Args, ctx: &Ctx, index: InMemoryIndex<f32>
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
   for (i, batch) in ids.chunks(batch_size).enumerate() {
     let mut metrics = OptimizeMetrics::default();
-    index.optimize(
-      batch.to_vec(),
-      index.params.distance_threshold,
-      Some(&mut metrics),
-      |_, _| {},
-    );
+    index.optimize(batch.to_vec(), Some(&mut metrics), |_, _| {});
     cumulative_updated_nodes.extend(metrics.updated_nodes.iter().copied());
     let touched_msg = metrics
       .updated_nodes
@@ -116,12 +112,7 @@ fn strategy_reinsert_randomly(ctx: &Ctx, index: InMemoryIndex<f32>) {
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
   for (i, batch) in ids.chunks(batch_size).enumerate() {
     let mut metrics = OptimizeMetrics::default();
-    index.optimize(
-      batch.to_vec(),
-      index.params.distance_threshold,
-      Some(&mut metrics),
-      |_, _| {},
-    );
+    index.optimize(batch.to_vec(), Some(&mut metrics), |_, _| {});
     cumulative_updated_nodes.extend(metrics.updated_nodes.iter().copied());
     let touched_msg = metrics
       .updated_nodes
@@ -154,12 +145,7 @@ fn strategy_reinsert_by_level(ctx: &Ctx, index: InMemoryIndex<f32>) {
     let nodes = ent.iter().flat_map(|e| e.to_vec()).collect_vec();
     let n = nodes.len();
     let mut metrics = OptimizeMetrics::default();
-    index.optimize(
-      nodes,
-      index.params.distance_threshold,
-      Some(&mut metrics),
-      |_, _| {},
-    );
+    index.optimize(nodes, Some(&mut metrics), |_, _| {});
     cumulative_updated_nodes.extend(metrics.updated_nodes.iter().copied());
     let touched_msg = metrics
       .updated_nodes
@@ -361,12 +347,12 @@ fn main() {
 
   // TODO Eval score should be based on distance, as it's more important for a near neighbor to be present than a far one.
   let src = InMemoryIndex {
-    graph: adj_list,
+    graph: Arc::new(adj_list),
     medoid: entrypoints[0],
     metric: metric_euclidean,
     params,
     precomputed_dists: None,
-    vectors: id_to_point,
+    vectors: Arc::new(id_to_point),
   };
 
   println!("strategy_stitch_cliques");

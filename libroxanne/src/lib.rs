@@ -6,13 +6,13 @@ use ahash::HashSetExt;
 use arbitrary_lock::ArbitraryLock;
 use bf::BruteForceIndex;
 use blob::BlobStore;
+use cfg::RoxanneDbCfg;
 use common::nan_to_num;
 use common::Dtype;
 use common::Id;
 use common::Metric;
 use common::PointDist;
 use common::PrecomputedDists;
-use common::StdMetric;
 use dashmap::DashMap;
 use dashmap::DashSet;
 use dashmap::Entry;
@@ -38,8 +38,6 @@ use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use search::GreedySearchable;
 use search::Query;
-use serde::Deserialize;
-use serde::Serialize;
 use std::cmp::max;
 use std::cmp::min;
 use std::collections::BTreeMap;
@@ -56,6 +54,7 @@ use vamana::VamanaParams;
 
 pub mod bf;
 pub mod blob;
+pub mod cfg;
 pub mod common;
 pub mod db;
 pub mod hnsw;
@@ -64,23 +63,6 @@ pub mod pq;
 pub mod queue;
 pub mod search;
 pub mod vamana;
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RoxanneDbCfg {
-  pub beam_width: usize,
-  pub brute_force_index_cap: usize,
-  pub degree_bound: usize,
-  pub dim: usize,
-  pub distance_threshold: f64,
-  pub max_temp_indices: usize,
-  pub metric: StdMetric,
-  pub pq_sample_size: usize,
-  pub pq_subspaces: usize,
-  pub query_search_list_cap: usize,
-  pub temp_index_cap: usize,
-  pub update_batch_size: usize,
-  pub update_search_list_cap: usize,
-}
 
 pub enum RoxanneDbError {
   Busy,
