@@ -328,6 +328,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
         .collect::<Vec<_>>();
       let neighbors = DashSet::new();
       // Parallelize as the purpose of beam width > 1 is to read from disk in parallel.
+      // TODO Use another thread pool instead of rayon as rayon expects CPU-bound tasks so spawns few and non-overlapping threads; using it for I/O will block a precious worker thread while being largely idle.
       new_visited.par_iter_mut().for_each(|p_star| {
         let (p_neighbors, full_vec) = self.get_out_neighbors(p_star.id);
         if let Some(v) = full_vec {

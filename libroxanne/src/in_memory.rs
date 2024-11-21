@@ -1,4 +1,5 @@
 use crate::common::metric_euclidean;
+use crate::common::DashMapValue;
 use crate::common::Dtype;
 use crate::common::Id;
 use crate::common::Metric;
@@ -6,7 +7,6 @@ use crate::common::PrecomputedDists;
 use crate::search::GreedySearchable;
 use crate::vamana::Vamana;
 use crate::vamana::VamanaParams;
-use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use ndarray::Array1;
 use ordered_float::OrderedFloat;
@@ -15,7 +15,6 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
-use std::borrow::Borrow;
 use std::iter::zip;
 use std::sync::Arc;
 
@@ -135,8 +134,8 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
       vectors,
     } = self;
 
-    let graph = random_r_regular_graph(&ids, params.degree_bound);
-    let vectors = zip(ids.clone(), vectors).collect::<DashMap<_, _>>();
+    let graph = Arc::new(random_r_regular_graph(&ids, params.degree_bound));
+    let vectors = Arc::new(zip(ids.clone(), vectors).collect::<DashMap<_, _>>());
 
     // The medoid will be the starting point `s` as referred in the DiskANN paper (2.3).
     let medoid = calc_approx_medoid(
@@ -169,8 +168,10 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
 pub struct InMemoryIndex<T: Dtype> {
   /// This can be useful for serializing to disk. Usually the points are already stored elsewhere, so serializing the graph alone can save space. To deserialize, collect the points, deserialize this graph, and use InMemoryVamana::new.
   /// This can also be used to introspect the graph, e.g. for debugging, analysis, or research.
-  pub graph: DashMap<Id, Vec<Id>>,
-  pub vectors: DashMap<Id, Array1<T>>,
+  // This is Arc so it can be easily shared with InMemoryIndexBlob for serialization.
+  pub graph: Arc<DashMap<Id, Vec<Id>>>,
+  // This is Arc so it can be easily shared with InMemoryIndexBlob for serialization.
+  pub vectors: Arc<DashMap<Id, Array1<T>>>,
   pub medoid: Id,
   pub metric: Metric<T>,
   pub params: VamanaParams,
@@ -194,14 +195,9 @@ impl<T: Dtype> InMemoryIndex<T> {
       },
     }
   }
-}
 
-// dashmap::Ref does not implement Borrow, only Deref, so we create a wrapper newtype to implement Borrow.
-pub struct DashMapValue<'a, V>(Ref<'a, Id, V>);
-
-impl<'a, V> Borrow<V> for DashMapValue<'a, V> {
-  fn borrow(&self) -> &V {
-    self.0.value()
+  pub fn len(&self) -> usize {
+    self.vectors.len()
   }
 }
 

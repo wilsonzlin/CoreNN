@@ -11,7 +11,9 @@ use ndarray::Array1;
 use ordered_float::OrderedFloat;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
+use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
@@ -147,5 +149,13 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
       completed += batch.len();
       on_progress(completed, metrics.as_ref().map(|m| &**m));
     }
+  }
+
+  fn insert(&'a self, ids: Vec<Id>, vectors: Vec<Array1<T>>) {
+    ids
+      .par_iter()
+      .zip(vectors)
+      .for_each(|(id, point)| self.set_point(*id, point));
+    self.optimize(ids, None, |_, _| {});
   }
 }

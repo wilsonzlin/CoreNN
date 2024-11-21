@@ -88,6 +88,20 @@ impl<T: Float> ProductQuantizer<T> {
     codes
   }
 
+  pub fn encode_1(&self, vec: &ArrayView1<T>) -> Array1<u8> {
+    assert_eq!(vec.shape()[0], self.dims);
+    let subspaces = self.subspace_codebooks.len();
+    let subdims = self.dims / subspaces;
+    let mut code = Array1::zeros(subspaces);
+    for (i, codebook) in self.subspace_codebooks.iter().enumerate() {
+      let subvec = vec.slice(s![i * subdims..(i + 1) * subdims]);
+      let obs = DatasetBase::new(subvec.to_owned(), ());
+      let label = codebook.predict(&obs);
+      code[i] = u8::try_from(label).unwrap();
+    }
+    code
+  }
+
   pub fn decode(&self, codes: &ArrayView2<u8>) -> Array2<T> {
     let n = codes.shape()[0];
     let subspaces = self.subspace_codebooks.len();

@@ -1,9 +1,9 @@
 use crate::common::Dtype;
 use crate::common::Id;
-use crate::common::StdMetric;
 use bitcode::Decode;
 use bitcode::Encode;
 use bytemuck::cast_slice;
+use ndarray::Array1;
 use rmp_serde::to_vec_named;
 use rocksdb::BlockBasedOptions;
 use rocksdb::DBPinnableSlice;
@@ -16,22 +16,14 @@ use std::path::Path;
 #[derive(PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum DbKeyT {
-  CfgBeamWidth,
-  CfgDegreeBound,
-  CfgDistanceThreshold,
-  CfgQuerySearchListCap,
-  CfgUpdateBatchSize,
-  CfgUpdateSearchListCap,
   Deleted, // (Id)
-  Dim,
+  HasLongTermIndex,
   Id,  // (Vec<u8>)
   Key, // (Id)
   Medoid,
-  Metric,
-  NextId,
-  Node,                // (Id)
-  NodeCount,           // Does not include deleted.
-  PqVec,               // (Id)
+  Node,  // (Id)
+  PqVec, // (Id)
+  TempIndexCount,
   WriteAheadLogVector, // (Id)
 }
 
@@ -80,6 +72,46 @@ impl DbTransaction {
     }
   }
 
+  fn delete_raw(&mut self, k: impl DbKey) {
+    self.batch.delete(k.bytes());
+  }
+
+  pub fn delete_deleted(&mut self, id: Id) {
+    self.delete_raw((DbKeyT::Deleted, id));
+  }
+
+  pub fn delete_has_long_term_index(&mut self) {
+    self.delete_raw(DbKeyT::HasLongTermIndex);
+  }
+
+  pub fn delete_id(&mut self, key: &str) {
+    self.delete_raw((DbKeyT::Id, key));
+  }
+
+  pub fn delete_key(&mut self, id: Id) {
+    self.delete_raw((DbKeyT::Key, id));
+  }
+
+  pub fn delete_medoid(&mut self) {
+    self.delete_raw(DbKeyT::Medoid);
+  }
+
+  pub fn delete_node(&mut self, id: Id) {
+    self.delete_raw((DbKeyT::Node, id));
+  }
+
+  pub fn delete_pq_vec(&mut self, id: Id) {
+    self.delete_raw((DbKeyT::PqVec, id));
+  }
+
+  pub fn delete_temp_index_count(&mut self) {
+    self.delete_raw(DbKeyT::TempIndexCount);
+  }
+
+  pub fn delete_write_ahead_log_vector(&mut self, id: Id) {
+    self.delete_raw((DbKeyT::WriteAheadLogVector, id));
+  }
+
   fn write_raw(&mut self, k: impl DbKey, v: Vec<u8>) {
     self.batch.put(k.bytes(), v);
   }
@@ -88,36 +120,12 @@ impl DbTransaction {
     self.write_raw(k, to_vec_named(v).unwrap());
   }
 
-  pub fn write_cfg_beam_width(&mut self, width: usize) {
-    self.write(DbKeyT::CfgBeamWidth, &width);
-  }
-
-  pub fn write_cfg_degree_bound(&mut self, dim: usize) {
-    self.write(DbKeyT::CfgDegreeBound, &dim);
-  }
-
-  pub fn write_cfg_distance_threshold(&mut self, dist: f64) {
-    self.write(DbKeyT::CfgDistanceThreshold, &dist);
-  }
-
-  pub fn write_cfg_query_search_list_cap(&mut self, cap: usize) {
-    self.write(DbKeyT::CfgQuerySearchListCap, &cap);
-  }
-
-  pub fn write_cfg_update_batch_size(&mut self, size: usize) {
-    self.write(DbKeyT::CfgUpdateBatchSize, &size);
-  }
-
-  pub fn write_cfg_update_search_list_cap(&mut self, cap: usize) {
-    self.write(DbKeyT::CfgUpdateSearchListCap, &cap);
-  }
-
   pub fn write_deleted(&mut self, id: Id) {
     self.write_raw((DbKeyT::Deleted, id), Vec::new());
   }
 
-  pub fn write_dim(&mut self, dim: usize) {
-    self.write(DbKeyT::Dim, &dim);
+  pub fn write_has_long_term_index(&mut self) {
+    self.write_raw(DbKeyT::HasLongTermIndex, Vec::new());
   }
 
   pub fn write_id(&mut self, key: &str, id: Id) {
@@ -132,24 +140,16 @@ impl DbTransaction {
     self.write(DbKeyT::Medoid, &medoid);
   }
 
-  pub fn write_metric(&mut self, metric: StdMetric) {
-    self.write(DbKeyT::Metric, &metric);
-  }
-
-  pub fn write_next_id(&mut self, id: Id) {
-    self.write(DbKeyT::NextId, &id);
-  }
-
-  pub fn write_node(&mut self, id: Id, node: &NodeData) {
+  pub fn write_node<T: Dtype>(&mut self, id: Id, node: &NodeData<T>) {
     self.write_raw((DbKeyT::Node, id), node.serialize());
-  }
-
-  pub fn write_node_count(&mut self, count: usize) {
-    self.write(DbKeyT::NodeCount, &count);
   }
 
   pub fn write_pq_vec(&mut self, id: Id, vec: Vec<u8>) {
     self.write_raw((DbKeyT::PqVec, id), vec);
+  }
+
+  pub fn write_temp_index_count(&mut self, count: usize) {
+    self.write(DbKeyT::TempIndexCount, &count);
   }
 
   pub fn write_write_ahead_log_vector<T: Dtype>(&mut self, id: Id, vec: Vec<T>) {
@@ -172,12 +172,12 @@ impl DbTransaction {
 // These are crucial as we want to pack this in under one disk page read, which DiskANN relies on.
 // We don't store as MessagePack like the other DB entries as that's less efficient for this specific use case.
 #[derive(Encode, Decode)]
-pub struct NodeData {
+pub struct NodeData<T> {
   pub neighbors: Vec<Id>,
-  pub vector: Vec<f32>,
+  pub vector: Vec<T>,
 }
 
-impl NodeData {
+impl<T: Dtype> NodeData<T> {
   pub fn serialize(&self) -> Vec<u8> {
     bitcode::encode(self)
   }
@@ -187,11 +187,10 @@ impl NodeData {
   }
 }
 
-fn rocksdb_options(create: bool) -> rocksdb::Options {
+fn rocksdb_options() -> rocksdb::Options {
   // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options.
   let mut opt = rocksdb::Options::default();
-  opt.create_if_missing(create);
-  opt.set_error_if_exists(create);
+  opt.create_if_missing(true);
   opt.set_max_background_jobs(num_cpus::get() as i32 * 2);
   opt.set_bytes_per_sync(1024 * 1024 * 4);
   opt.set_write_buffer_size(1024 * 1024 * 128);
@@ -214,12 +213,7 @@ pub struct Db {
 
 impl Db {
   pub fn open(dir: impl AsRef<Path>) -> Self {
-    let db = rocksdb::DB::open(&rocksdb_options(false), dir).unwrap();
-    Db { db }
-  }
-
-  pub fn create(dir: impl AsRef<Path>) -> Self {
-    let db = rocksdb::DB::open(&rocksdb_options(true), dir).unwrap();
+    let db = rocksdb::DB::open(&rocksdb_options(), dir).unwrap();
     Db { db }
   }
 
@@ -234,7 +228,7 @@ impl Db {
   fn iter<'a, T>(
     &'a self,
     kt: DbKeyT,
-    parser: impl Fn(&[u8]) -> T + 'a,
+    parser: impl (Fn(Box<[u8]>) -> T) + 'a,
   ) -> impl Iterator<Item = (Id, T)> + 'a {
     self
       .db
@@ -244,12 +238,28 @@ impl Db {
       .map(move |(k, v)| {
         let id_raw = &k[1..];
         let id = Id::from_le_bytes(id_raw.try_into().unwrap());
-        (id, parser(&v))
+        (id, parser(v))
       })
   }
 
-  pub fn iter_nodes(&self) -> impl Iterator<Item = (Id, NodeData)> + '_ {
-    self.iter(DbKeyT::Node, |v| NodeData::deserialize(v))
+  pub fn iter_deleted(&self) -> impl Iterator<Item = Id> + '_ {
+    self.iter(DbKeyT::Deleted, |_| ()).map(|(id, _)| id)
+  }
+
+  pub fn iter_ids(&self) -> impl Iterator<Item = (Id, String)> + '_ {
+    self.iter(DbKeyT::Id, |v| String::from_utf8(v.into_vec()).unwrap())
+  }
+
+  pub fn iter_nodes<T: Dtype>(&self) -> impl Iterator<Item = (Id, NodeData<T>)> + '_ {
+    self.iter(DbKeyT::Node, |v| NodeData::deserialize(&v))
+  }
+
+  pub fn iter_write_ahead_log_vectors<T: Dtype>(
+    &self,
+  ) -> impl Iterator<Item = (Id, Array1<T>)> + '_ {
+    self.iter(DbKeyT::WriteAheadLogVector, |v| {
+      Array1::from_vec(cast_slice(&v).to_vec())
+    })
   }
 
   fn maybe_read_raw(&self, k: impl DbKey) -> Option<DBPinnableSlice<'_>> {
@@ -260,48 +270,17 @@ impl Db {
     self.maybe_read_raw(k).unwrap()
   }
 
-  pub fn read_cfg_beam_width(&self) -> usize {
-    let raw = self.read_raw(DbKeyT::CfgBeamWidth);
-    rmp_serde::from_slice(&raw).unwrap()
-  }
-
-  pub fn read_cfg_degree_bound(&self) -> usize {
-    let raw = self.read_raw(DbKeyT::CfgDegreeBound);
-    rmp_serde::from_slice(&raw).unwrap()
-  }
-
-  pub fn read_cfg_distance_threshold(&self) -> f64 {
-    let raw = self.read_raw(DbKeyT::CfgDistanceThreshold);
-    rmp_serde::from_slice(&raw).unwrap()
-  }
-
-  pub fn read_cfg_query_search_list_cap(&self) -> usize {
-    let raw = self.read_raw(DbKeyT::CfgQuerySearchListCap);
-    rmp_serde::from_slice(&raw).unwrap()
-  }
-
-  pub fn read_cfg_update_batch_size(&self) -> usize {
-    let raw = self.read_raw(DbKeyT::CfgUpdateBatchSize);
-    rmp_serde::from_slice(&raw).unwrap()
-  }
-
-  pub fn read_cfg_update_search_list_cap(&self) -> usize {
-    let raw = self.read_raw(DbKeyT::CfgUpdateSearchListCap);
-    rmp_serde::from_slice(&raw).unwrap()
-  }
-
   pub fn read_deleted(&self, id: Id) -> bool {
     self.maybe_read_raw((DbKeyT::Deleted, id)).is_some()
   }
 
-  pub fn read_dim(&self) -> usize {
-    let raw = self.read_raw(DbKeyT::Dim);
-    rmp_serde::from_slice(&raw).unwrap()
+  pub fn read_has_long_term_index(&self) -> bool {
+    self.maybe_read_raw(DbKeyT::HasLongTermIndex).is_some()
   }
 
-  pub fn read_id(&self, key: &str) -> Id {
-    let raw = self.read_raw((DbKeyT::Id, key));
-    rmp_serde::from_slice(&raw).unwrap()
+  pub fn maybe_read_id(&self, key: &str) -> Option<Id> {
+    let raw = self.maybe_read_raw((DbKeyT::Id, key))?;
+    Some(rmp_serde::from_slice(&raw).unwrap())
   }
 
   pub fn read_key(&self, id: Id) -> String {
@@ -314,29 +293,19 @@ impl Db {
     rmp_serde::from_slice(&raw).unwrap()
   }
 
-  pub fn read_metric(&self) -> StdMetric {
-    let raw = self.read_raw(DbKeyT::Metric);
-    rmp_serde::from_slice(&raw).unwrap()
-  }
-
-  pub fn read_next_id(&self) -> Id {
-    let raw = self.read_raw(DbKeyT::NextId);
-    rmp_serde::from_slice(&raw).unwrap()
-  }
-
-  pub fn read_node(&self, id: Id) -> NodeData {
+  pub fn read_node<T: Dtype>(&self, id: Id) -> NodeData<T> {
     let raw = self.read_raw((DbKeyT::Node, id));
     NodeData::deserialize(&raw)
-  }
-
-  pub fn read_node_count(&self) -> usize {
-    let raw = self.read_raw(DbKeyT::NodeCount);
-    rmp_serde::from_slice(&raw).unwrap()
   }
 
   pub fn read_pq_vec(&self, id: Id) -> Vec<u8> {
     let raw = self.read_raw((DbKeyT::PqVec, id));
     raw.to_vec()
+  }
+
+  pub fn read_temp_index_count(&self) -> usize {
+    let raw = self.read_raw(DbKeyT::TempIndexCount);
+    rmp_serde::from_slice(&raw).unwrap()
   }
 
   pub fn read_write_ahead_log_vector<T: Dtype>(&self, id: Id) -> Vec<T> {

@@ -9,6 +9,7 @@ edition = "2021"
 
 [dependencies]
 ahash = { version = "0.8.11", features = ["serde"] }
+arbitrary-lock = "0.1.1"
 bitcode = "0.6.3"
 bytemuck = { version = "1.19.0", features = ["nightly_float"] }
 byteorder = "1.5.0"
@@ -28,9 +29,10 @@ rand = "0.8"
 rayon = "1.10.0"
 rmp-serde = "1.3.0"
 rocksdb = "0.22.0"
-serde = { version = "1.0.210", features = ["derive"] }
+serde = { version = "1.0.210", features = ["derive", "rc"] }
 strum = "0.26.3"
 strum_macros = "0.26.4"
+toml = "0.8.19"
 
 [dev-dependencies]
 ndarray-rand = "0.14.0" # Version 0.15 depends on ndarray 0.16 which we cannot use (see above).

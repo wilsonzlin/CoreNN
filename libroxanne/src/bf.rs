@@ -25,6 +25,10 @@ impl<T: Dtype> BruteForceIndex<T> {
     self.id_to_point.insert(id, vec);
   }
 
+  pub fn delete(&self, id: Id) {
+    self.id_to_point.remove(&id);
+  }
+
   pub fn query(&self, q: &ArrayView1<T>, k: usize) -> Vec<PointDist> {
     self
       .id_to_point

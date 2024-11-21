@@ -1,82 +1,103 @@
 use crate::common::Dtype;
 use crate::common::Id;
+use crate::common::Metric;
+use crate::in_memory::InMemoryIndex;
 use crate::pq::ProductQuantizer;
+use crate::vamana::VamanaParams;
 use dashmap::DashMap;
 use data_encoding::BASE64URL_NOPAD;
-use itertools::Itertools;
 use linfa::Float;
 use ndarray::Array1;
 use rand::thread_rng;
 use rand::RngCore;
 use rmp_serde::from_slice;
-use rmp_serde::to_vec_named;
 use serde::Deserialize;
 use serde::Serialize;
 use std::fs;
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Subset of `InMemoryIndex` fields that we need to store (the rest can be derived).
 // https://stackoverflow.com/a/51465659
 #[derive(Serialize, Deserialize)]
 pub struct InMemoryIndexBlob<T> {
-  pub graph: DashMap<Id, Vec<Id>>,
-  pub vectors: DashMap<Id, Array1<T>>,
+  // This is Arc so it can be easily shared with InMemoryIndex for serialization.
+  pub graph: Arc<DashMap<Id, Vec<Id>>>,
+  // This is Arc so it can be easily shared with InMemoryIndex for serialization.
+  pub vectors: Arc<DashMap<Id, Array1<T>>>,
   pub medoid: Id,
+}
+
+impl<T: Dtype> From<&InMemoryIndex<T>> for InMemoryIndexBlob<T> {
+  fn from(value: &InMemoryIndex<T>) -> Self {
+    Self {
+      graph: value.graph.clone(),
+      medoid: value.medoid,
+      vectors: value.vectors.clone(),
+    }
+  }
+}
+
+impl<T: Dtype> InMemoryIndexBlob<T> {
+  pub fn to_index(&self, metric: Metric<T>, params: VamanaParams) -> InMemoryIndex<T> {
+    InMemoryIndex {
+      graph: self.graph.clone(),
+      medoid: self.medoid,
+      metric,
+      params,
+      precomputed_dists: None,
+      vectors: self.vectors.clone(),
+    }
+  }
 }
 
 // Some large data should be stored outside the DB:
 // - Too big, causing write amplification when RocksDB has to move and compact data around on disk.
 // - Doesn't change often, and only loaded once.
 pub struct BlobStore {
-  dir: String,
+  dir: PathBuf,
 }
 
 impl BlobStore {
-  pub fn new(dir: String) -> Self {
-    fs::create_dir_all(format!("{}/in_memory_indices", dir)).unwrap();
+  pub fn open(dir: PathBuf) -> Self {
+    fs::create_dir_all(dir.join("temp_indices")).unwrap();
     Self { dir }
   }
 
-  fn write(&self, name: &str, val_raw: &[u8]) {
-    let p = format!("{}/{name}", self.dir);
+  fn write(&self, name: &str, val: &impl Serialize) {
+    let p = self.dir.join(name);
     let mut tmp_sfx = vec![0u8; 24];
     thread_rng().fill_bytes(&mut tmp_sfx);
-    let p_tmp = format!("{p}.tmp_{}", BASE64URL_NOPAD.encode(&tmp_sfx));
-    fs::write(&p_tmp, val_raw).unwrap();
+    let p_tmp = p.with_added_extension(format!("tmp_{}", BASE64URL_NOPAD.encode(&tmp_sfx)));
+    let f = File::create(&p_tmp).unwrap();
+    let mut bw = BufWriter::new(f);
+    let mut s = rmp_serde::Serializer::new(&mut bw).with_struct_map();
+    val.serialize(&mut s).unwrap();
     fs::rename(&p_tmp, p).unwrap();
   }
 
-  pub fn read_all_in_memory_indices<T: Dtype>(&self) -> Vec<(usize, InMemoryIndexBlob<T>)> {
-    fs::read_dir(format!("{}/in_memory_indices", self.dir))
-      .unwrap()
-      .map(|e| {
-        let id_raw = e.unwrap().file_name().into_string().unwrap();
-        let id = usize::from_str_radix(&id_raw, 10).unwrap();
-        let raw = fs::read(format!("{}/in_memory_indices/{id}", self.dir)).unwrap();
-        let blob: InMemoryIndexBlob<T> = from_slice(&raw).unwrap();
-        (id, blob)
-      })
-      .collect_vec()
+  pub fn read_temp_index<T: Dtype>(&self, id: usize) -> InMemoryIndexBlob<T> {
+    let raw = fs::read(self.dir.join("temp_indices").join(id.to_string())).unwrap();
+    from_slice(&raw).unwrap()
   }
 
-  pub fn write_in_memory_index<T: Dtype>(&self, id: usize, blob: &InMemoryIndexBlob<T>) {
-    self.write(
-      &format!("in_memory_indices/{id}"),
-      &to_vec_named(blob).unwrap(),
-    );
+  pub fn write_temp_index<T: Dtype>(&self, id: usize, blob: &InMemoryIndexBlob<T>) {
+    self.write(&format!("temp_indices/{id}"), blob);
   }
 
-  pub fn delete_all_in_memory_indices(&self) {
-    fs::remove_dir_all(format!("{}/in_memory_indices", self.dir)).unwrap();
-    fs::create_dir_all(format!("{}/in_memory_indices", self.dir)).unwrap();
+  pub fn delete_all_temp_indices(&self) {
+    fs::remove_dir_all(self.dir.join("temp_indices")).unwrap();
+    fs::create_dir_all(self.dir.join("temp_indices")).unwrap();
   }
 
   pub fn read_pq_model<T: Dtype + Float>(&self) -> ProductQuantizer<T> {
-    let raw = fs::read(format!("{}/pq_model", self.dir)).unwrap();
+    let raw = fs::read(self.dir.join("pq_model")).unwrap();
     from_slice(&raw).unwrap()
   }
 
   pub fn write_pq_model<T: Dtype + Float>(&self, pq_model: &ProductQuantizer<T>) {
-    let raw = to_vec_named(pq_model).unwrap();
-    self.write("pq_model", &raw);
+    self.write("pq_model", pq_model);
   }
 }
