@@ -1,0 +1,122 @@
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.App {
+  --query-color: rgb(234, 0, 255);
+  --correct-color: rgb(0, 204, 0);
+  --incorrect-color: red;
+
+  display: flex;
+  align-items: stretch;
+  height: 100%;
+
+  .graph-container {
+    min-width: 0;
+    flex-grow: 1;
+
+    .Graph {
+      position: absolute;
+      inset: 0;
+
+      .node-medoid {
+        fill: rgb(0, 38, 255);
+        stroke-width: 2;
+        stroke: rgb(0, 24, 158);
+      }
+
+      .node-query {
+        fill: var(--query-color);
+        stroke-width: 2;
+        stroke: rgb(157, 0, 172);
+      }
+
+      .node-result-correct {
+        fill: var(--correct-color);
+        stroke-width: 2;
+        stroke: rgb(1, 165, 1);
+      }
+
+      .node-result-incorrect {
+        fill: var(--incorrect-color);
+        stroke-width: 2;
+        stroke: rgb(196, 1, 1);
+      }
+
+      .node-query-visited {
+        fill: rgb(98, 171, 255);
+      }
+
+      .edge-query {
+        stroke: rgba(62, 210, 255, 0.712);
+        stroke-width: 2;
+        animation-name: fade-in;
+        /* Use both so that the animation is applied to the initial state as well. */
+        animation-fill-mode: both;
+        animation-duration: 120ms;
+      }
+    }
+  }
+
+  .panel {
+    padding: 0.75rem;
+    width: 30rem;
+    flex-shrink: 0;
+
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+
+    .buttons {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    label {
+      display: block;
+
+      > span {
+        display: block;
+        font-weight: bolder;
+      }
+
+      > div {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+
+        > :first-child {
+          flex-grow: 1;
+          min-width: 0;
+        }
+
+        > :nth-child(2) {
+          flex-shrink: 0;
+        }
+      }
+    }
+
+    .result {
+      > h3 {
+        color: var(--query-color);
+        margin: 0;
+
+        > .correct::before {
+          content: "correct";
+          color: var(--correct-color);
+        }
+
+        > .incorrect::before {
+          content: "incorrect";
+          color: var(--incorrect-color);
+        }
+      }
+    }
+  }
+}

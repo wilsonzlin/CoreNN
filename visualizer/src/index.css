@@ -1,0 +1,18 @@
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  font-family: sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+#root {
+  position: fixed;
+  inset: 0;
+}
+
+button {
+  cursor: pointer;
+}

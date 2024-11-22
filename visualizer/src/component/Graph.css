@@ -1,0 +1,10 @@
+.Graph {
+  .default-edge {
+    stroke: rgba(0, 0, 0, 0.04);
+    stroke-width: 1;
+  }
+
+  .default-node {
+    fill: #bbb;
+  }
+}
