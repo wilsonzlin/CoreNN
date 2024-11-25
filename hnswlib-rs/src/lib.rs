@@ -5,6 +5,7 @@ use ahash::HashSetExt;
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
+use std::collections::BinaryHeap;
 use std::io;
 use std::io::Read;
 use std::mem::size_of;
@@ -248,5 +249,32 @@ impl HnswIndex {
   pub fn get_node_level(&self, label: LabelType) -> usize {
     let internal_id = self.get_internal_id(label);
     self.element_levels[internal_id as usize]
+  }
+
+  pub fn search_knn(&self, query: &[f32], k: usize, metric: impl Fn(&[f32], &[f32]) -> f64) {
+    let mut result = BinaryHeap::<(f64, LabelType)>::new();
+
+    let mut curr_obj = self.enter_point_node;
+    let mut cur_dist = metric(query, &self.get_data_by_internal_id(curr_obj));
+
+    for level in (1..=self.max_level).rev() {
+      let mut changed = true;
+      while changed {
+        changed = false;
+
+        let data = self.get_link_list(curr_obj, level);
+        for cand in data {
+          let d = metric(query, &self.get_data_by_internal_id(cand));
+
+          if d < cur_dist {
+            cur_dist = d;
+            curr_obj = cand;
+            changed = true;
+          }
+        }
+      }
+    }
+
+    todo!()
   }
 }
