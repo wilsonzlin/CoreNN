@@ -38,11 +38,11 @@ impl MaxHeap {
   }
 
   pub fn pop(&mut self) -> Option<(f64, TableInt)> {
-    self.0.pop().map(|e| (e.0.0, e.1))
+    self.0.pop().map(|e| (e.0 .0, e.1))
   }
 
   pub fn peek(&self) -> Option<(f64, TableInt)> {
-    self.0.peek().map(|e| (e.0.0, e.1))
+    self.0.peek().map(|e| (e.0 .0, e.1))
   }
 }
 

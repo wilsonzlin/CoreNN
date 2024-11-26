@@ -2,21 +2,31 @@ use crate::common::Dtype;
 use crate::common::Id;
 use bitcode::Decode;
 use bitcode::Encode;
+use bytemuck::cast_slice;
 use rmp_serde::to_vec_named;
 use rocksdb::BlockBasedOptions;
 use rocksdb::DBPinnableSlice;
 use rocksdb::Direction;
 use rocksdb::IteratorMode;
 use rocksdb::WriteBatchWithTransaction;
+use serde::Deserialize;
 use serde::Serialize;
 use std::path::Path;
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum DbIndexMode {
+  BruteForce,
+  InMemory,
+  LongTerm,
+}
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum DbKeyT {
   AdditionalOutNeighbors, // (Id)
+  BruteForceVec,          // (Id)
   Deleted,                // (Id)
-  HasLongTermIndex,
+  IndexMode,
   Id,  // (Vec<u8>)
   Key, // (Id)
   Medoid,
@@ -76,12 +86,12 @@ impl DbTransaction {
     self.delete_raw((DbKeyT::AdditionalOutNeighbors, id));
   }
 
-  pub fn delete_deleted(&mut self, id: Id) {
-    self.delete_raw((DbKeyT::Deleted, id));
+  pub fn delete_brute_force_vec(&mut self, id: Id) {
+    self.delete_raw((DbKeyT::BruteForceVec, id));
   }
 
-  pub fn delete_has_long_term_index(&mut self) {
-    self.delete_raw(DbKeyT::HasLongTermIndex);
+  pub fn delete_deleted(&mut self, id: Id) {
+    self.delete_raw((DbKeyT::Deleted, id));
   }
 
   pub fn delete_id(&mut self, key: &str) {
@@ -116,16 +126,20 @@ impl DbTransaction {
     );
   }
 
+  pub fn write_brute_force_vec<T: Dtype>(&mut self, id: Id, vec: &[T]) {
+    self.write_raw((DbKeyT::BruteForceVec, id), cast_slice(vec));
+  }
+
   pub fn write_deleted(&mut self, id: Id) {
     self.write_raw((DbKeyT::Deleted, id), Vec::new());
   }
 
-  pub fn write_has_long_term_index(&mut self) {
-    self.write_raw(DbKeyT::HasLongTermIndex, Vec::new());
-  }
-
   pub fn write_id(&mut self, key: &str, id: Id) {
     self.write((DbKeyT::Id, key), &id);
+  }
+
+  pub fn write_index_mode(&mut self, mode: DbIndexMode) {
+    self.write(DbKeyT::IndexMode, &mode);
   }
 
   pub fn write_key(&mut self, id: Id, key: &str) {
@@ -229,6 +243,10 @@ impl Db {
     })
   }
 
+  pub fn iter_brute_force_vecs<T: Dtype>(&self) -> impl Iterator<Item = (Id, Vec<T>)> + '_ {
+    self.iter(DbKeyT::BruteForceVec, |v| cast_slice(&v).to_vec())
+  }
+
   pub fn iter_deleted(&self) -> impl Iterator<Item = Id> + '_ {
     self.iter(DbKeyT::Deleted, |_| ()).map(|(id, _)| id)
   }
@@ -256,12 +274,20 @@ impl Db {
       .unwrap_or_default()
   }
 
-  pub fn read_deleted(&self, id: Id) -> bool {
-    self.maybe_read_raw((DbKeyT::Deleted, id)).is_some()
+  pub fn read_brute_force_vec<T: Dtype>(&self, id: Id) -> Vec<T> {
+    let raw = self.read_raw((DbKeyT::BruteForceVec, id));
+    cast_slice(&raw).to_vec()
   }
 
-  pub fn read_has_long_term_index(&self) -> bool {
-    self.maybe_read_raw(DbKeyT::HasLongTermIndex).is_some()
+  pub fn read_index_mode(&self) -> DbIndexMode {
+    self
+      .maybe_read_raw(DbKeyT::IndexMode)
+      .map(|raw| rmp_serde::from_slice(&raw).unwrap())
+      .unwrap_or(DbIndexMode::BruteForce)
+  }
+
+  pub fn read_deleted(&self, id: Id) -> bool {
+    self.maybe_read_raw((DbKeyT::Deleted, id)).is_some()
   }
 
   pub fn maybe_read_id(&self, key: &str) -> Option<Id> {
@@ -274,9 +300,10 @@ impl Db {
     String::from_utf8(raw.to_vec()).unwrap()
   }
 
-  pub fn read_medoid(&self) -> Id {
-    let raw = self.read_raw(DbKeyT::Medoid);
-    rmp_serde::from_slice(&raw).unwrap()
+  pub fn maybe_read_medoid(&self) -> Option<Id> {
+    self
+      .maybe_read_raw(DbKeyT::Medoid)
+      .map(|raw| rmp_serde::from_slice(&raw).unwrap())
   }
 
   pub fn read_node<T: Dtype>(&self, id: Id) -> NodeData<T> {

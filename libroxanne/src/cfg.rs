@@ -6,6 +6,10 @@ fn default_beam_width() -> usize {
   4
 }
 
+fn default_brute_force_index_cap() -> usize {
+  10_000
+}
+
 fn default_degree_bound() -> usize {
   80
 }
@@ -50,6 +54,8 @@ fn update_search_list_cap() -> usize {
 pub struct RoxanneDbCfg {
   #[serde(default = "default_beam_width")]
   pub beam_width: usize,
+  #[serde(default = "default_brute_force_index_cap")]
+  pub brute_force_index_cap: usize,
   #[serde(default = "default_degree_bound")]
   pub degree_bound: usize,
   pub dim: usize,
@@ -78,6 +84,7 @@ impl Default for RoxanneDbCfg {
   fn default() -> Self {
     Self {
       beam_width: default_beam_width(),
+      brute_force_index_cap: default_brute_force_index_cap(),
       degree_bound: default_degree_bound(),
       dim: 0,
       distance_threshold: default_distance_threshold(),

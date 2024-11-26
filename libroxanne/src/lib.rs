@@ -4,6 +4,7 @@
 use ahash::HashSet;
 use ahash::HashSetExt;
 use arbitrary_lock::ArbitraryLock;
+use bf::BruteForceIndex;
 use blob::BlobStore;
 use cfg::RoxanneDbCfg;
 use common::nan_to_num;
@@ -16,8 +17,10 @@ use dashmap::DashMap;
 use dashmap::DashSet;
 use dashmap::Entry;
 use db::Db;
+use db::DbIndexMode;
 use db::DbTransaction;
 use db::NodeData;
+use in_memory::InMemoryIndex;
 use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::Array2;
@@ -45,6 +48,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::thread;
 use vamana::Vamana;
 use vamana::VamanaParams;
 
@@ -91,19 +95,25 @@ impl<T: Dtype> PqState<T> {
 }
 
 enum Mode<T: Dtype> {
+  InMemory {
+    graph: Arc<DashMap<Id, Vec<Id>>>,
+    vectors: Arc<DashMap<Id, Array1<T>>>,
+  },
   LTI {
     pq: PqState<T>,
-  },
-  InMemory {
-    graph: DashMap<Id, Vec<Id>>,
-    vectors: DashMap<Id, Array1<T>>,
   },
 }
 
 struct Index<T: Dtype> {
+  // We use a brute force index for the first few points, because:
+  // - we want a decent sized sample to calculate the medoid
+  // - it's fast enough to query
+  // - inserting into a Vamana graph with zero or only a few nodes has complications (e.g. RobustPrune may actually make a node unreachable)
+  bf: RwLock<Option<Arc<BruteForceIndex<T>>>>,
   db: Arc<Db>,
   mode: RwLock<Mode<T>>,
-  medoid: Id,
+  // This changes when we transition from BF to InMemory.
+  medoid: AtomicUsize,
   metric: Metric<T>,
   vamana_params: VamanaParams,
   additional_out_neighbors: DashMap<Id, Vec<Id>>,
@@ -119,7 +129,7 @@ impl<'a, T: Dtype> GreedySearchable<'a, T> for Index<T> {
   type Point = Array1<T>;
 
   fn medoid(&self) -> Id {
-    self.medoid
+    self.medoid.load(Ordering::Relaxed)
   }
 
   fn metric(&self) -> Metric<T> {
@@ -131,24 +141,24 @@ impl<'a, T: Dtype> GreedySearchable<'a, T> for Index<T> {
       return v.clone();
     }
     match &*self.mode.read() {
-      Mode::LTI { pq } => pq.get_pq_vec(id),
       Mode::InMemory { vectors, .. } => vectors.get(&id).unwrap().clone(),
+      Mode::LTI { pq } => pq.get_pq_vec(id),
     }
   }
 
   fn get_out_neighbors(&'a self, id: Id) -> (Self::Neighbors, Option<Self::FullVec>) {
     let temp = self.temp_out_neighbors.get(&id).map(|e| e.clone());
     let mut res = match &*self.mode.read() {
-      Mode::LTI { .. } => {
-        let n = self.db.read_node(id);
-        (temp.unwrap_or(n.neighbors), Some(Array1::from(n.vector)))
-      }
       Mode::InMemory { graph, .. } => {
         // TODO Avoid clones.
         (
           temp.unwrap_or_else(|| graph.get(&id).unwrap().clone()),
           None,
         )
+      }
+      Mode::LTI { .. } => {
+        let n = self.db.read_node(id);
+        (temp.unwrap_or(n.neighbors), Some(Array1::from(n.vector)))
       }
     };
     if let Some(add) = self.additional_out_neighbors.get(&id) {
@@ -205,8 +215,48 @@ impl<T: Dtype> RoxanneDb<T> {
         batch.1.extend(e.1);
         batch_signals.push(e.2);
       }
-
       let (batch_ids, batch_vecs, _) = batch;
+
+      // BruteForceIndex is wrapped in Arc so we can work on it while dropping the lock (so we can potentially replace it).
+      if let Some(index) = self.index.bf.read().clone() {
+        batch_ids.par_iter().zip(batch_vecs).for_each(|(&id, v)| {
+          index.insert(id, v);
+        });
+        if index.len() > self.cfg.brute_force_index_cap {
+          let ids = index.vectors().iter().map(|e| *e.key()).collect_vec();
+          let vecs = index
+            .vectors()
+            .iter()
+            .map(|e| e.value().clone())
+            .collect_vec();
+          let ann = InMemoryIndex::builder(ids.clone(), vecs)
+            .degree_bound(self.cfg.degree_bound)
+            .distance_threshold(self.cfg.distance_threshold)
+            .metric(self.index.metric)
+            .update_batch_size(self.cfg.update_batch_size)
+            .update_search_list_cap(self.cfg.update_search_list_cap)
+            .build();
+          let mut txn = DbTransaction::new();
+          txn.write_index_mode(DbIndexMode::InMemory);
+          txn.write_medoid(ann.medoid());
+          for id in ids {
+            txn.delete_brute_force_vec(id);
+            txn.write_node(id, &NodeData {
+              neighbors: ann.graph.get(&id).unwrap().clone(),
+              vector: ann.vectors.get(&id).unwrap().to_vec(),
+            });
+          }
+          txn.commit(&self.db);
+          *self.index.bf.write() = None;
+          self.index.medoid.store(ann.medoid(), Ordering::Relaxed);
+          *self.index.mode.write() = Mode::InMemory {
+            graph: ann.graph,
+            vectors: ann.vectors,
+          };
+        };
+        continue;
+      };
+
       let txn = Mutex::new(DbTransaction::new());
       let touched_nodes = DashSet::new();
       batch_ids
@@ -221,7 +271,7 @@ impl<T: Dtype> RoxanneDb<T> {
             1,
             self.index.vamana_params.update_search_list_cap,
             1,
-            self.index.medoid,
+            self.index.medoid.load(Ordering::Relaxed),
             |n| !self.deleted.contains(&n.id),
             Some(&mut candidates),
             None,
@@ -322,7 +372,7 @@ impl<T: Dtype> RoxanneDb<T> {
           drop(mat);
 
           let mut txn = DbTransaction::new();
-          txn.write_has_long_term_index();
+          txn.write_index_mode(DbIndexMode::LongTerm);
           txn.commit(&self.db);
 
           Some(Mode::LTI {
@@ -436,16 +486,30 @@ impl<T: Dtype> RoxanneDb<T> {
         additional_out_neighbors.insert(id, add);
       });
 
+    let mode = db.read_index_mode();
+
     let index = Index {
+      bf: RwLock::new(if mode == DbIndexMode::BruteForce {
+        let bf = BruteForceIndex::new(metric);
+        db.iter_brute_force_vecs::<T>()
+          .par_bridge()
+          .for_each(|(id, vec)| {
+            bf.insert(id, Array1::from_vec(vec));
+          });
+        Some(Arc::new(bf))
+      } else {
+        None
+      }),
       db: db.clone(),
-      medoid: db.read_medoid(),
+      // In BruteForce mode (e.g. init), there is no medoid.
+      medoid: db.maybe_read_medoid().unwrap_or(Id::MAX).into(),
       metric,
       vamana_params,
       additional_out_neighbors,
       additional_edge_count,
       temp_vecs: Default::default(),
       temp_out_neighbors: Default::default(),
-      mode: RwLock::new(if db.read_has_long_term_index() {
+      mode: RwLock::new(if mode == DbIndexMode::LongTerm {
         let pq = blobs.read_pq_model();
         Mode::LTI {
           pq: PqState {
@@ -455,8 +519,9 @@ impl<T: Dtype> RoxanneDb<T> {
           },
         }
       } else {
-        let graph = DashMap::new();
-        let vectors = DashMap::new();
+        // This also handles BruteForce mode (this'll be empty.)
+        let graph = Arc::new(DashMap::new());
+        let vectors = Arc::new(DashMap::new());
         db.iter_nodes().par_bridge().for_each(|(id, n)| {
           graph.insert(id, n.neighbors);
           vectors.insert(id, Array1::from_vec(n.vector));
@@ -476,7 +541,7 @@ impl<T: Dtype> RoxanneDb<T> {
       next_id: AtomicUsize::new(next_id),
       update_sender: send,
     });
-    std::thread::spawn({
+    thread::spawn({
       let roxanne = roxanne.clone();
       move || roxanne.updater_thread(recv)
     });
@@ -484,17 +549,20 @@ impl<T: Dtype> RoxanneDb<T> {
   }
 
   pub fn query(&self, query: &ArrayView1<T>, k: usize) -> Vec<PointDist> {
-    self.index.greedy_search(
-      Query::Vec(query),
-      k,
-      self.cfg.query_search_list_cap,
-      self.cfg.beam_width,
-      self.index.medoid(),
-      |n| !self.deleted.contains(&n.id),
-      None,
-      None,
-      None,
-    )
+    match self.index.bf.read().as_ref() {
+      Some(bf) => bf.query(query, k, |n| !self.deleted.contains(&n)),
+      None => self.index.greedy_search(
+        Query::Vec(query),
+        k,
+        self.cfg.query_search_list_cap,
+        self.cfg.beam_width,
+        self.index.medoid(),
+        |n| !self.deleted.contains(&n.id),
+        None,
+        None,
+        None,
+      ),
+    }
   }
 
   // Considerations:
@@ -572,7 +640,6 @@ mod tests {
   use ndarray::Array1;
   use rand::thread_rng;
   use rand::Rng;
-  use rand::RngCore;
   use std::fs;
   use std::path::PathBuf;
 
@@ -591,7 +658,9 @@ mod tests {
     };
 
     // Create and open DB.
-    fs::remove_dir_all(&dir).unwrap();
+    if fs::exists(&dir).unwrap() {
+      fs::remove_dir_all(&dir).unwrap();
+    }
     fs::create_dir(&dir).unwrap();
     fs::write(
       dir.join("roxanne.toml"),
