@@ -192,6 +192,7 @@ pub struct SearchMetrics {
 
 // These generics allow for owned and borrowed variants in various forms (e.g. DashMap::Ref, slice, ArrayView, &Array); the complexity allows for avoiding copying where possible, which gets really expensive for in-memory usages, while supporting copied owned data for reading from disk.
 pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
+  // TODO Use our own traits instead of Borrow. This way, we can have maximum flexibility: allow anything that can ultimately provide iterators, ArrayView.
   type Point: Borrow<Array1<T>>;
   type Neighbors: Borrow<Vec<Id>>;
   type FullVec: Borrow<Array1<T>>;

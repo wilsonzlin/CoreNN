@@ -2,8 +2,6 @@ use crate::common::Dtype;
 use crate::common::Id;
 use bitcode::Decode;
 use bitcode::Encode;
-use bytemuck::cast_slice;
-use ndarray::Array1;
 use rmp_serde::to_vec_named;
 use rocksdb::BlockBasedOptions;
 use rocksdb::DBPinnableSlice;
@@ -16,15 +14,13 @@ use std::path::Path;
 #[derive(PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum DbKeyT {
-  Deleted, // (Id)
+  AdditionalOutNeighbors, // (Id)
+  Deleted,                // (Id)
   HasLongTermIndex,
   Id,  // (Vec<u8>)
   Key, // (Id)
   Medoid,
-  Node,  // (Id)
-  PqVec, // (Id)
-  TempIndexCount,
-  WriteAheadLogVector, // (Id)
+  Node, // (Id)
 }
 
 pub trait DbKey {
@@ -76,6 +72,10 @@ impl DbTransaction {
     self.batch.delete(k.bytes());
   }
 
+  pub fn delete_additional_out_neighbors(&mut self, id: Id) {
+    self.delete_raw((DbKeyT::AdditionalOutNeighbors, id));
+  }
+
   pub fn delete_deleted(&mut self, id: Id) {
     self.delete_raw((DbKeyT::Deleted, id));
   }
@@ -100,24 +100,20 @@ impl DbTransaction {
     self.delete_raw((DbKeyT::Node, id));
   }
 
-  pub fn delete_pq_vec(&mut self, id: Id) {
-    self.delete_raw((DbKeyT::PqVec, id));
-  }
-
-  pub fn delete_temp_index_count(&mut self) {
-    self.delete_raw(DbKeyT::TempIndexCount);
-  }
-
-  pub fn delete_write_ahead_log_vector(&mut self, id: Id) {
-    self.delete_raw((DbKeyT::WriteAheadLogVector, id));
-  }
-
   fn write_raw(&mut self, k: impl DbKey, v: impl AsRef<[u8]>) {
     self.batch.put(k.bytes(), v);
   }
 
   fn write(&mut self, k: impl DbKey, v: &impl Serialize) {
     self.write_raw(k, to_vec_named(v).unwrap());
+  }
+
+  pub fn write_additional_out_neighbors(&mut self, id: Id, neighbors: &[Id]) {
+    // Use bitcode to squeeze even more byte savings, important for the purpose of AdditionalOutNeighbors.
+    self.write_raw(
+      (DbKeyT::AdditionalOutNeighbors, id),
+      bitcode::encode(neighbors),
+    );
   }
 
   pub fn write_deleted(&mut self, id: Id) {
@@ -142,18 +138,6 @@ impl DbTransaction {
 
   pub fn write_node<T: Dtype>(&mut self, id: Id, node: &NodeData<T>) {
     self.write_raw((DbKeyT::Node, id), node.serialize());
-  }
-
-  pub fn write_pq_vec(&mut self, id: Id, vec: Vec<u8>) {
-    self.write_raw((DbKeyT::PqVec, id), vec);
-  }
-
-  pub fn write_temp_index_count(&mut self, count: usize) {
-    self.write(DbKeyT::TempIndexCount, &count);
-  }
-
-  pub fn write_write_ahead_log_vector<T: Dtype>(&mut self, id: Id, vec: &[T]) {
-    self.write_raw((DbKeyT::WriteAheadLogVector, id), cast_slice(vec));
   }
 
   pub fn commit(self, db: &Db) {
@@ -239,6 +223,12 @@ impl Db {
       })
   }
 
+  pub fn iter_additional_out_neighbors(&self) -> impl Iterator<Item = (Id, Vec<Id>)> + '_ {
+    self.iter(DbKeyT::AdditionalOutNeighbors, |v| {
+      bitcode::decode(&v).unwrap()
+    })
+  }
+
   pub fn iter_deleted(&self) -> impl Iterator<Item = Id> + '_ {
     self.iter(DbKeyT::Deleted, |_| ()).map(|(id, _)| id)
   }
@@ -251,20 +241,19 @@ impl Db {
     self.iter(DbKeyT::Node, |v| NodeData::deserialize(&v))
   }
 
-  pub fn iter_write_ahead_log_vectors<T: Dtype>(
-    &self,
-  ) -> impl Iterator<Item = (Id, Array1<T>)> + '_ {
-    self.iter(DbKeyT::WriteAheadLogVector, |v| {
-      Array1::from_vec(cast_slice(&v).to_vec())
-    })
-  }
-
   fn maybe_read_raw(&self, k: impl DbKey) -> Option<DBPinnableSlice<'_>> {
     self.db.get_pinned(k.bytes()).unwrap()
   }
 
   fn read_raw(&self, k: impl DbKey) -> DBPinnableSlice<'_> {
     self.maybe_read_raw(k).unwrap()
+  }
+
+  pub fn read_additional_out_neighbors(&self, id: Id) -> Vec<Id> {
+    self
+      .maybe_read_raw((DbKeyT::AdditionalOutNeighbors, id))
+      .map(|raw| bitcode::decode(&raw).unwrap())
+      .unwrap_or_default()
   }
 
   pub fn read_deleted(&self, id: Id) -> bool {
@@ -293,20 +282,5 @@ impl Db {
   pub fn read_node<T: Dtype>(&self, id: Id) -> NodeData<T> {
     let raw = self.read_raw((DbKeyT::Node, id));
     NodeData::deserialize(&raw)
-  }
-
-  pub fn read_pq_vec(&self, id: Id) -> Vec<u8> {
-    let raw = self.read_raw((DbKeyT::PqVec, id));
-    raw.to_vec()
-  }
-
-  pub fn read_temp_index_count(&self) -> usize {
-    let raw = self.read_raw(DbKeyT::TempIndexCount);
-    rmp_serde::from_slice(&raw).unwrap()
-  }
-
-  pub fn read_write_ahead_log_vector<T: Dtype>(&self, id: Id) -> Vec<T> {
-    let raw = self.read_raw((DbKeyT::WriteAheadLogVector, id));
-    cast_slice(&raw).to_vec()
   }
 }

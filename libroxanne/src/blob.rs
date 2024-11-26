@@ -62,7 +62,6 @@ pub struct BlobStore {
 
 impl BlobStore {
   pub fn open(dir: PathBuf) -> Self {
-    fs::create_dir_all(dir.join("temp_indices")).unwrap();
     Self { dir }
   }
 
@@ -76,20 +75,6 @@ impl BlobStore {
     let mut s = rmp_serde::Serializer::new(&mut bw).with_struct_map();
     val.serialize(&mut s).unwrap();
     fs::rename(&p_tmp, p).unwrap();
-  }
-
-  pub fn read_temp_index<T: Dtype>(&self, id: usize) -> InMemoryIndexBlob<T> {
-    let raw = fs::read(self.dir.join("temp_indices").join(id.to_string())).unwrap();
-    from_slice(&raw).unwrap()
-  }
-
-  pub fn write_temp_index<T: Dtype>(&self, id: usize, blob: &InMemoryIndexBlob<T>) {
-    self.write(&format!("temp_indices/{id}"), blob);
-  }
-
-  pub fn delete_all_temp_indices(&self) {
-    fs::remove_dir_all(self.dir.join("temp_indices")).unwrap();
-    fs::create_dir_all(self.dir.join("temp_indices")).unwrap();
   }
 
   pub fn read_pq_model<T: Dtype + Float>(&self) -> ProductQuantizer<T> {

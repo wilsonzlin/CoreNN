@@ -5,6 +5,7 @@ use ahash::HashSetExt;
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
+use ordered_float::OrderedFloat;
 use std::collections::BinaryHeap;
 use std::io;
 use std::io::Read;
@@ -252,7 +253,7 @@ impl HnswIndex {
   }
 
   pub fn search_knn(&self, query: &[f32], k: usize, metric: impl Fn(&[f32], &[f32]) -> f64) {
-    let mut result = BinaryHeap::<(f64, LabelType)>::new();
+    let mut result = BinaryHeap::<(OrderedFloat<f64>, LabelType)>::new();
 
     let mut curr_obj = self.enter_point_node;
     let mut cur_dist = metric(query, &self.get_data_by_internal_id(curr_obj));

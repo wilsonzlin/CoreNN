@@ -43,7 +43,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
   /// WARNING: `candidate_ids` must not contain the point itself.
   fn compute_robust_pruned(
     &'a self,
-    node_id: Id,
+    node: Query<T>,
     candidate_ids: impl IntoIterator<Item = Id>,
   ) -> Vec<Id> {
     let degree_bound = self.params().degree_bound;
@@ -53,7 +53,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
       .into_iter()
       .map(|candidate_id| PointDist {
         id: candidate_id,
-        dist: self.dist(node_id, candidate_id),
+        dist: self.dist2(candidate_id, node),
       })
       .sorted_unstable_by_key(|s| OrderedFloat(s.dist))
       .collect::<VecDeque<_>>();
@@ -90,7 +90,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
     for batch in ids.chunks(self.params().update_batch_size) {
       #[derive(Default)]
       struct Update {
-        // These two aren't the same and can't be merged, as otherwise we can't tell whether we are supposed to replace or merge with the existing out-neighbors.
+        // These two aren't the same and can't be merged into one field, as otherwise we can't tell whether we are supposed to replace or merge with the existing out-neighbors.
         replacement_base: Option<Vec<Id>>,
         additional_edges: HashSet<Id>,
       }
@@ -121,7 +121,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
         // It's tempting to do this at the end once only, in case other points in this batch will add an edge to us (which means another round of RobustPrune),
         // but that means `new_neighbors` will be a lot bigger (it'll just be the unpruned raw candidate set),
         // which means dirtying a lot more other nodes (and also adding a lot of poor edges), ultimately spending more compute.
-        let new_neighbors = self.compute_robust_pruned(id, candidates);
+        let new_neighbors = self.compute_robust_pruned(Query::Id(id), candidates);
         for &j in new_neighbors.iter() {
           updates.entry(j).or_default().additional_edges.insert(id);
         }
@@ -142,7 +142,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
           };
         }
         if new_neighbors.len() > self.params().degree_bound {
-          new_neighbors = self.compute_robust_pruned(id, new_neighbors);
+          new_neighbors = self.compute_robust_pruned(Query::Id(id), new_neighbors);
         };
         self.set_out_neighbors(id, new_neighbors);
       });
