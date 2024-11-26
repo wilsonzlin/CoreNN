@@ -184,7 +184,7 @@ pub struct RoxanneDb<T: Dtype> {
   db: Arc<Db>,
   deleted: DashSet<Id>,
   index: Index<T>,
-  key_locks: ArbitraryLock<String, parking_lot::Mutex<()>>,
+  key_locks: ArbitraryLock<String, Mutex<()>>,
   next_id: AtomicUsize,
   update_sender: Sender<(Vec<Id>, Vec<Array1<T>>, Sender<()>)>,
 }
@@ -561,5 +561,52 @@ impl<T: Dtype> RoxanneDb<T> {
     };
 
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::cfg::RoxanneDbCfg;
+  use crate::RoxanneDb;
+  use itertools::Itertools;
+  use ndarray::Array1;
+  use rand::thread_rng;
+  use rand::Rng;
+  use rand::RngCore;
+  use std::fs;
+  use std::path::PathBuf;
+
+  #[test]
+  fn test_roxanne() {
+    // Parameters.
+    let dir = PathBuf::from("/dev/shm/roxannedb-test");
+    let dim = 512;
+    let pq_subspaces = 64;
+    let gen = || {
+      Array1::from_vec(
+        (0..dim)
+          .map(|_| thread_rng().gen_range(-1.0..1.0))
+          .collect_vec(),
+      )
+    };
+
+    // Create and open DB.
+    fs::remove_dir_all(&dir).unwrap();
+    fs::create_dir(&dir).unwrap();
+    fs::write(
+      dir.join("roxanne.toml"),
+      toml::to_string(&RoxanneDbCfg {
+        dim,
+        pq_subspaces,
+        ..Default::default()
+      })
+      .unwrap(),
+    )
+    .unwrap();
+    let db = RoxanneDb::open(dir);
+
+    // First test: an empty DB should provide no results.
+    let res = db.query(&gen().view(), 100);
+    assert_eq!(res.len(), 0);
   }
 }

@@ -36,3 +36,4 @@ toml = "0.8.19"
 
 [dev-dependencies]
 ndarray-rand = "0.14.0" # Version 0.15 depends on ndarray 0.16 which we cannot use (see above).
+ndarray-linalg = { version = "0.15.0", features = ["openblas"] } # For testing.

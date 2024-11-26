@@ -6,6 +6,7 @@ use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use ordered_float::OrderedFloat;
+use std::cmp::max;
 use std::collections::BinaryHeap;
 use std::io;
 use std::io::Read;
@@ -16,6 +17,34 @@ use std::ops::Range;
 pub type TableInt = u32; // This is the internal ID.
 pub type LinkListSizeInt = u32;
 pub type LabelType = usize; // This is the external ID.
+
+pub type Metric = fn(&[f32], &[f32]) -> f64;
+
+// Corresponds to `std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>` in hnswalg.h.
+#[derive(Default)]
+struct MaxHeap(BinaryHeap<(OrderedFloat<f64>, TableInt)>);
+
+impl MaxHeap {
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  pub fn len(&self) -> usize {
+    self.0.len()
+  }
+
+  pub fn push(&mut self, dist: f64, id: TableInt) {
+    self.0.push((OrderedFloat(dist), id));
+  }
+
+  pub fn pop(&mut self) -> Option<(f64, TableInt)> {
+    self.0.pop().map(|e| (e.0.0, e.1))
+  }
+
+  pub fn peek(&self) -> Option<(f64, TableInt)> {
+    self.0.peek().map(|e| (e.0.0, e.1))
+  }
+}
 
 trait ReadExt {
   fn read_usize(&mut self) -> io::Result<usize>;
@@ -44,6 +73,7 @@ fn get_external_label(
 #[derive(Debug)]
 pub struct HnswIndex {
   pub dim: usize,
+  pub metric: Metric,
 
   pub max_elements: usize,
   pub cur_element_count: usize,
@@ -74,7 +104,7 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
-  pub fn load(dim: usize, mut rd: impl Read) -> Self {
+  pub fn load(dim: usize, metric: Metric, mut rd: impl Read) -> Self {
     let offset_level_0 = rd.read_usize().unwrap();
     let max_elements = rd.read_usize().unwrap();
     let cur_element_count = rd.read_usize().unwrap();
@@ -125,6 +155,7 @@ impl HnswIndex {
 
     Self {
       dim,
+      metric,
       max_elements,
       cur_element_count,
       size_data_per_element,
@@ -252,9 +283,66 @@ impl HnswIndex {
     self.element_levels[internal_id as usize]
   }
 
-  pub fn search_knn(&self, query: &[f32], k: usize, metric: impl Fn(&[f32], &[f32]) -> f64) {
-    let mut result = BinaryHeap::<(OrderedFloat<f64>, LabelType)>::new();
+  fn search_base_layer_st_bare_bone(
+    &self,
+    ep_id: TableInt,
+    query: &[f32],
+    ef: usize,
+    hop_count: &mut usize,
+  ) -> MaxHeap {
+    let mut visited = HashSet::<TableInt>::new();
 
+    let mut top_candidates = MaxHeap::new();
+    let mut candidate_set = MaxHeap::new();
+
+    let ep_data = self.get_data_by_internal_id(ep_id);
+    let dist = (self.metric)(query, &ep_data);
+    let mut lower_bound = dist;
+    top_candidates.push(dist, ep_id);
+    candidate_set.push(-dist, ep_id);
+
+    visited.insert(ep_id);
+
+    while let Some(p) = candidate_set.pop() {
+      let candidate_dist = -p.0;
+      if candidate_dist > lower_bound {
+        break;
+      }
+      *hop_count += 1;
+
+      let current_node_id = p.1;
+      let data = self.get_link_list(current_node_id, 0);
+      for candidate_id in data {
+        if visited.insert(candidate_id) {
+          let curr_obj_1 = self.get_data_by_internal_id(candidate_id);
+          let dist = (self.metric)(query, &curr_obj_1);
+          let flag_consider_candidate = top_candidates.len() < ef || lower_bound > dist;
+          if flag_consider_candidate {
+            candidate_set.push(-dist, candidate_id);
+            top_candidates.push(dist, candidate_id);
+            let mut flag_remove_extra = top_candidates.len() > ef;
+            while flag_remove_extra {
+              top_candidates.pop().unwrap();
+              flag_remove_extra = top_candidates.len() > ef;
+            }
+            if let Some(p) = top_candidates.peek() {
+              lower_bound = p.0;
+            }
+          }
+        }
+      }
+    }
+
+    top_candidates
+  }
+
+  pub fn search_knn(
+    &self,
+    query: &[f32],
+    k: usize,
+    metric: impl Fn(&[f32], &[f32]) -> f64,
+    hop_count: &mut usize,
+  ) -> Vec<(LabelType, f64)> {
     let mut curr_obj = self.enter_point_node;
     let mut cur_dist = metric(query, &self.get_data_by_internal_id(curr_obj));
 
@@ -262,6 +350,7 @@ impl HnswIndex {
       let mut changed = true;
       while changed {
         changed = false;
+        *hop_count += 1;
 
         let data = self.get_link_list(curr_obj, level);
         for cand in data {
@@ -276,6 +365,19 @@ impl HnswIndex {
       }
     }
 
-    todo!()
+    let mut top_candidates =
+      self.search_base_layer_st_bare_bone(curr_obj, query, max(self.ef, k), hop_count);
+
+    while top_candidates.len() > k {
+      top_candidates.pop();
+    }
+
+    let mut res = Vec::new();
+    while let Some((dist, id)) = top_candidates.pop() {
+      let label = self.get_external_label(id);
+      res.push((label, dist));
+    }
+    res.reverse();
+    res
   }
 }
