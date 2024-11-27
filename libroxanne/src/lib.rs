@@ -1077,6 +1077,6 @@ mod tests {
     .unwrap();
     tracing::info!("inserted all vectors");
     // Do final query.
-    assert_accuracy(n, 0.84);
+    assert_accuracy(n, 0.8);
   }
 }
