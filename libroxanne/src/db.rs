@@ -295,9 +295,14 @@ impl Db {
     Some(rmp_serde::from_slice(&raw).unwrap())
   }
 
+  pub fn maybe_read_key(&self, id: Id) -> Option<String> {
+    self
+      .maybe_read_raw((DbKeyT::Key, id))
+      .map(|raw| String::from_utf8(raw.to_vec()).unwrap())
+  }
+
   pub fn read_key(&self, id: Id) -> String {
-    let raw = self.read_raw((DbKeyT::Key, id));
-    String::from_utf8(raw.to_vec()).unwrap()
+    self.maybe_read_key(id).unwrap()
   }
 
   pub fn maybe_read_medoid(&self) -> Option<Id> {

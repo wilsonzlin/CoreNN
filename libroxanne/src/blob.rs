@@ -62,6 +62,7 @@ pub struct BlobStore {
 
 impl BlobStore {
   pub fn open(dir: PathBuf) -> Self {
+    fs::create_dir_all(&dir).unwrap();
     Self { dir }
   }
 

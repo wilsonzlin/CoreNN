@@ -18,6 +18,11 @@ fn default_distance_threshold() -> f64 {
   1.1
 }
 
+fn default_in_memory_index_cap() -> usize {
+  // Approx. 128 GB of RAM if dim=512, dtype=fp16, degree_bound=80.
+  80_000_000
+}
+
 fn default_max_degree_bound() -> usize {
   160
 }
@@ -61,6 +66,8 @@ pub struct RoxanneDbCfg {
   pub dim: usize,
   #[serde(default = "default_distance_threshold")]
   pub distance_threshold: f64,
+  #[serde(default = "default_in_memory_index_cap")]
+  pub in_memory_index_cap: usize,
   #[serde(default = "default_max_degree_bound")]
   pub max_degree_bound: usize,
   #[serde(default = "default_merge_threshold_additional_edges")]
@@ -88,6 +95,7 @@ impl Default for RoxanneDbCfg {
       degree_bound: default_degree_bound(),
       dim: 0,
       distance_threshold: default_distance_threshold(),
+      in_memory_index_cap: default_in_memory_index_cap(),
       max_degree_bound: default_max_degree_bound(),
       merge_threshold_additional_edges: default_merge_threshold_additional_edges(),
       merge_threshold_deletes: default_merge_threshold_deletes(),

@@ -33,7 +33,9 @@ serde = { version = "1.0.210", features = ["derive", "rc"] }
 strum = "0.26.3"
 strum_macros = "0.26.4"
 toml = "0.8.19"
+tracing = "0.1.40"
 
 [dev-dependencies]
 ndarray-rand = "0.14.0" # Version 0.15 depends on ndarray 0.16 which we cannot use (see above).
 ndarray-linalg = { version = "0.15.0", features = ["openblas"] } # For testing.
+tracing-subscriber = "0.3.18"
