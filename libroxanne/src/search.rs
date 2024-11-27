@@ -3,6 +3,7 @@ use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PointDist;
 use crate::common::PrecomputedDists;
+use crate::util::insert_into_ordered_vecdeque;
 use ahash::HashSet;
 use ahash::HashSetExt;
 use dashmap::DashSet;
@@ -104,75 +105,6 @@ impl<'a, T: Dtype, G: GreedySearchable<'a, T>> QueryBuilder<'a, T, G> {
   }
 }
 
-pub fn insert_into_ordered_vecdeque<T: Clone, K: Ord>(
-  dest: &mut VecDeque<T>,
-  src: &[T],
-  key: impl Fn(&T) -> K,
-) {
-  for v in src.into_iter() {
-    // WARNING: We can't collect all positions and then insert by index descending, as that doesn't account for when multiple source values are inserted at the same position but between themselves are not sorted. This costs the same anyway because we need to do N insertions.
-    let pos = dest
-      .binary_search_by(|s| key(s).cmp(&key(v)))
-      .map_or_else(identity, identity);
-    dest.insert(pos, v.clone());
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn test_insert_into_ordered_vecdeque() {
-    // Empty destination.
-    let mut dest = VecDeque::new();
-    insert_into_ordered_vecdeque(&mut dest, &[3, 1, 4], |&x| x);
-    assert_eq!(dest.into_iter().collect::<Vec<_>>(), vec![1, 3, 4]);
-
-    // Empty source.
-    let mut dest = VecDeque::from(vec![1, 2, 3]);
-    insert_into_ordered_vecdeque(&mut dest, &[], |&x| x);
-    assert_eq!(dest.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
-
-    // Both empty.
-    let mut dest = VecDeque::<usize>::new();
-    insert_into_ordered_vecdeque(&mut dest, &[], |&x| x);
-    assert!(dest.is_empty());
-
-    // Interleaved values.
-    let mut dest = VecDeque::from(vec![2, 4, 6]);
-    insert_into_ordered_vecdeque(&mut dest, &[1, 3, 5], |&x| x);
-    assert_eq!(dest.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
-
-    // All duplicates.
-    let mut dest = VecDeque::from(vec![1, 1, 1]);
-    insert_into_ordered_vecdeque(&mut dest, &[1, 1], |&x| x);
-    assert_eq!(dest.into_iter().collect::<Vec<_>>(), vec![1, 1, 1, 1, 1]);
-
-    // All source elements larger.
-    let mut dest = VecDeque::from(vec![1, 2, 3]);
-    insert_into_ordered_vecdeque(&mut dest, &[4, 5, 6], |&x| x);
-    assert_eq!(dest.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
-
-    // All source elements smaller.
-    let mut dest = VecDeque::from(vec![4, 5, 6]);
-    insert_into_ordered_vecdeque(&mut dest, &[1, 2, 3], |&x| x);
-    assert_eq!(dest.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
-
-    // Custom key function.
-    let mut dest = VecDeque::from(vec!["aa", "cccc"]);
-    insert_into_ordered_vecdeque(&mut dest, &["bbb", "d"], |s| s.len());
-    assert_eq!(dest.into_iter().collect::<Vec<_>>(), vec![
-      "d", "aa", "bbb", "cccc"
-    ]);
-
-    // Single element source and dest.
-    let mut dest = VecDeque::from(vec![2]);
-    insert_into_ordered_vecdeque(&mut dest, &[1], |&x| x);
-    assert_eq!(dest.into_iter().collect::<Vec<_>>(), vec![1, 2]);
-  }
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SearchIterationMetrics {
   pub visited: usize,
@@ -190,17 +122,63 @@ pub struct SearchMetrics {
   pub iterations: Vec<SearchIterationMetrics>,
 }
 
+// Memory copying is really expensive, and can use a lot of unnecessary CPU (check profiler). But the issue is that graphs can be stored in many different types, so supporting some concept of "zero-cost" use, across references (e.g. in-memory) and owned values (e.g. copied after loading from disk), is hard.
+// Things I'd like to be able to use as points:
+// - Array1, ArrayView1
+// - CowArray1
+// - Array2.row(), ArrayView2.row()
+// - DashMap::Ref, DashMap::RefMut
+// Things I'd like to be able to use as neighbors:
+// - Vec<Id>, Box<Id>, Cow<[Id]>, [Id; N], &[Id], &mut [Id]
+// - HashSet<Id>, HashMap<Id, _>.keys()
+// - DashSet<Id>
+// - croaring::Bitmap
+// - (0..n)
+// - DashMap::Ref, DashMap::RefMut
+// - mapped from lock-held value
+// - ...anything iterable
+// Basically, it could be owned, borrowing something self owns, passing the ref to something self also borrows, within some container like a lock guard, something that can be DeRef'd or AsRef'd or Borrow'd into any of these, a consumable single-use dynamic iterator, a view/slice within some larger thing, etc. This requires decent flexibility with whatever type system approach we use.
+// Constraints:
+// - Rust does not allow implementing foreign traits on foreign types, only own traits on foreign types or foreign traits on own types.
+// - I'd prefer not to use some enum, which just offloads type-based dispatch to runtime and offers no extensibility to downstream users.
+// Possible approaches:
+// - Use a standard trait like Borrow<ArrayView1<T>>.
+//   - Downsides: most custom types don't support this, so I have to implement a lot of newtype wrappers (due to constraint).
+// - Create a new trait.
+//   - Allows implementing on most types without using a bunch of newtype wrappers. Downstream users will still need to wrap in a newtype, but we should impl for most common external/std library types.
+
+pub trait IVec<'a, T: Dtype> {
+  fn view(&'a self) -> ArrayView1<'a, T>;
+}
+
+impl<'a, T: Dtype> IVec<'a, T> for Array1<T> {
+  fn view(&self) -> ArrayView1<T> {
+    self.view()
+  }
+}
+
+impl<'a, T: Dtype> IVec<'a, T> for ArrayView1<'a, T> {
+  fn view(&'a self) -> ArrayView1<'a, T> {
+    self.clone()
+  }
+}
+
+impl<'a, T: Dtype> IVec<'a, T> for &'a [T] {
+  fn view(&'a self) -> ArrayView1<'a, T> {
+    ArrayView1::from(self)
+  }
+}
+
+pub trait GreedySearchable<T: Dtype>: Send + Sync + Sized {
 // These generics allow for owned and borrowed variants in various forms (e.g. DashMap::Ref, slice, ArrayView, &Array); the complexity allows for avoiding copying where possible, which gets really expensive for in-memory usages, while supporting copied owned data for reading from disk.
-pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
-  // TODO Use our own traits instead of Borrow. This way, we can have maximum flexibility: allow anything that can ultimately provide iterators, ArrayView.
-  type Point: Borrow<Array1<T>>;
-  type Neighbors: Borrow<Vec<Id>>;
-  type FullVec: Borrow<Array1<T>>;
+  type Point: for<'a> IVec<'a, T>;
+  type Neighbors: Iterator<Item=Id>;
+  type FullVec: for<'a> IVec<'a, T>;
 
   fn medoid(&self) -> Id;
   fn metric(&self) -> Metric<T>;
   fn get_point(&'a self, id: Id) -> Self::Point;
-  // If the graph supports it, provide full embedding for reranking as second return value.
+  // If the graph supports it, and get_point doesn't already provide the full embedding, provide full embedding for reranking as second return value.
   fn get_out_neighbors(&'a self, id: Id) -> (Self::Neighbors, Option<Self::FullVec>);
   fn precomputed_dists(&self) -> Option<&PrecomputedDists>;
   fn default_query_search_list_cap(&self) -> usize {

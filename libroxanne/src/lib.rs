@@ -63,6 +63,7 @@ pub mod pq;
 pub mod queue;
 pub mod search;
 pub mod vamana;
+pub mod util;
 
 #[derive(Debug)]
 pub enum RoxanneDbError {
