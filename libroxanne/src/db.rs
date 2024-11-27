@@ -3,15 +3,19 @@ use crate::common::Id;
 use bitcode::Decode;
 use bitcode::Encode;
 use bytemuck::cast_slice;
+use flume::r#async::RecvStream;
+use futures::Stream;
+use futures::StreamExt;
 use rmp_serde::to_vec_named;
 use rocksdb::BlockBasedOptions;
-use rocksdb::DBPinnableSlice;
 use rocksdb::Direction;
 use rocksdb::IteratorMode;
 use rocksdb::WriteBatchWithTransaction;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::task::spawn_blocking;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum DbIndexMode {
@@ -154,8 +158,9 @@ impl DbTransaction {
     self.write_raw((DbKeyT::Node, id), node.serialize());
   }
 
-  pub fn commit(self, db: &Db) {
-    db.db.write(self.batch).unwrap();
+  pub async fn commit(self, db: &Db) {
+    let db = db.db.clone();
+    spawn_blocking(move || db.write(self.batch)).await.unwrap();
   }
 }
 
@@ -203,12 +208,13 @@ fn rocksdb_options() -> rocksdb::Options {
 }
 
 pub struct Db {
-  db: rocksdb::DB,
+  // Use Arc so we can use spawn_blocking.
+  db: Arc<rocksdb::DB>,
 }
 
 impl Db {
-  pub fn open(dir: impl AsRef<Path>) -> Self {
-    let db = rocksdb::DB::open(&rocksdb_options(), dir).unwrap();
+  pub async fn open(dir: impl AsRef<Path> + Send + 'static) -> Self {
+    let db = spawn_blocking(move || rocksdb::DB::open(&rocksdb_options(), dir).unwrap()).await.unwrap().into();
     Db { db }
   }
 
@@ -216,103 +222,116 @@ impl Db {
     &self.db
   }
 
-  pub fn flush(&self) {
-    self.db.flush().unwrap();
+  pub async fn flush(&self) {
+    let db = self.db.clone();
+    spawn_blocking(move || db.flush().unwrap()).await.unwrap();
   }
 
-  fn iter<'a, T>(
+  fn iter<'a, T: Send + 'static>(
     &'a self,
     kt: DbKeyT,
-    parser: impl (Fn(Box<[u8]>) -> T) + 'a,
-  ) -> impl Iterator<Item = (Id, T)> + 'a {
-    self
-      .db
-      .full_iterator(IteratorMode::From(&[kt as u8], Direction::Forward))
-      .map(|e| e.unwrap())
-      .take_while(move |(k, _)| k[0] == (kt as u8))
-      .map(move |(k, v)| {
+    parser: impl (Fn(Box<[u8]>) -> T) + Send + 'static,
+  ) -> RecvStream<'a, (Id, T)> {
+    let db = self.db.clone();
+    let (send, recv) = flume::bounded(16);
+    spawn_blocking(move || {
+      for e in db.full_iterator(IteratorMode::From(&[kt as u8], Direction::Forward)) {
+        let (k, v) = e.unwrap();
+        if k[0] != (kt as u8) {
+          break;
+        }
         let id_raw = &k[1..];
         let id = Id::from_le_bytes(id_raw.try_into().unwrap());
-        (id, parser(v))
-      })
+        let Ok(_) = send.send((id, parser(v))) else {
+          break;
+        };
+      };
+    });
+    recv.into_stream()
   }
 
-  pub fn iter_additional_out_neighbors(&self) -> impl Iterator<Item = (Id, Vec<Id>)> + '_ {
+  pub fn iter_additional_out_neighbors(&self) -> RecvStream<(Id, Vec<Id>)> {
     self.iter(DbKeyT::AdditionalOutNeighbors, |v| {
       bitcode::decode(&v).unwrap()
     })
   }
 
-  pub fn iter_brute_force_vecs<T: Dtype>(&self) -> impl Iterator<Item = (Id, Vec<T>)> + '_ {
+  pub fn iter_brute_force_vecs<T: Dtype>(&self) -> RecvStream<(Id, Vec<T>)> {
     self.iter(DbKeyT::BruteForceVec, |v| cast_slice(&v).to_vec())
   }
 
-  pub fn iter_deleted(&self) -> impl Iterator<Item = Id> + '_ {
+  pub fn iter_deleted(&self) -> impl Stream<Item = Id> + '_ {
     self.iter(DbKeyT::Deleted, |_| ()).map(|(id, _)| id)
   }
 
-  pub fn iter_ids(&self) -> impl Iterator<Item = (Id, String)> + '_ {
+  pub fn iter_ids(&self) -> RecvStream<(Id, String)> {
     self.iter(DbKeyT::Id, |v| String::from_utf8(v.into_vec()).unwrap())
   }
 
-  pub fn iter_nodes<T: Dtype>(&self) -> impl Iterator<Item = (Id, NodeData<T>)> + '_ {
+  pub fn iter_nodes<T: Dtype>(&self) -> RecvStream<(Id, NodeData<T>)> {
     self.iter(DbKeyT::Node, |v| NodeData::deserialize(&v))
   }
 
-  fn maybe_read_raw(&self, k: impl DbKey) -> Option<DBPinnableSlice<'_>> {
-    self.db.get_pinned(k.bytes()).unwrap()
+  async fn maybe_read_raw(&self, k: impl DbKey) -> Option<Vec<u8>> {
+    let db = self.db.clone();
+    let key = k.bytes();
+    spawn_blocking(move || db.get(key).unwrap()).await.unwrap()
   }
 
-  fn read_raw(&self, k: impl DbKey) -> DBPinnableSlice<'_> {
-    self.maybe_read_raw(k).unwrap()
+  async fn read_raw(&self, k: impl DbKey) -> Vec<u8> {
+    self.maybe_read_raw(k).await.unwrap()
   }
 
-  pub fn read_additional_out_neighbors(&self, id: Id) -> Vec<Id> {
+  pub async fn read_additional_out_neighbors(&self, id: Id) -> Vec<Id> {
     self
       .maybe_read_raw((DbKeyT::AdditionalOutNeighbors, id))
+      .await
       .map(|raw| bitcode::decode(&raw).unwrap())
       .unwrap_or_default()
   }
 
-  pub fn read_brute_force_vec<T: Dtype>(&self, id: Id) -> Vec<T> {
-    let raw = self.read_raw((DbKeyT::BruteForceVec, id));
+  pub async fn read_brute_force_vec<T: Dtype>(&self, id: Id) -> Vec<T> {
+    let raw = self.read_raw((DbKeyT::BruteForceVec, id)).await;
     cast_slice(&raw).to_vec()
   }
 
-  pub fn read_index_mode(&self) -> DbIndexMode {
+  pub async fn read_index_mode(&self) -> DbIndexMode {
     self
       .maybe_read_raw(DbKeyT::IndexMode)
+      .await
       .map(|raw| rmp_serde::from_slice(&raw).unwrap())
       .unwrap_or(DbIndexMode::BruteForce)
   }
 
-  pub fn read_deleted(&self, id: Id) -> bool {
-    self.maybe_read_raw((DbKeyT::Deleted, id)).is_some()
+  pub async fn read_deleted(&self, id: Id) -> bool {
+    self.maybe_read_raw((DbKeyT::Deleted, id)).await.is_some()
   }
 
-  pub fn maybe_read_id(&self, key: &str) -> Option<Id> {
-    let raw = self.maybe_read_raw((DbKeyT::Id, key))?;
+  pub async fn maybe_read_id(&self, key: &str) -> Option<Id> {
+    let raw = self.maybe_read_raw((DbKeyT::Id, key)).await?;
     Some(rmp_serde::from_slice(&raw).unwrap())
   }
 
-  pub fn maybe_read_key(&self, id: Id) -> Option<String> {
+  pub async fn maybe_read_key(&self, id: Id) -> Option<String> {
     self
       .maybe_read_raw((DbKeyT::Key, id))
+      .await
       .map(|raw| String::from_utf8(raw.to_vec()).unwrap())
   }
 
-  pub fn read_key(&self, id: Id) -> String {
-    self.maybe_read_key(id).unwrap()
+  pub async fn read_key(&self, id: Id) -> String {
+    self.maybe_read_key(id).await.unwrap()
   }
 
-  pub fn maybe_read_medoid(&self) -> Option<Id> {
+  pub async fn maybe_read_medoid(&self) -> Option<Id> {
     self
       .maybe_read_raw(DbKeyT::Medoid)
+      .await
       .map(|raw| rmp_serde::from_slice(&raw).unwrap())
   }
 
-  pub fn read_node<T: Dtype>(&self, id: Id) -> NodeData<T> {
-    let raw = self.read_raw((DbKeyT::Node, id));
+  pub async fn read_node<T: Dtype>(&self, id: Id) -> NodeData<T> {
+    let raw = self.read_raw((DbKeyT::Node, id)).await;
     NodeData::deserialize(&raw)
   }
 }

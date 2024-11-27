@@ -8,6 +8,7 @@ use crate::util::IoIteratorExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
 use dashmap::DashSet;
+use futures::join;
 use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::ArrayView1;
@@ -300,9 +301,9 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
   }
 
   // Optimised custom function for k=1 and search_list_cap=1.
-  fn greedy_search_fast1(
-    &'a self,
-    query: Query<T>,
+  async fn greedy_search_fast1(
+    &self,
+    query: Query<'_, '_, T>,
     start: Id,
     filter: impl (Fn(Id) -> bool),
   ) -> Option<PointDist> {
@@ -310,7 +311,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
     // TODO Study impact of performance and accuracy compared to full exhaustive search with backtracking while filtered.
     let mut cur = PointDist {
       id: start,
-      dist: self.dist2(start, query),
+      dist: self.dist2(start, query).await,
     };
     // The optima cannot default to `start` as it may be filtered.
     let mut optima: Option<PointDist> = None;
@@ -318,7 +319,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
     seen.insert(start);
     loop {
       let cur_id = cur.id;
-      let (neighbors, full_vec) = self.get_out_neighbors(cur_id);
+      let (neighbors, full_vec) = self.get_out_neighbors(cur_id).await;
       if let Some(v) = full_vec {
         cur.dist = self.dist3(&v.view(), query);
       };
@@ -329,7 +330,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
         };
         let n = PointDist {
           id: n_id,
-          dist: self.dist2(n_id, query),
+          dist: self.dist2(n_id, query).await,
         };
         let not_filtered = filter(n.id);
         if not_filtered && !optima.is_some_and(|o| o.dist <= n.dist) {
@@ -350,9 +351,9 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
   // DiskANN paper, Algorithm 1: GreedySearch.
   // Returns a pair: (closest points, visited node IDs).
   // Filtered nodes will be visited and expanded but not considered for the final set of neighbors.
-  fn greedy_search(
-    &'a self,
-    query: Query<T>,
+  async fn greedy_search(
+    &self,
+    query: Query<'_, '_, T>,
     k: usize,
     search_list_cap: usize,
     beam_width: usize,
@@ -414,26 +415,24 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
         |s| OrderedFloat(s.dist),
       );
 
-      let new_unvisited = neighbors
-        .iter()
-        .filter_map(|neighbor| {
-          let neighbor = *neighbor;
-          // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
-          if all_visited.contains(&neighbor) {
-            return None;
-          };
-          if l_unvisited_set.contains(&neighbor) {
-            return None;
-          };
-          if ground_truth.is_some_and(|gt| gt.contains(&neighbor)) {
-            ground_truth_found.fetch_add(1, Ordering::Relaxed);
-          }
-          Some(PointDist {
-            id: neighbor,
-            dist: self.dist2(neighbor, query),
-          })
+      let mut new_unvisited = Vec::new();
+      for neighbor in neighbors.iter() {
+        let neighbor = *neighbor;
+        // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
+        if all_visited.contains(&neighbor) {
+          continue;
+        };
+        if l_unvisited_set.contains(&neighbor) {
+          continue;
+        };
+        if ground_truth.is_some_and(|gt| gt.contains(&neighbor)) {
+          ground_truth_found.fetch_add(1, Ordering::Relaxed);
+        }
+        new_unvisited.push(PointDist {
+          id: neighbor,
+          dist: self.dist2(neighbor, query).await,
         })
-        .collect_vec();
+      };
       l_unvisited_set.extend(new_unvisited.iter().map(|e| e.id));
       insert_into_ordered_vecdeque(&mut l_unvisited, &new_unvisited, |s| OrderedFloat(s.dist));
 
