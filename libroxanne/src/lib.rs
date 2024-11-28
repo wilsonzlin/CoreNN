@@ -37,6 +37,8 @@ use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use search::GreedySearchable;
+use search::INeighbors;
+use search::IVec;
 use search::Query;
 use std::cmp::max;
 use std::cmp::min;
@@ -49,6 +51,8 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
+use util::ArcMap;
+use util::IoIteratorExt;
 use vamana::Vamana;
 use vamana::VamanaParams;
 
@@ -62,8 +66,8 @@ pub mod in_memory;
 pub mod pq;
 pub mod queue;
 pub mod search;
-pub mod vamana;
 pub mod util;
+pub mod vamana;
 
 #[derive(Debug)]
 pub enum RoxanneDbError {
@@ -124,10 +128,63 @@ struct Index<T: Dtype> {
   temp_nodes: DashMap<Id, (Vec<Id>, Array1<T>)>,
 }
 
+enum IndexPoint<'a, T> {
+  LTI(Array1<T>),
+  Temp(dashmap::mapref::one::Ref<'a, Id, (Vec<Id>, Array1<T>)>),
+  // I'd prefer to use MappedRwLockReadGuard but we're blocked on https://github.com/Amanieu/parking_lot/issues/289.
+  InMemory(ArcMap<DashMap<Id, Array1<T>>, dashmap::mapref::one::Ref<'a, Id, Array1<T>>>),
+}
+
+impl<'a, T: Dtype> IVec<T> for IndexPoint<'a, T> {
+  fn view(&self) -> ArrayView1<T> {
+    match self {
+      IndexPoint::LTI(v) => v.view(),
+      IndexPoint::Temp(v) => v.value().1.view(),
+      IndexPoint::InMemory(v) => v.value().view(),
+    }
+  }
+}
+
+enum IndexNeighborsBase<'a, T> {
+  Temp(dashmap::mapref::one::Ref<'a, Id, (Vec<Id>, Array1<T>)>),
+  // I'd prefer to use MappedRwLockReadGuard but we're blocked on https://github.com/Amanieu/parking_lot/issues/289.
+  InMemory(ArcMap<DashMap<Id, Vec<Id>>, dashmap::mapref::one::Ref<'a, Id, Vec<Id>>>),
+  LTI(Vec<Id>),
+}
+
+struct IndexNeighbors<'a, T> {
+  base: IndexNeighborsBase<'a, T>,
+  add: Option<dashmap::mapref::one::Ref<'a, Id, Vec<Id>>>,
+}
+
+impl<'a, T> IndexNeighbors<'a, T> {
+  fn iter_add(&self) -> impl Iterator<Item = Id> + '_ {
+    match &self.add {
+      Some(e) => e.value().as_slice(),
+      None => &[],
+    }
+    .iter()
+    .map(|e| *e)
+  }
+}
+
+impl<'a, T> INeighbors for IndexNeighbors<'a, T> {
+  fn iter(&self) -> impl Iterator<Item = Id> {
+    match &self.base {
+      IndexNeighborsBase::InMemory(e) => e.value().as_slice(),
+      IndexNeighborsBase::LTI(v) => v.as_slice(),
+      IndexNeighborsBase::Temp(e) => e.value().0.as_slice(),
+    }
+    .iter()
+    .map(|e| *e)
+    .chain(self.iter_add())
+  }
+}
+
 impl<'a, T: Dtype> GreedySearchable<'a, T> for Index<T> {
   type FullVec = Array1<T>;
-  type Neighbors = Vec<Id>;
-  type Point = Array1<T>;
+  type Neighbors = IndexNeighbors<'a, T>;
+  type Point = IndexPoint<'a, T>;
 
   fn medoid(&self) -> Id {
     self.medoid.load(Ordering::Relaxed)
@@ -139,12 +196,13 @@ impl<'a, T: Dtype> GreedySearchable<'a, T> for Index<T> {
 
   fn get_point(&'a self, id: Id) -> Self::Point {
     if let Some(temp) = self.temp_nodes.get(&id) {
-      // TODO Avoid clone.
-      return temp.1.clone();
+      return IndexPoint::Temp(temp);
     }
     match &*self.mode.read() {
-      Mode::InMemory { vectors, .. } => vectors.get(&id).unwrap().clone(),
-      Mode::LTI { pq } => pq.get_pq_vec(id),
+      Mode::InMemory { vectors, .. } => {
+        IndexPoint::InMemory(ArcMap::map(vectors.clone(), |v| v.get(&id).unwrap()))
+      }
+      Mode::LTI { pq } => IndexPoint::LTI(pq.get_pq_vec(id)),
     }
   }
 
@@ -152,23 +210,35 @@ impl<'a, T: Dtype> GreedySearchable<'a, T> for Index<T> {
     if let Some(temp) = self.temp_nodes.get(&id) {
       // We don't need to add additional_out_neighbors, as temp_nodes is a full override.
       // We don't need to return a full vector as it's not from the disk.
-      // TODO Avoid clone.
-      return (temp.0.clone(), None);
+      return (
+        IndexNeighbors {
+          base: IndexNeighborsBase::Temp(temp),
+          add: None,
+        },
+        None,
+      );
     }
-    let mut res = match &*self.mode.read() {
-      Mode::InMemory { graph, .. } => {
-        // TODO Avoid clones.
-        (graph.get(&id).unwrap().clone(), None)
-      }
+    match &*self.mode.read() {
+      Mode::InMemory { graph, .. } => (
+        IndexNeighbors {
+          base: IndexNeighborsBase::InMemory(ArcMap::map(Arc::clone(&graph), |g| {
+            g.get(&id).unwrap()
+          })),
+          add: self.additional_out_neighbors.get(&id),
+        },
+        None,
+      ),
       Mode::LTI { .. } => {
         let n = self.db.read_node(id);
-        (n.neighbors, Some(Array1::from(n.vector)))
+        (
+          IndexNeighbors {
+            base: IndexNeighborsBase::LTI(n.neighbors),
+            add: self.additional_out_neighbors.get(&id),
+          },
+          Some(Array1::from(n.vector)),
+        )
       }
-    };
-    if let Some(add) = self.additional_out_neighbors.get(&id) {
-      res.0.extend(add.iter());
     }
-    res
   }
 
   fn precomputed_dists(&self) -> Option<&PrecomputedDists> {
@@ -313,7 +383,7 @@ impl<T: Dtype> RoxanneDb<T> {
               pq.pq_vecs.insert(id, pq.pq.encode_1(&v.view()));
             }
           }
-          for &j in neighbors.iter() {
+          for j in neighbors.iter() {
             // `id` cannot have existed in any existing out-neighbors of any node as it has just been created, so we don't need to check if it doesn't already exist in `out(j)` first.
             self
               .index
@@ -334,8 +404,9 @@ impl<T: Dtype> RoxanneDb<T> {
         });
       let flushed_adds_count = AtomicUsize::new(0);
       let touched_count = touched_nodes.len();
-      touched_nodes.into_par_iter().for_each(|id| {
-        let (mut new_neighbors, full_vec) = self.index.get_out_neighbors(id);
+      touched_nodes.into_iter().io_for_each(|id| {
+        let (new_neighbors, full_vec) = self.index.get_out_neighbors(id);
+        let mut new_neighbors = new_neighbors.into_vec();
         // Clone so we can remove later if necessary (otherwise we'll deadlock).
         let add_neighbors = self
           .index
@@ -351,16 +422,24 @@ impl<T: Dtype> RoxanneDb<T> {
         } else {
           flushed_adds_count.fetch_add(1, Ordering::Relaxed);
           // At this point, compute_robust_pruned will likely look up the vectors for our newly inserted vectors, which is why we have temp_nodes.
-          new_neighbors = self
-            .index
-            .compute_robust_pruned(Query::Id(id), new_neighbors);
+          // Run in Rayon as we're currently in the I/O thread pool with thousands of threads, and this is CPU-bound, so we can't be running thousands of these.
+          let mut robust_pruned = Vec::new();
+          rayon::scope(|s| {
+            s.spawn(|_| {
+              robust_pruned = self
+                .index
+                .compute_robust_pruned(Query::Id(id), new_neighbors)
+            })
+          });
+          new_neighbors = robust_pruned;
           let mut txn = txn.lock();
           txn.write_node(id, &NodeData {
             neighbors: new_neighbors.clone(),
             // If LTI, full_vec will be Some; if in-memory, use get_point.
             vector: full_vec
-              .unwrap_or_else(|| self.index.get_point(id))
-              .to_vec(),
+              .map(|v| v.into_raw_vec())
+              // TODO Avoid cloning. (write_node should take a `&[T]`.)
+              .unwrap_or_else(|| self.index.get_point(id).into_vec()),
           });
           txn.delete_additional_out_neighbors(id);
           drop(txn);
@@ -485,7 +564,7 @@ impl<T: Dtype> RoxanneDb<T> {
 
           let mut deleted_neighbors = Vec::new();
           let new_neighbors = DashSet::new();
-          for &n in node.neighbors.iter() {
+          for n in node.neighbors.iter() {
             if deleted.contains(&n) {
               deleted_neighbors.push(n);
             } else {
@@ -509,8 +588,7 @@ impl<T: Dtype> RoxanneDb<T> {
               };
             }
           }
-          // TODO I/O parallelism using Rayon: no no.
-          deleted_neighbors.par_iter().for_each(|&n_id| {
+          deleted_neighbors.into_iter().io_for_each(|n_id| {
             for n in self.db.read_node::<T>(n_id).neighbors {
               if !deleted.contains(&n) {
                 new_neighbors.insert(n);
@@ -669,12 +747,11 @@ impl<T: Dtype> RoxanneDb<T> {
         None,
       ),
     };
-    // TODO Using rayon for I/O, tsk tsk tsk.
     res
-      .into_par_iter()
+      .into_iter()
       // A node may have been deleted during the query (already collected, so didn't get filtered), or literally just after the end of the query but before here.
       // TODO DOCUMENT: it's possible to get less than k for the above reason.
-      .filter_map(|r| self.db.maybe_read_key(r.id).map(|k| (k, r.dist)))
+      .io_filter_map(|r| self.db.maybe_read_key(r.id).map(|k| (k, r.dist)))
       .collect()
   }
 

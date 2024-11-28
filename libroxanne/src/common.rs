@@ -2,14 +2,11 @@ use ahash::HashMap;
 use bitcode::Decode;
 use bitcode::Encode;
 use bytemuck::Pod;
-use dashmap::mapref::one::Ref;
-use dashmap::mapref::one::RefMut;
 use linfa::Float;
 use ndarray::ArrayView1;
 use ndarray_linalg::Scalar;
 use serde::Deserialize;
 use serde::Serialize;
-use std::borrow::Borrow;
 use strum_macros::Display;
 use strum_macros::EnumString;
 
@@ -105,23 +102,5 @@ impl PrecomputedDists {
     let ia = self.id_to_no[&a];
     let ib = self.id_to_no[&b];
     self.matrix_flat[ia * n + ib].into()
-  }
-}
-
-// dashmap::Ref and RefMut do not implement Borrow, only Deref, so we create wrapper newtypes to implement Borrow.
-
-pub struct DashMapValue<'a, V>(pub Ref<'a, Id, V>);
-
-impl<'a, V> Borrow<V> for DashMapValue<'a, V> {
-  fn borrow(&self) -> &V {
-    self.0.value()
-  }
-}
-
-pub struct DashMapValueMut<'a, V>(pub RefMut<'a, Id, V>);
-
-impl<'a, V> Borrow<V> for DashMapValueMut<'a, V> {
-  fn borrow(&self) -> &V {
-    self.0.value()
   }
 }

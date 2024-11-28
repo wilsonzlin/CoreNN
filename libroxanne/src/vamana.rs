@@ -2,6 +2,7 @@ use crate::common::Dtype;
 use crate::common::Id;
 use crate::common::PointDist;
 use crate::search::GreedySearchable;
+use crate::search::INeighbors;
 use crate::search::Query;
 use ahash::HashSet;
 use ahash::HashSetExt;
@@ -17,7 +18,6 @@ use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
-use std::borrow::Borrow;
 use std::collections::VecDeque;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,7 +113,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
 
         // RobustPrune.
         // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
-        for &n in self.get_out_neighbors(id).0.borrow() {
+        for n in self.get_out_neighbors(id).0.iter() {
           candidates.insert(n);
         }
         // RobustPrune requires that the point itself is never in the candidate set.
@@ -122,7 +122,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
         // but that means `new_neighbors` will be a lot bigger (it'll just be the unpruned raw candidate set),
         // which means dirtying a lot more other nodes (and also adding a lot of poor edges), ultimately spending more compute.
         let new_neighbors = self.compute_robust_pruned(Query::Id(id), candidates);
-        for &j in new_neighbors.iter() {
+        for j in new_neighbors.iter() {
           updates.entry(j).or_default().additional_edges.insert(id);
         }
         updates.entry(id).or_default().replacement_base = Some(new_neighbors);
@@ -135,7 +135,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
       updates.into_par_iter().for_each(|(id, u)| {
         let mut new_neighbors = u
           .replacement_base
-          .unwrap_or_else(|| self.get_out_neighbors(id).0.borrow().clone());
+          .unwrap_or_else(|| self.get_out_neighbors(id).0.into_vec());
         for j in u.additional_edges {
           if !new_neighbors.contains(&j) {
             new_neighbors.push(j);

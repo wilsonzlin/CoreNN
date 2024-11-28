@@ -6,7 +6,6 @@ use ahash::HashMap;
 use hnswlib_rs::HnswIndex;
 use hnswlib_rs::LabelType;
 use itertools::Itertools;
-use ndarray::Array1;
 
 pub struct HnswGraph<'h> {
   hnsw: &'h HnswIndex,
@@ -61,10 +60,10 @@ impl<'h> HnswGraph<'h> {
   }
 }
 
-impl<'h, 'a> GreedySearchable<'a, f32> for HnswGraph<'h> {
-  type FullVec = Array1<f32>;
-  type Neighbors = &'a Vec<LabelType>;
-  type Point = Array1<f32>;
+impl<'a, 'h> GreedySearchable<'a, f32> for HnswGraph<'h> {
+  type FullVec = &'a [f32];
+  type Neighbors = &'a [LabelType];
+  type Point = &'a [f32];
 
   fn medoid(&self) -> Id {
     self.hnsw.entry_label()
@@ -75,7 +74,7 @@ impl<'h, 'a> GreedySearchable<'a, f32> for HnswGraph<'h> {
   }
 
   fn get_point(&'a self, id: Id) -> Self::Point {
-    Array1::from_vec(self.hnsw.get_data_by_label(id))
+    self.hnsw.get_data_by_label(id)
   }
 
   fn get_out_neighbors(&'a self, id: Id) -> (Self::Neighbors, Option<Self::FullVec>) {

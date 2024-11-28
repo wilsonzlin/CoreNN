@@ -2,7 +2,7 @@ use ahash::HashMap;
 use ahash::HashMapExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
-use byteorder::ByteOrder;
+use bytemuck::cast_slice;
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use ordered_float::OrderedFloat;
@@ -221,18 +221,16 @@ impl HnswIndex {
     self.get_raw_data_by_internal_id(self.get_internal_id(label))
   }
 
-  fn get_data_by_internal_id(&self, internal_id: TableInt) -> Vec<f32> {
+  fn get_data_by_internal_id(&self, internal_id: TableInt) -> &[f32] {
     let ptr = self.get_raw_data_by_internal_id(internal_id);
-    let mut vec = vec![0.0f32; self.dim];
-    LittleEndian::read_f32_into(&ptr[..4 * self.dim], &mut vec);
-    vec
+    cast_slice(&ptr[..4 * self.dim])
   }
 
-  pub fn get_data_by_label(&self, label: LabelType) -> Vec<f32> {
+  pub fn get_data_by_label(&self, label: LabelType) -> &[f32] {
     self.get_data_by_internal_id(self.get_internal_id(label))
   }
 
-  fn get_link_list(&self, internal_id: TableInt, level: usize) -> Vec<TableInt> {
+  fn get_link_list(&self, internal_id: TableInt, level: usize) -> &[TableInt] {
     let ptr = if level == 0 {
       // Source: get_linklist0.
       &self.data_level_0_memory
@@ -244,9 +242,7 @@ impl HnswIndex {
     };
     // Source: getListCount.
     let cnt = u16::from_le_bytes(ptr[..2].try_into().unwrap()) as usize;
-    let mut lst = vec![0; cnt];
-    LittleEndian::read_u32_into(&ptr[4..4 + cnt * size_of::<TableInt>()], &mut lst);
-    lst
+    cast_slice(&ptr[4..4 + cnt * size_of::<TableInt>()])
   }
 
   pub fn get_level_neighbors(
@@ -258,7 +254,7 @@ impl HnswIndex {
     let neighbors = self.get_link_list(internal_id, level);
     neighbors
       .into_iter()
-      .map(|internal_id| self.get_external_label(internal_id))
+      .map(|&internal_id| self.get_external_label(internal_id))
   }
 
   // Provide `min_level` > 0 to filter out all nodes at lower levels and edges to them.
@@ -268,7 +264,7 @@ impl HnswIndex {
     // Source: searchKnn and searchBaseLayerST (called by searchKnn).
     for level in min_level..=self.get_node_level(label) {
       let list = self.get_link_list(internal_id, level);
-      for internal_id in list {
+      for &internal_id in list {
         let id = self.get_external_label(internal_id);
         // There should be no edges to lower level nodes as that should only be possible by looking at the out-neighbor list at a lower level.
         debug_assert!(self.get_node_level(id) >= min_level);
@@ -312,7 +308,7 @@ impl HnswIndex {
 
       let current_node_id = p.1;
       let data = self.get_link_list(current_node_id, 0);
-      for candidate_id in data {
+      for &candidate_id in data {
         if visited.insert(candidate_id) {
           let curr_obj_1 = self.get_data_by_internal_id(candidate_id);
           let dist = (self.metric)(query, &curr_obj_1);
@@ -353,8 +349,8 @@ impl HnswIndex {
         *hop_count += 1;
 
         let data = self.get_link_list(curr_obj, level);
-        for cand in data {
-          let d = metric(query, &self.get_data_by_internal_id(cand));
+        for &cand in data {
+          let d = metric(query, self.get_data_by_internal_id(cand));
 
           if d < cur_dist {
             cur_dist = d;

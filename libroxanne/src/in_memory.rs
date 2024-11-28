@@ -1,5 +1,4 @@
 use crate::common::metric_euclidean;
-use crate::common::DashMapValue;
 use crate::common::Dtype;
 use crate::common::Id;
 use crate::common::Metric;
@@ -7,6 +6,7 @@ use crate::common::PrecomputedDists;
 use crate::search::GreedySearchable;
 use crate::vamana::Vamana;
 use crate::vamana::VamanaParams;
+use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use ndarray::Array1;
 use ordered_float::OrderedFloat;
@@ -202,9 +202,9 @@ impl<T: Dtype> InMemoryIndex<T> {
 }
 
 impl<'a, T: Dtype> GreedySearchable<'a, T> for InMemoryIndex<T> {
-  type FullVec = DashMapValue<'a, Array1<T>>;
-  type Neighbors = DashMapValue<'a, Vec<Id>>;
-  type Point = DashMapValue<'a, Array1<T>>;
+  type FullVec = Ref<'a, Id, Array1<T>>;
+  type Neighbors = Ref<'a, Id, Vec<Id>>;
+  type Point = Ref<'a, Id, Array1<T>>;
 
   fn medoid(&self) -> Id {
     self.medoid
@@ -219,11 +219,11 @@ impl<'a, T: Dtype> GreedySearchable<'a, T> for InMemoryIndex<T> {
   }
 
   fn get_point(&'a self, id: Id) -> Self::Point {
-    DashMapValue(self.vectors.get(&id).unwrap())
+    self.vectors.get(&id).unwrap()
   }
 
   fn get_out_neighbors(&'a self, id: Id) -> (Self::Neighbors, Option<Self::FullVec>) {
-    (DashMapValue(self.graph.get(&id).unwrap()), None)
+    (self.graph.get(&id).unwrap(), None)
   }
 }
 
