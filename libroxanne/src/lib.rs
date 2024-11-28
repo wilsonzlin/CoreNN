@@ -33,7 +33,6 @@ use rand::thread_rng;
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
-use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use search::GreedySearchable;
@@ -44,6 +43,7 @@ use std::cmp::max;
 use std::cmp::min;
 use std::collections::BTreeMap;
 use std::fs;
+use std::iter::zip;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -553,60 +553,64 @@ impl<T: Dtype> RoxanneDb<T> {
 
       // In RocksDB, iterators view a snapshot of the entire DB at the time of iterator creation, so we can safely modify DB entries during iteration. https://github.com/facebook/rocksdb/wiki/Iterator
       let touched = AtomicUsize::new(0);
-      self
-        .db
-        .iter_nodes::<T>()
-        .par_bridge()
-        .for_each(|(id, node)| {
-          if deleted.contains(&id) {
-            return;
-          };
+      // We iterate all nodes, as we don't know which nodes have edges to a node in `deleted` (backedges do exist but are regularly pruned). This is the approach in the FreshDiskANN paper.
+      self.db.iter_nodes::<T>().io_for_each(|(id, node)| {
+        if deleted.contains(&id) {
+          return;
+        };
 
-          let mut deleted_neighbors = Vec::new();
-          let new_neighbors = DashSet::new();
-          for n in node.neighbors.iter() {
-            if deleted.contains(&n) {
-              deleted_neighbors.push(n);
-            } else {
+        let mut deleted_neighbors = Vec::new();
+        let new_neighbors = DashSet::new();
+        for n in node.neighbors.iter() {
+          if deleted.contains(&n) {
+            deleted_neighbors.push(n);
+          } else {
+            new_neighbors.insert(n);
+          };
+        }
+        let add = self.index.additional_out_neighbors.remove(&id).map(|e| e.1);
+        if add.is_none() && deleted_neighbors.is_empty() {
+          // Node is untouched.
+          return;
+        };
+        touched.fetch_add(1, Ordering::Relaxed);
+        if let Some(add) = add {
+          self
+            .index
+            .additional_edge_count
+            .fetch_sub(add.len(), Ordering::Relaxed);
+          for n in add {
+            if !deleted.contains(&n) {
               new_neighbors.insert(n);
             };
           }
-          let add = self.index.additional_out_neighbors.remove(&id).map(|e| e.1);
-          if add.is_none() && deleted_neighbors.is_empty() {
-            // Node is untouched.
-            return;
-          };
-          touched.fetch_add(1, Ordering::Relaxed);
-          if let Some(add) = add {
-            self
-              .index
-              .additional_edge_count
-              .fetch_sub(add.len(), Ordering::Relaxed);
-            for n in add {
-              if !deleted.contains(&n) {
-                new_neighbors.insert(n);
-              };
-            }
+        }
+        deleted_neighbors.into_iter().io_for_each(|n_id| {
+          for n in self.db.read_node::<T>(n_id).neighbors {
+            if !deleted.contains(&n) {
+              new_neighbors.insert(n);
+            };
           }
-          deleted_neighbors.into_iter().io_for_each(|n_id| {
-            for n in self.db.read_node::<T>(n_id).neighbors {
-              if !deleted.contains(&n) {
-                new_neighbors.insert(n);
-              };
-            }
-          });
-          let new_neighbors = self
-            .index
-            .compute_robust_pruned(Query::Id(id), new_neighbors);
-
-          let mut txn = DbTransaction::new();
-          txn.write_node(id, &NodeData {
-            neighbors: new_neighbors,
-            vector: node.vector,
-          });
-          txn.delete_additional_out_neighbors(id);
-          txn.commit(&self.db);
         });
+        // We're in thousands of I/O threads right now, and this is CPU-parallel work, so use Rayon.
+        let mut robust_pruned = Vec::new();
+        rayon::scope(|s| {
+          s.spawn(|_| {
+            robust_pruned = self
+              .index
+              .compute_robust_pruned(Query::Id(id), new_neighbors);
+          })
+        });
+        let new_neighbors = robust_pruned;
+
+        let mut txn = DbTransaction::new();
+        txn.write_node(id, &NodeData {
+          neighbors: new_neighbors,
+          vector: node.vector,
+        });
+        txn.delete_additional_out_neighbors(id);
+        txn.commit(&self.db);
+      });
 
       let mut txn = DbTransaction::new();
       for &id in deleted.iter() {
@@ -767,36 +771,32 @@ impl<T: Dtype> RoxanneDb<T> {
     let ids_base = self.next_id.fetch_add(n, Ordering::Relaxed);
     let ids = (0..n).map(|i| ids_base + i).collect_vec();
 
-    let mut entries = entries.into_iter().collect_vec();
+    let vectors = zip(ids.clone(), entries)
+      .io_map(|(id, (k, v))| {
+        let locker = self.key_locks.get(k.clone());
+        let _lock = locker.lock();
+        // TODO FIX/DOCUMENT: For simplicity and performance reasons, the deletion of an existing vector with the same key is **not** atomic; always retry inserts. The alternative seems to be to hold a lock on the key for the entirety of its insert in updater_thread.
+        let mut txn = DbTransaction::new();
+        if let Some(ex_id) = self.db.maybe_read_id(&k) {
+          txn.write_deleted(ex_id);
+          txn.delete_key(ex_id);
+          self.deleted.insert(id);
+        };
+        // CORRECTNESS: even though we haven't actually inserted anything at ID, it's safe to commit the key <-> ID link now, as:
+        // - We don't support retrieving vectors by key.
+        // - If it gets marked as deleted later, that's fine as our algorithm doesn't expect delete-marked nodes to exist (even during merging).
+        // - No result will come back with this ID.
+        txn.write_key(id, &k);
+        txn.write_id(&k, id);
+        txn.commit(&self.db);
 
-    entries.par_iter_mut().enumerate().for_each(|(i, (k, v))| {
-      // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
-      v.mapv_inplace(nan_to_num);
-
-      let id = ids_base + i;
-      let locker = self.key_locks.get(k.clone());
-      let _lock = locker.lock();
-      // TODO FIX/DOCUMENT: For simplicity and performance reasons, the deletion of an existing vector with the same key is **not** atomic; always retry inserts. The alternative seems to be to hold a lock on the key for the entirety of its insert in updater_thread.
-      let mut txn = DbTransaction::new();
-      if let Some(ex_id) = self.db.maybe_read_id(&k) {
-        txn.write_deleted(ex_id);
-        txn.delete_key(ex_id);
-        self.deleted.insert(id);
-      };
-      // CORRECTNESS: even though we haven't actually inserted anything at ID, it's safe to commit the key <-> ID link now, as:
-      // - We don't support retrieving vectors by key.
-      // - If it gets marked as deleted later, that's fine as our algorithm doesn't expect delete-marked nodes to exist (even during merging).
-      // - No result will come back with this ID.
-      txn.write_key(id, &k);
-      txn.write_id(&k, id);
-      txn.commit(&self.db);
-    });
+        // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
+        v.mapv(nan_to_num)
+      })
+      .collect();
 
     let (tx, rx) = std::sync::mpsc::channel();
-    self
-      .update_sender
-      .send((ids, entries.into_iter().map(|e| e.1).collect(), tx))
-      .unwrap();
+    self.update_sender.send((ids, vectors, tx)).unwrap();
     rx.recv().unwrap();
     Ok(())
   }
