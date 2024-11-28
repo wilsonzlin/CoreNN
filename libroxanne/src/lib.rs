@@ -51,6 +51,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 use util::ArcMap;
 use util::IoIteratorExt;
 use vamana::Vamana;
@@ -307,6 +308,7 @@ impl<T: Dtype> RoxanneDb<T> {
             vectors = index.len(),
             "transitioning brute force index to in-memory index"
           );
+          let started = Instant::now();
           let ids = index.vectors().iter().map(|e| *e.key()).collect_vec();
           let vecs = index
             .vectors()
@@ -338,7 +340,12 @@ impl<T: Dtype> RoxanneDb<T> {
             graph: ann.graph,
             vectors: ann.vectors,
           };
-          tracing::info!(vectors = index.len(), "transitioned to in-memory index");
+          let exec_ms = started.elapsed().as_millis_f64();
+          tracing::info!(
+            vectors = index.len(),
+            exec_ms,
+            "transitioned to in-memory index"
+          );
         };
         for c in batch_signals {
           c.send(()).unwrap();
@@ -829,6 +836,7 @@ mod tests {
   use crate::common::StdMetric;
   use crate::db::DbIndexMode;
   use crate::in_memory::calc_approx_medoid;
+  use crate::util::IoIteratorExt;
   use crate::Mode;
   use crate::RoxanneDb;
   use ahash::HashSet;
@@ -846,6 +854,7 @@ mod tests {
   use std::fs;
   use std::iter::once;
   use std::path::PathBuf;
+  use std::sync::atomic::AtomicUsize;
   use std::sync::atomic::Ordering;
   use std::thread::sleep;
   use std::time::Duration;
@@ -918,10 +927,13 @@ mod tests {
 
     let deleted = DashSet::new();
     let assert_accuracy = |below_i: usize, exp_acc: f64| {
+      let mode = db.db.read_index_mode();
       let start = Instant::now();
-      let mut correct = 0;
-      let mut total = 0;
-      for i in 0..below_i {
+      let correct = AtomicUsize::new(0);
+      let total = AtomicUsize::new(0);
+      // When BruteForce or InMemory, we should use Rayon, but for simplicity we'll just always use I/O thread pool.
+      // (For LongTerm, we want to use I/O thread pool.)
+      (0..below_i).io_for_each(|i| {
         let res = db.query(&vecs[i].view(), 100);
         let got = res
           .iter()
@@ -933,12 +945,17 @@ mod tests {
           .filter(|&n| n < below_i && !deleted.contains(&n))
           .take(100)
           .collect::<HashSet<_>>();
-        total += want.len();
-        correct += want.intersection(&got).count();
-      }
-      let accuracy = correct as f64 / total as f64;
+        total.fetch_add(want.len(), Ordering::Relaxed);
+        correct.fetch_add(want.intersection(&got).count(), Ordering::Relaxed);
+      });
+      let accuracy = correct.load(Ordering::Relaxed) as f64 / total.load(Ordering::Relaxed) as f64;
       let exec_ms = start.elapsed().as_millis_f64();
-      tracing::info!(accuracy, exec_ms, queries = below_i, "accuracy");
+      tracing::info!(
+        mode = format!("{:?}", mode),
+        accuracy,
+        qps = below_i as f64 / exec_ms * 1000.0,
+        "accuracy"
+      );
       assert!(accuracy >= exp_acc);
     };
 
@@ -953,7 +970,8 @@ mod tests {
     db.insert((1..734).map(|i| (i.to_string(), vecs[i].clone())).collect())
       .unwrap();
     // It's tempting to directly compare against `nn[i]` given BF's 100% accuracy, but it's still complicated due to 1) non-deterministic DB internal IDs assigned, and 2) unstable sorting (i.e. two same dists).
-    assert_accuracy(734, 1.0);
+    // Accuracy can be very slightly less than 1.0 due to non-deterministic sorting of equal dist points.
+    assert_accuracy(734, 0.99);
     tracing::info!("inserted 734 so far");
 
     // Delete some keys.
@@ -972,7 +990,8 @@ mod tests {
         .collect(),
     )
     .unwrap();
-    assert_accuracy(1000, 1.0);
+    // Accuracy can be very slightly less than 1.0 due to non-deterministic sorting of equal dist points.
+    assert_accuracy(1000, 0.99);
     tracing::info!("inserted 1000 so far");
     // Ensure the updater_thread isn't doing anything.
     sleep(Duration::from_secs(1));

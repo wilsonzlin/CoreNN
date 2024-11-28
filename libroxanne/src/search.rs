@@ -14,7 +14,6 @@ use ndarray::ArrayView1;
 use ordered_float::OrderedFloat;
 use serde::Deserialize;
 use serde::Serialize;
-use std::borrow::Borrow;
 use std::borrow::Cow;
 use std::cmp::max;
 use std::collections::BinaryHeap;
@@ -321,7 +320,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
       let cur_id = cur.id;
       let (neighbors, full_vec) = self.get_out_neighbors(cur_id);
       if let Some(v) = full_vec {
-        cur.dist = self.dist3(&v.borrow().view(), query);
+        cur.dist = self.dist3(&v.view(), query);
       };
       for n_id in neighbors.iter() {
         // If this node is a neighbor of a future expanded node, we don't need to compare the distance to this node, as if it's not the shortest now, it won't be then either.
@@ -395,7 +394,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
         .io_map(|mut p_star| {
           let (p_neighbors, full_vec) = self.get_out_neighbors(p_star.id);
           if let Some(v) = full_vec {
-            p_star.dist = self.dist3(&v.borrow().view(), query);
+            p_star.dist = self.dist3(&v.view(), query);
           }
           for j in p_neighbors.iter() {
             neighbors.insert(j);

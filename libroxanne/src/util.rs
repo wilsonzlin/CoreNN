@@ -12,47 +12,38 @@ pub(crate) static IO_POOL: Lazy<ThreadPool> = Lazy::new(|| {
   ThreadPool::new(1024)
 });
 
-pub trait IoIteratorExt<T: Send>: Iterator<Item = T> {
+pub trait IoIteratorExt<T: Send>: Iterator<Item = T> + Sized {
   // Faster if you don't need it ordered (e.g. you'll sort it differently anyway).
-  fn io_map_unordered<R, F>(&mut self, f: F) -> impl Iterator<Item = R>
+  fn io_map_unordered<R, F>(self, f: F) -> impl Iterator<Item = R>
   where
     R: Send,
-    F: Fn(T) -> R + Clone + Send,
+    F: Fn(T) -> R + Copy + Send,
   {
     let (send, recv) = std::sync::mpsc::channel();
-    scope_with(&*IO_POOL, |scope| {
-      for v in self {
+    scope_with(&*IO_POOL, move |scope| {
+      for v in self.into_iter() {
         let send = send.clone();
-        let f = f.clone();
         scope.execute(move || {
-          let r = f(v);
-          send.send(r).unwrap();
+          send.send(f(v)).unwrap();
         });
       }
-      drop(send);
     });
     recv.into_iter()
   }
 
-  fn io_map<R, F>(&mut self, f: F) -> impl Iterator<Item = R>
+  fn io_map<R, F>(self, f: F) -> impl Iterator<Item = R>
   where
     R: Send,
-    F: Fn(T) -> R + Clone + Send,
+    F: Fn(T) -> R + Copy + Send,
   {
     let (send, recv) = std::sync::mpsc::channel();
-    scope_with(&*IO_POOL, |scope| {
-      let mut n = 0;
-      for v in self {
-        let i = n;
-        n += 1;
+    scope_with(&*IO_POOL, move |scope| {
+      for (i, v) in self.enumerate() {
         let send = send.clone();
-        let f = f.clone();
         scope.execute(move || {
-          let r = f(v);
-          send.send((i, r)).unwrap();
+          send.send((i, f(v))).unwrap();
         });
       }
-      drop(send);
     });
     recv
       .into_iter()
@@ -60,26 +51,21 @@ pub trait IoIteratorExt<T: Send>: Iterator<Item = T> {
       .map(|e| e.1)
   }
 
-  fn io_filter_map<R, F>(&mut self, f: F) -> impl Iterator<Item = R>
+  fn io_filter_map<R, F>(self, f: F) -> impl Iterator<Item = R>
   where
     R: Send,
-    F: Fn(T) -> Option<R> + Clone + Send,
+    F: Fn(T) -> Option<R> + Copy + Send,
   {
     let (send, recv) = std::sync::mpsc::channel();
-    scope_with(&*IO_POOL, |scope| {
-      let mut n = 0;
-      for v in self {
-        let i = n;
-        n += 1;
+    scope_with(&*IO_POOL, move |scope| {
+      for (i, v) in self.enumerate() {
         let send = send.clone();
-        let f = f.clone();
         scope.execute(move || {
           if let Some(r) = f(v) {
             send.send((i, r)).unwrap();
           };
         });
       }
-      drop(send);
     });
     recv
       .into_iter()
@@ -87,28 +73,68 @@ pub trait IoIteratorExt<T: Send>: Iterator<Item = T> {
       .map(|e| e.1)
   }
 
-  fn io_for_each<F>(&mut self, f: F)
+  fn io_for_each<F>(self, f: F)
   where
-    F: Fn(T) + Clone + Send,
+    F: Fn(T) + Copy + Send,
   {
-    let (send, recv) = std::sync::mpsc::channel();
-    scope_with(&*IO_POOL, |scope| {
+    scope_with(&*IO_POOL, move |scope| {
       // Don't use Barrier, as it will block I/O thread pool threads and can deadlock if there are more tasks than threads.
-      for v in self {
-        let send = send.clone();
-        let f = f.clone();
+      for v in self.into_iter() {
         scope.execute(move || {
           f(v);
-          send.send(()).unwrap();
         });
       }
-      drop(send);
+      scope.join_all();
     });
-    for _ in recv {}
   }
 }
 
 impl<T: Send + 'static, I: Iterator<Item = T>> IoIteratorExt<T> for I {}
+
+#[cfg(test)]
+mod tests_ioiteratorext {
+  use super::IoIteratorExt;
+  use dashmap::DashSet;
+  use itertools::Itertools;
+  use rand::thread_rng;
+  use rand::Rng;
+  use std::thread::sleep;
+  use std::time::Duration;
+
+  #[test]
+  fn test_io_map() {
+    let local = DashSet::new();
+    let n = 10_000;
+    let res = (0..n)
+      .io_map(|i| {
+        // Simulate out-of-order completion and I/O blocking.
+        sleep(Duration::from_micros(thread_rng().gen_range(0..1000)));
+        // Do something with the outer scope.
+        local.insert(i);
+        i * 2
+      })
+      .collect_vec();
+    for i in 0..n {
+      assert!(local.contains(&i));
+      assert_eq!(res[i], i * 2);
+    }
+  }
+
+  #[test]
+  fn test_io_for_each() {
+    let local = DashSet::new();
+    let n = 10_000;
+    (0..n).io_for_each(|i| {
+      // Simulate out-of-order completion and I/O blocking.
+      sleep(Duration::from_micros(thread_rng().gen_range(0..1000)));
+      // Do something with the outer scope.
+      local.insert(i);
+    });
+    for i in 0..n {
+      assert!(local.contains(&i));
+    }
+  }
+}
 
 pub fn insert_into_ordered_vecdeque<T: Clone, K: Ord>(
   dest: &mut VecDeque<T>,
@@ -125,7 +151,7 @@ pub fn insert_into_ordered_vecdeque<T: Clone, K: Ord>(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_insert_into_ordered_vecdeque {
   use crate::util::insert_into_ordered_vecdeque;
   use itertools::Itertools;
   use std::collections::VecDeque;
