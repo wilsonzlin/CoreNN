@@ -119,7 +119,7 @@ pub trait VamanaSync<T: Dtype>: GreedySearchableSync<T> + Vamana<T> {
 
         // RobustPrune.
         // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
-        for n in self.get_out_neighbors_sync(id).0.iter() {
+        for n in self.get_out_neighbors_sync(id).0.neighbors() {
           candidates.insert(n);
         }
         // RobustPrune requires that the point itself is never in the candidate set.
@@ -128,7 +128,7 @@ pub trait VamanaSync<T: Dtype>: GreedySearchableSync<T> + Vamana<T> {
         // but that means `new_neighbors` will be a lot bigger (it'll just be the unpruned raw candidate set),
         // which means dirtying a lot more other nodes (and also adding a lot of poor edges), ultimately spending more compute.
         let new_neighbors = self.compute_robust_pruned(Query::Id(id), candidates);
-        for j in new_neighbors.iter() {
+        for j in new_neighbors.neighbors() {
           updates.entry(j).or_default().additional_edges.insert(id);
         }
         updates.entry(id).or_default().replacement_base = Some(new_neighbors);

@@ -45,7 +45,7 @@ use search::GreedySearchParams;
 use search::GreedySearchable;
 use search::GreedySearchableAsync;
 use search::INeighbors;
-use search::IVec;
+use search::IPoint;
 use search::Query;
 use signal_future::SignalFuture;
 use signal_future::SignalFutureController;
@@ -116,12 +116,12 @@ enum IndexPoint<'a, T> {
   InMemory(ArcMap<DashMap<Id, Array1<T>>, dashmap::mapref::one::Ref<'a, Id, Array1<T>>>),
 }
 
-impl<'a, T: Dtype> IVec<T> for IndexPoint<'a, T> {
-  fn view(&self) -> ArrayView1<T> {
+impl<'a, T: Dtype> IPoint<T> for IndexPoint<'a, T> {
+  fn point(&self) -> ArrayView1<T> {
     match self {
+      IndexPoint::InMemory(v) => v.value().view(),
       IndexPoint::LTI(v) => v.view(),
       IndexPoint::Temp(v) => v.value().1.view(),
-      IndexPoint::InMemory(v) => v.value().view(),
     }
   }
 }
@@ -150,7 +150,7 @@ impl<'a, T> IndexNeighbors<'a, T> {
 }
 
 impl<'a, T> INeighbors for IndexNeighbors<'a, T> {
-  fn iter(&self) -> impl Iterator<Item = Id> {
+  fn neighbors(&self) -> impl Iterator<Item = Id> {
     match &self.base {
       IndexNeighborsBase::InMemory(e) => e.value().as_slice(),
       IndexNeighborsBase::LTI(v) => v.as_slice(),
@@ -380,7 +380,7 @@ impl<T: Dtype> RoxanneDb<T> {
               // We won't update InMemory or DB just yet, as this new node's neighbors could change again in future batches.
               // CORRECTNESS: our new `neighbors` can only contain existing nodes and nodes from previous batches, and none from this insertion batch, so it's safe to expand any of the nodes in `neighbors` right now (i.e. get_out_neighbors/get_point will return them).
               idx.temp_nodes.insert(id, (neighbors.clone(), v));
-              for j in neighbors.iter() {
+              for j in neighbors.neighbors() {
                 // `id` cannot have existed in any existing out-neighbors of any node as it has just been created, so we don't need to check if it doesn't already exist in `out(j)` first.
                 idx.additional_out_neighbors.entry(j).or_default().push(id);
                 idx.additional_edge_count.fetch_add(1, Ordering::Relaxed);
@@ -418,7 +418,7 @@ impl<T: Dtype> RoxanneDb<T> {
                 let mut new_neighbors = new_neighbors.into_vec();
                 // Clone so we can remove later if necessary (otherwise we'll deadlock).
                 let add_neighbors = idx.additional_out_neighbors.get(&id).unwrap().clone();
-                new_neighbors.extend(add_neighbors.iter());
+                new_neighbors.extend(add_neighbors.neighbors());
                 // Technically, we can always update the graph node's out neighbors if we're using in-memory index, but for a consistent code path we'll stick with using additional_out_neighbors even for in-memory.
                 if new_neighbors.len() <= roxanne.cfg.max_degree_bound {
                   let mut txn = txn.lock().await;
@@ -558,7 +558,7 @@ impl<T: Dtype> RoxanneDb<T> {
 
           let mut deleted_neighbors = Vec::new();
           let new_neighbors = DashSet::new();
-          for n in node.neighbors.iter() {
+          for n in node.neighbors.neighbors() {
             if deleted.contains(&n) {
               deleted_neighbors.push(n);
             } else {
