@@ -33,7 +33,7 @@ impl<T> CollectionExt<T> for VecDeque<T> {
 
 #[cfg(test)]
 mod tests_insert_into_ordered_vecdeque {
-  use crate::util::insert_into_ordered_vecdeque;
+  use crate::util::CollectionExt;
   use itertools::Itertools;
   use std::collections::VecDeque;
 
@@ -41,49 +41,49 @@ mod tests_insert_into_ordered_vecdeque {
   fn test_insert_into_ordered_vecdeque() {
     // Empty destination.
     let mut dest = VecDeque::new();
-    dest.extend_into_ordered(&[3, 1, 4], |&x| x);
+    dest.extend_into_ordered([3, 1, 4], |&x| x);
     assert_eq!(dest.into_iter().collect_vec(), vec![1, 3, 4]);
 
     // Empty source.
     let mut dest = VecDeque::from(vec![1, 2, 3]);
-    dest.extend_into_ordered(&[], |&x| x);
+    dest.extend_into_ordered([], |&x| x);
     assert_eq!(dest.into_iter().collect_vec(), vec![1, 2, 3]);
 
     // Both empty.
     let mut dest = VecDeque::<usize>::new();
-    dest.extend_into_ordered(&[], |&x| x);
+    dest.extend_into_ordered([], |&x| x);
     assert!(dest.is_empty());
 
     // Interleaved values.
     let mut dest = VecDeque::from(vec![2, 4, 6]);
-    dest.extend_into_ordered(&[1, 3, 5], |&x| x);
+    dest.extend_into_ordered([1, 3, 5], |&x| x);
     assert_eq!(dest.into_iter().collect_vec(), vec![1, 2, 3, 4, 5, 6]);
 
     // All duplicates.
     let mut dest = VecDeque::from(vec![1, 1, 1]);
-    dest.extend_into_ordered(&[1, 1], |&x| x);
+    dest.extend_into_ordered([1, 1], |&x| x);
     assert_eq!(dest.into_iter().collect_vec(), vec![1, 1, 1, 1, 1]);
 
     // All source elements larger.
     let mut dest = VecDeque::from(vec![1, 2, 3]);
-    dest.extend_into_ordered(&[4, 5, 6], |&x| x);
+    dest.extend_into_ordered([4, 5, 6], |&x| x);
     assert_eq!(dest.into_iter().collect_vec(), vec![1, 2, 3, 4, 5, 6]);
 
     // All source elements smaller.
     let mut dest = VecDeque::from(vec![4, 5, 6]);
-    dest.extend_into_ordered(&[1, 2, 3], |&x| x);
+    dest.extend_into_ordered([1, 2, 3], |&x| x);
     assert_eq!(dest.into_iter().collect_vec(), vec![1, 2, 3, 4, 5, 6]);
 
     // Custom key function.
     let mut dest = VecDeque::from(vec!["aa", "cccc"]);
-    dest.extend_into_ordered(&["bbb", "d"], |s| s.len());
+    dest.extend_into_ordered(["bbb", "d"], |s| s.len());
     assert_eq!(dest.into_iter().collect_vec(), vec![
       "d", "aa", "bbb", "cccc"
     ]);
 
     // Single element source and dest.
     let mut dest = VecDeque::from(vec![2]);
-    dest.extend_into_ordered(&[1], |&x| x);
+    dest.extend_into_ordered([1], |&x| x);
     assert_eq!(dest.into_iter().collect_vec(), vec![1, 2]);
   }
 }
