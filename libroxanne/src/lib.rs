@@ -1225,6 +1225,7 @@ mod tests {
     .unwrap();
     tracing::info!("inserted all vectors");
     // Do final query.
+    // We expect a dramatic drop in accuracy as we're inserting uniformly random data (i.e. noise) that cannot be compressed or fitted to, and we've now inserted ~300% more data so our PQ model is now very poor.
     assert_accuracy!(n, 0.77);
   }
 }
