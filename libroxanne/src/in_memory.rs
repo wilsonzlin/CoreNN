@@ -4,8 +4,10 @@ use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PrecomputedDists;
 use crate::search::GreedySearchable;
+use crate::search::GreedySearchableSync;
 use crate::vamana::Vamana;
 use crate::vamana::VamanaParams;
+use crate::vamana::VamanaSync;
 use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use ndarray::Array1;
@@ -201,10 +203,10 @@ impl<T: Dtype> InMemoryIndex<T> {
   }
 }
 
-impl<'a, T: Dtype> GreedySearchable<'a, T> for InMemoryIndex<T> {
-  type FullVec = Ref<'a, Id, Array1<T>>;
-  type Neighbors = Ref<'a, Id, Vec<Id>>;
-  type Point = Ref<'a, Id, Array1<T>>;
+impl<T: Dtype> GreedySearchable<T> for InMemoryIndex<T> {
+  type FullVec = Vec<T>;
+  type Neighbors<'a> = Ref<'a, Id, Vec<Id>>;
+  type Point<'a> = Ref<'a, Id, Array1<T>>;
 
   fn medoid(&self) -> Id {
     self.medoid
@@ -218,20 +220,24 @@ impl<'a, T: Dtype> GreedySearchable<'a, T> for InMemoryIndex<T> {
     self.precomputed_dists.as_ref().map(|pd| pd.as_ref())
   }
 
-  fn get_point(&'a self, id: Id) -> Self::Point {
+  fn get_point<'a>(&'a self, id: Id) -> Self::Point<'a> {
     self.vectors.get(&id).unwrap()
   }
+}
 
-  fn get_out_neighbors(&'a self, id: Id) -> (Self::Neighbors, Option<Self::FullVec>) {
+impl<T: Dtype> GreedySearchableSync<T> for InMemoryIndex<T> {
+  fn get_out_neighbors_sync<'a>(&'a self, id: Id) -> (Self::Neighbors<'a>, Option<Self::FullVec>) {
     (self.graph.get(&id).unwrap(), None)
   }
 }
 
-impl<'a, T: Dtype> Vamana<'a, T> for InMemoryIndex<T> {
+impl<T: Dtype> Vamana<T> for InMemoryIndex<T> {
   fn params(&self) -> &VamanaParams {
     &self.params
   }
+}
 
+impl<T: Dtype> VamanaSync<T> for InMemoryIndex<T> {
   fn set_point(&self, id: Id, point: Array1<T>) {
     self.vectors.insert(id, point);
   }

@@ -13,9 +13,9 @@ use rocksdb::IteratorMode;
 use rocksdb::WriteBatchWithTransaction;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::spawn_blocking;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::task::spawn_blocking;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum DbIndexMode {
@@ -160,7 +160,9 @@ impl DbTransaction {
 
   pub async fn commit(self, db: &Db) {
     let db = db.db.clone();
-    spawn_blocking(move || db.write(self.batch)).await.unwrap();
+    spawn_blocking(move || db.write(self.batch).unwrap())
+      .await
+      .unwrap();
   }
 }
 
@@ -213,8 +215,11 @@ pub struct Db {
 }
 
 impl Db {
-  pub async fn open(dir: impl AsRef<Path> + Send + 'static) -> Self {
-    let db = spawn_blocking(move || rocksdb::DB::open(&rocksdb_options(), dir).unwrap()).await.unwrap().into();
+  pub async fn open(dir: PathBuf) -> Self {
+    let db = spawn_blocking(move || rocksdb::DB::open(&rocksdb_options(), dir).unwrap())
+      .await
+      .unwrap()
+      .into();
     Db { db }
   }
 
@@ -227,11 +232,11 @@ impl Db {
     spawn_blocking(move || db.flush().unwrap()).await.unwrap();
   }
 
-  fn iter<'a, T: Send + 'static>(
-    &'a self,
+  fn iter<T: Send + 'static>(
+    &self,
     kt: DbKeyT,
     parser: impl (Fn(Box<[u8]>) -> T) + Send + 'static,
-  ) -> RecvStream<'a, (Id, T)> {
+  ) -> RecvStream<(Id, T)> {
     let db = self.db.clone();
     let (send, recv) = flume::bounded(16);
     spawn_blocking(move || {
@@ -245,7 +250,7 @@ impl Db {
         let Ok(_) = send.send((id, parser(v))) else {
           break;
         };
-      };
+      }
     });
     recv.into_stream()
   }

@@ -1,7 +1,9 @@
 use crate::common::Dtype;
 use crate::common::Id;
 use crate::common::PointDist;
+use crate::search::GreedySearchParams;
 use crate::search::GreedySearchable;
+use crate::search::GreedySearchableSync;
 use crate::search::INeighbors;
 use crate::search::Query;
 use ahash::HashSet;
@@ -35,14 +37,12 @@ pub struct OptimizeMetrics {
   pub updated_nodes: HashSet<Id>,
 }
 
-pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
+pub trait Vamana<T: Dtype>: GreedySearchable<T> {
   fn params(&self) -> &VamanaParams;
-  fn set_point(&self, id: Id, point: Array1<T>);
-  fn set_out_neighbors(&self, id: Id, neighbors: Vec<Id>);
 
   /// WARNING: `candidate_ids` must not contain the point itself.
   fn compute_robust_pruned(
-    &'a self,
+    &self,
     node: Query<T>,
     candidate_ids: impl IntoIterator<Item = Id>,
   ) -> Vec<Id> {
@@ -73,13 +73,19 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
     }
     new_neighbors
   }
+}
+
+pub trait VamanaSync<T: Dtype>: GreedySearchableSync<T> + Vamana<T> {
+  fn set_point(&self, id: Id, point: Array1<T>);
+  fn set_out_neighbors(&self, id: Id, neighbors: Vec<Id>);
 
   // The point referenced by each ID should already be inserted into the DB.
   // This is used when inserting, but also during initialization, so this is a separate function from `insert`.
   // WARNING: The graph must not be mutated while this function is executing, but it is up to the caller to ensure this.
   /// WARNING: This is publicly exposed, but use this only if you know what you're doing. There are no guarantees of API stability.
+  /// There's no async variant of this, since in async contexts, the optimize() implementation's approach is likely unsuitable.
   fn optimize(
-    &'a self,
+    &self,
     mut ids: Vec<Id>,
     mut metrics: Option<&mut OptimizeMetrics>,
     on_progress: impl Fn(usize, Option<&OptimizeMetrics>),
@@ -99,21 +105,21 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
       batch.into_par_iter().for_each(|&id| {
         // Initial GreedySearch.
         let mut candidates = HashSet::new();
-        self.greedy_search(
-          Query::Id(id),
-          1,
-          self.params().update_search_list_cap,
-          1,
-          self.medoid(),
-          |_| true,
-          Some(&mut candidates),
-          None,
-          None,
-        );
+        self.greedy_search_sync(GreedySearchParams {
+          query: Query::Id(id),
+          k: 1,
+          search_list_cap: self.params().update_search_list_cap,
+          beam_width: 1,
+          start: self.medoid(),
+          filter: |_| true,
+          out_visited: Some(&mut candidates),
+          out_metrics: None,
+          ground_truth: None,
+        });
 
         // RobustPrune.
         // RobustPrune requires locking the graph node at this point; we're already holding the lock so we're good to go.
-        for n in self.get_out_neighbors(id).0.iter() {
+        for n in self.get_out_neighbors_sync(id).0.iter() {
           candidates.insert(n);
         }
         // RobustPrune requires that the point itself is never in the candidate set.
@@ -135,7 +141,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
       updates.into_par_iter().for_each(|(id, u)| {
         let mut new_neighbors = u
           .replacement_base
-          .unwrap_or_else(|| self.get_out_neighbors(id).0.into_vec());
+          .unwrap_or_else(|| self.get_out_neighbors_sync(id).0.into_vec());
         for j in u.additional_edges {
           if !new_neighbors.contains(&j) {
             new_neighbors.push(j);
@@ -151,7 +157,7 @@ pub trait Vamana<'a, T: Dtype>: GreedySearchable<'a, T> + Send + Sync {
     }
   }
 
-  fn insert(&'a self, ids: Vec<Id>, vectors: Vec<Array1<T>>) {
+  fn insert(&self, ids: Vec<Id>, vectors: Vec<Array1<T>>) {
     ids
       .par_iter()
       .zip(vectors)
