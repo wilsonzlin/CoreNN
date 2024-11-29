@@ -3,12 +3,11 @@ use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PointDist;
 use crate::common::PrecomputedDists;
-use crate::util::insert_into_ordered_vecdeque;
-use crate::util::IoIteratorExt;
+use crate::util::AsyncConcurrentIteratorExt;
+use crate::util::AsyncConcurrentStreamExt;
+use crate::util::CollectionExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
-use dashmap::DashSet;
-use futures::join;
 use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::ArrayView1;
@@ -16,12 +15,9 @@ use ordered_float::OrderedFloat;
 use serde::Deserialize;
 use serde::Serialize;
 use std::borrow::Cow;
-use std::cmp::max;
 use std::collections::BinaryHeap;
 use std::collections::VecDeque;
 use std::hash::Hash;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy)]
 pub enum Query<'a, 'b, T: Dtype> {
@@ -41,27 +37,48 @@ impl<'a, 'b, T: Dtype> From<&'a ArrayView1<'b, T>> for Query<'a, 'b, T> {
   }
 }
 
-pub struct QueryBuilder<'a, T: Dtype, G: GreedySearchable<'a, T>> {
-  g: &'a G,
-  query: Query<'a, 'a, T>,
-  k: usize,
-  search_list_cap: usize,
-  beam_width: usize,
-  start: Id,
-  filter: Option<Box<dyn Fn(PointDist) -> bool + 'a>>,
-  out_visited: Option<&'a mut HashSet<Id>>,
-  out_metrics: Option<&'a mut SearchMetrics>,
-  ground_truth: Option<&'a HashSet<Id>>,
+fn no_filter(_id: Id) -> bool {
+  true
 }
 
-impl<'a, T: Dtype, G: GreedySearchable<'a, T>> QueryBuilder<'a, T, G> {
+pub struct GreedySearchParams<'a, T: Dtype, F> {
+  pub(crate) query: Query<'a, 'a, T>,
+  pub(crate) k: usize,
+  pub(crate) search_list_cap: usize,
+  pub(crate) beam_width: usize,
+  pub(crate) start: Id,
+  pub(crate) filter: F,
+  pub(crate) out_visited: Option<&'a mut HashSet<Id>>,
+  pub(crate) out_metrics: Option<&'a mut SearchMetrics>,
+  pub(crate) ground_truth: Option<&'a HashSet<Id>>,
+}
+
+impl<'a, T: Dtype, F: Fn(Id) -> bool> GreedySearchParams<'a, T, F> {
+  pub fn new(
+    query: impl Into<Query<'a, 'a, T>>,
+    k: usize,
+    start: Id,
+  ) -> GreedySearchParams<'a, T, fn(Id) -> bool> {
+    GreedySearchParams {
+      query: query.into(),
+      k,
+      search_list_cap: k,
+      beam_width: 1,
+      start,
+      filter: no_filter,
+      out_visited: None,
+      out_metrics: None,
+      ground_truth: None,
+    }
+  }
+
   pub fn beam_width(mut self, beam_width: usize) -> Self {
     self.beam_width = beam_width;
     self
   }
 
-  pub fn filter(mut self, filter: impl Fn(PointDist) -> bool + 'a) -> Self {
-    self.filter = Some(Box::new(filter));
+  pub fn filter(mut self, filter: F) -> Self {
+    self.filter = filter;
     self
   }
 
@@ -90,18 +107,12 @@ impl<'a, T: Dtype, G: GreedySearchable<'a, T>> QueryBuilder<'a, T, G> {
     self
   }
 
-  pub fn query(self) -> Vec<PointDist> {
-    self.g.greedy_search(
-      self.query,
-      self.k,
-      self.search_list_cap,
-      self.beam_width,
-      self.start,
-      |n| self.filter.as_ref().is_none_or(|f| f(n)),
-      self.out_visited,
-      self.out_metrics,
-      self.ground_truth,
-    )
+  pub async fn query_async(self, g: &impl GreedySearchableAsync<T>) -> Vec<PointDist> {
+    g.greedy_search_async(self).await
+  }
+
+  pub fn query_sync(self, g: &impl GreedySearchableSync<T>) -> Vec<PointDist> {
+    g.greedy_search_sync(self)
   }
 }
 
@@ -192,6 +203,16 @@ impl<T: Dtype> IVec<T> for &'_ [T] {
   }
 }
 
+impl<T: Dtype> IVec<T> for Vec<T> {
+  fn view(&self) -> ArrayView1<T> {
+    ArrayView1::from(self.as_slice())
+  }
+
+  fn into_vec(self) -> Vec<T> {
+    self
+  }
+}
+
 impl<'r, K: Eq + Hash, T: Dtype> IVec<T> for dashmap::mapref::one::Ref<'r, K, Array1<T>> {
   fn view(&self) -> ArrayView1<T> {
     self.value().view()
@@ -250,30 +271,41 @@ impl<'r, K: Eq + Hash> INeighbors for dashmap::mapref::one::Ref<'r, K, Vec<Id>> 
   }
 }
 
-pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
+#[derive(Default)]
+pub struct GreedySearchState {
+  // It's too inefficient to calculate L\V repeatedly.
+  // Since we need both L (return value) and L\V (each iteration), we split L into V and ¬V.
+  // For simplicity, we'll just allow both to reach `k` size, and do a final merge at the end. This doubles the memory requirements, but in reality `k` is often small enough that it's not a problem.
+  // We also need `all_visited` as `l_visited` truncates to `k`, but we also want all visited points in the end.
+  // L = l_visited + l_unvisited
+  // `l_unvisited_set` is for members currently in l_unvisited, to avoid pushing duplicates. (NOTE: This is *not* the same as `all_visited`.) We don't need one for `l_visited` because we only push popped elements from `l_unvisited`, which we guarantee are unique (as previously mentioned).
+  l_unvisited_set: HashSet<Id>,
+  l_unvisited: VecDeque<PointDist>, // L \ V
+  l_visited: VecDeque<PointDist>,   // V
+  all_visited: HashSet<Id>,
+  ground_truth_found: usize,
+}
+
+// Don't use `GreedySearchable<'a>` instead of `type XXX<'a>: ...` as the former constrains the entire trait, which causes lifetime issues within async contexts.
+pub trait GreedySearchable<T: Dtype>: Send + Sync + Sized {
   // These generics allow for owned and borrowed variants in various forms (e.g. DashMap::Ref, slice, ArrayView, &Array); the complexity allows for avoiding copying where possible, which gets really expensive for in-memory usages, while supporting copied owned data for reading from disk.
-  type Point: IVec<T>;
-  type Neighbors: INeighbors;
+  type Point<'a>: IVec<T>
+  where
+    Self: 'a;
+  type Neighbors<'a>: INeighbors
+  where
+    Self: 'a;
   type FullVec: IVec<T>;
 
   fn medoid(&self) -> Id;
   fn metric(&self) -> Metric<T>;
   /// NOTE: This isn't I/O; all get_point uses memory only (even LTI, which uses cached PQ vecs). Therefore, don't use ThreadPool when calling this multiple times.
-  fn get_point(&'a self, id: Id) -> Self::Point;
-  // If the graph supports it, and get_point doesn't already provide the full embedding, provide full embedding for reranking as second return value.
-  /// NOTE: This *is* I/O, so use ThreadPool when calling this multiple times.
-  fn get_out_neighbors(&'a self, id: Id) -> (Self::Neighbors, Option<Self::FullVec>);
+  fn get_point<'a>(&'a self, id: Id) -> Self::Point<'a>;
   fn precomputed_dists(&self) -> Option<&PrecomputedDists>;
-  fn default_query_search_list_cap(&self) -> usize {
-    150
-  }
-  fn default_beam_width(&self) -> usize {
-    1
-  }
 
   /// Calculate the distance between two points.
   /// NOTE: This isn't I/O. Therefore, don't use ThreadPool when calling this multiple times.
-  fn dist(&'a self, a: Id, b: Id) -> f64 {
+  fn dist(&self, a: Id, b: Id) -> f64 {
     if let Some(pd) = self.precomputed_dists().map(|pd| pd.get(a, b)) {
       return pd;
     };
@@ -284,7 +316,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
 
   /// Calculate the distance between a point and a query.
   /// NOTE: This isn't I/O. Therefore, don't use ThreadPool when calling this multiple times.
-  fn dist2(&'a self, a: Id, b: Query<T>) -> f64 {
+  fn dist2(&self, a: Id, b: Query<T>) -> f64 {
     match b {
       Query::Id(b) => self.dist(a, b),
       Query::Vec(b) => self.metric()(&self.get_point(a).view(), b),
@@ -293,15 +325,174 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
 
   /// Calculate the distance between a vector and a query.
   /// NOTE: This isn't I/O. Therefore, don't use ThreadPool when calling this multiple times.
-  fn dist3(&'a self, a: &ArrayView1<T>, b: Query<T>) -> f64 {
+  fn dist3(&self, a: &ArrayView1<T>, b: Query<T>) -> f64 {
     match b {
       Query::Id(b) => self.metric()(a, &self.get_point(b).view()),
       Query::Vec(b) => self.metric()(a, b),
     }
   }
 
-  // Optimised custom function for k=1 and search_list_cap=1.
-  async fn greedy_search_fast1(
+  // We decompose the greedy search algorithm into subroutines that can be shared across both greedy_search_{a,}sync instead of duplicating a whole bunch of code across both variants. These decompositions are the gs_* methods (which should be only used internally).
+  fn gs_init<F>(&self, params: &GreedySearchParams<T, F>) -> GreedySearchState {
+    assert!(
+      params.search_list_cap >= params.k,
+      "search list capacity must be greater than or equal to k"
+    );
+    let mut s = GreedySearchState::default();
+    s.l_unvisited.push_back(PointDist {
+      id: params.start,
+      dist: self.dist2(params.start, params.query),
+    });
+    s
+  }
+
+  /// If returns None, end loop.
+  fn gs_loop_itertion_nodes_to_expand<F>(
+    &self,
+    state: &mut GreedySearchState,
+    params: &GreedySearchParams<T, F>,
+  ) -> Option<Vec<PointDist>> {
+    let nodes = (0..params.beam_width)
+      .filter_map(|_| state.l_unvisited.pop_front())
+      .collect_vec();
+    if nodes.is_empty() {
+      None
+    } else {
+      Some(nodes)
+    }
+  }
+
+  fn gs_loop_iteration_after_nodes_expanded<'a, F: Fn(Id) -> bool>(
+    &'a self,
+    expanded: impl IntoIterator<Item = (PointDist, Self::Neighbors<'a>, Option<Self::FullVec>)>,
+    state: &mut GreedySearchState,
+    params: &mut GreedySearchParams<T, F>,
+  ) {
+    let mut neighbors = HashSet::new();
+    for (mut p_star, p_neighbors, full_vec) in expanded {
+      if let Some(v) = full_vec {
+        p_star.dist = self.dist3(&v.view(), params.query);
+      }
+      for j in p_neighbors.iter() {
+        neighbors.insert(j);
+      }
+      // Move to visited section.
+      state.all_visited.insert(p_star.id);
+      if (params.filter)(p_star.id) {
+        state
+          .l_visited
+          .insert_into_ordered(p_star, |s| OrderedFloat(s.dist));
+      }
+    }
+    let neighbors_len = neighbors.len();
+
+    let mut new_unvisited_len = 0;
+    for neighbor in neighbors {
+      // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
+      if state.all_visited.contains(&neighbor) {
+        continue;
+      };
+      if !state.l_unvisited_set.insert(neighbor) {
+        continue;
+      };
+      if params.ground_truth.is_some_and(|gt| gt.contains(&neighbor)) {
+        state.ground_truth_found += 1;
+      }
+      let dist = self.dist2(neighbor, params.query);
+      state
+        .l_unvisited
+        .insert_into_ordered(PointDist { id: neighbor, dist }, |s| OrderedFloat(s.dist));
+      new_unvisited_len += 1;
+    }
+
+    let mut dropped_unvisited = 0;
+    let mut dropped_visited = 0;
+    while state.l_unvisited.len() + state.l_visited.len() > params.search_list_cap {
+      let (Some(u), Some(v)) = (state.l_unvisited.back(), state.l_visited.back()) else {
+        break;
+      };
+      if u.dist >= v.dist {
+        state.l_unvisited.pop_back();
+        dropped_unvisited += 1;
+      } else {
+        state.l_visited.pop_back();
+        dropped_visited += 1;
+      }
+    }
+
+    if let Some(m) = &mut params.out_metrics {
+      m.iterations.push(SearchIterationMetrics {
+        dropped_candidates: neighbors_len - new_unvisited_len,
+        dropped_unvisited,
+        dropped_visited,
+        ground_truth_found: state.ground_truth_found,
+        new_candidates: new_unvisited_len,
+        unvisited_dist_mins: state
+          .l_unvisited
+          .front()
+          .map(|n| n.dist)
+          .unwrap_or_default(),
+        unvisited_dist_sum: state.l_unvisited.iter().map(|n| n.dist).sum(),
+        visited: state.all_visited.len(),
+      });
+    }
+  }
+
+  fn gs_final<F>(
+    &self,
+    mut state: GreedySearchState,
+    mut params: GreedySearchParams<T, F>,
+  ) -> Vec<PointDist> {
+    // Find the k closest points from both l_visited + l_unvisited (= L).
+    let mut closest = Vec::new();
+    while closest.len() < params.k {
+      match (state.l_visited.pop_front(), state.l_unvisited.pop_front()) {
+        (None, None) => break,
+        (Some(v), None) | (None, Some(v)) => closest.push(v),
+        (Some(a), Some(b)) => {
+          if a.dist < b.dist {
+            closest.push(a);
+            closest.push(b);
+          } else {
+            closest.push(b);
+            closest.push(a);
+          };
+        }
+      };
+    }
+    // We may have exceeded k due to pushing both a and b in the last match arm.
+    closest.truncate(params.k);
+    if let Some(out) = &mut params.out_visited {
+      out.extend(state.all_visited);
+    };
+    closest
+  }
+}
+
+pub trait GreedySearchableSync<T: Dtype>: GreedySearchable<T> {
+  /// If the graph supports it, and get_point doesn't already provide the full embedding, provide full embedding for reranking as second return value.
+  fn get_out_neighbors_sync<'a>(&'a self, id: Id) -> (Self::Neighbors<'a>, Option<Self::FullVec>);
+
+  // DiskANN paper, Algorithm 1: GreedySearch.
+  // Returns a pair: (closest points, visited node IDs).
+  // Filtered nodes will be visited and expanded but not considered for the final set of neighbors.
+  fn greedy_search_sync<F: Fn(Id) -> bool>(
+    &self,
+    mut params: GreedySearchParams<T, F>,
+  ) -> Vec<PointDist> {
+    let mut state = self.gs_init(&params);
+    while let Some(nodes_to_expand) = self.gs_loop_itertion_nodes_to_expand(&mut state, &params) {
+      let expanded = nodes_to_expand.into_iter().map(|p_star| {
+        let (p_neighbors, full_vec) = self.get_out_neighbors_sync(p_star.id);
+        (p_star, p_neighbors, full_vec)
+      });
+      self.gs_loop_iteration_after_nodes_expanded(expanded, &mut state, &mut params);
+    }
+    self.gs_final(state, params)
+  }
+
+  /// Optimised custom function for k=1 and search_list_cap=1 and beam_width=1.
+  fn greedy_search_fast1(
     &self,
     query: Query<'_, '_, T>,
     start: Id,
@@ -311,7 +502,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
     // TODO Study impact of performance and accuracy compared to full exhaustive search with backtracking while filtered.
     let mut cur = PointDist {
       id: start,
-      dist: self.dist2(start, query).await,
+      dist: self.dist2(start, query),
     };
     // The optima cannot default to `start` as it may be filtered.
     let mut optima: Option<PointDist> = None;
@@ -319,7 +510,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
     seen.insert(start);
     loop {
       let cur_id = cur.id;
-      let (neighbors, full_vec) = self.get_out_neighbors(cur_id).await;
+      let (neighbors, full_vec) = self.get_out_neighbors_sync(cur_id);
       if let Some(v) = full_vec {
         cur.dist = self.dist3(&v.view(), query);
       };
@@ -330,7 +521,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
         };
         let n = PointDist {
           id: n_id,
-          dist: self.dist2(n_id, query).await,
+          dist: self.dist2(n_id, query),
         };
         let not_filtered = filter(n.id);
         if not_filtered && !optima.is_some_and(|o| o.dist <= n.dist) {
@@ -348,149 +539,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
     optima
   }
 
-  // DiskANN paper, Algorithm 1: GreedySearch.
-  // Returns a pair: (closest points, visited node IDs).
-  // Filtered nodes will be visited and expanded but not considered for the final set of neighbors.
-  async fn greedy_search(
-    &self,
-    query: Query<'_, '_, T>,
-    k: usize,
-    search_list_cap: usize,
-    beam_width: usize,
-    start: Id,
-    filter: impl Fn(PointDist) -> bool,
-    mut out_visited: Option<&mut HashSet<Id>>,
-    // (map from ID to row/col no, matrix of dists flattened).
-    mut out_metrics: Option<&mut SearchMetrics>,
-    ground_truth: Option<&HashSet<Id>>,
-  ) -> Vec<PointDist> {
-    assert!(
-      search_list_cap >= k,
-      "search list capacity must be greater than or equal to k"
-    );
-
-    // It's too inefficient to calculate L\V repeatedly.
-    // Since we need both L (return value) and L\V (each iteration), we split L into V and ¬V.
-    // For simplicity, we'll just allow both to reach `k` size, and do a final merge at the end. This doubles the memory requirements, but in reality `k` is often small enough that it's not a problem.
-    // We also need `all_visited` as `l_visited` truncates to `k`, but we also want all visited points in the end.
-    // L = l_visited + l_unvisited
-    // `l_unvisited_set` is for members currently in l_unvisited, to avoid pushing duplicates. (NOTE: This is *not* the same as `all_visited`.) We don't need one for `l_visited` because we only push popped elements from `l_unvisited`, which we guarantee are unique (as previously mentioned).
-    let mut l_unvisited_set = HashSet::new();
-    let mut l_unvisited = VecDeque::<PointDist>::new(); // L \ V
-    let mut l_visited = VecDeque::<PointDist>::new(); // V
-    let mut all_visited = HashSet::new();
-    l_unvisited.push_back(PointDist {
-      id: start,
-      dist: self.dist2(start, query),
-    });
-    let ground_truth_found = AtomicUsize::new(0);
-    while !l_unvisited.is_empty() {
-      let new_visited = (0..beam_width)
-        .filter_map(|_| l_unvisited.pop_front())
-        .collect::<Vec<_>>();
-      let neighbors = DashSet::new();
-      // Parallelize as the purpose of beam width > 1 is to read from disk in parallel.
-      let new_visited = new_visited
-        .into_iter()
-        .io_map(|mut p_star| {
-          let (p_neighbors, full_vec) = self.get_out_neighbors(p_star.id);
-          if let Some(v) = full_vec {
-            p_star.dist = self.dist3(&v.view(), query);
-          }
-          for j in p_neighbors.iter() {
-            neighbors.insert(j);
-          }
-          p_star
-        })
-        .collect_vec();
-      // Move to visited section.
-      all_visited.extend(new_visited.iter().map(|e| e.id));
-      insert_into_ordered_vecdeque(
-        &mut l_visited,
-        &new_visited
-          .iter()
-          .filter(|e| filter(**e))
-          .cloned()
-          .collect_vec(),
-        |s| OrderedFloat(s.dist),
-      );
-
-      let mut new_unvisited = Vec::new();
-      for neighbor in neighbors.iter() {
-        let neighbor = *neighbor;
-        // We separate L out into V and not V, so we must manually ensure the property that l_visited and l_unvisited are disjoint.
-        if all_visited.contains(&neighbor) {
-          continue;
-        };
-        if l_unvisited_set.contains(&neighbor) {
-          continue;
-        };
-        if ground_truth.is_some_and(|gt| gt.contains(&neighbor)) {
-          ground_truth_found.fetch_add(1, Ordering::Relaxed);
-        }
-        new_unvisited.push(PointDist {
-          id: neighbor,
-          dist: self.dist2(neighbor, query).await,
-        })
-      };
-      l_unvisited_set.extend(new_unvisited.iter().map(|e| e.id));
-      insert_into_ordered_vecdeque(&mut l_unvisited, &new_unvisited, |s| OrderedFloat(s.dist));
-
-      let mut dropped_unvisited = 0;
-      let mut dropped_visited = 0;
-      while l_unvisited.len() + l_visited.len() > search_list_cap {
-        let (Some(u), Some(v)) = (l_unvisited.back(), l_visited.back()) else {
-          break;
-        };
-        if u.dist >= v.dist {
-          l_unvisited.pop_back();
-          dropped_unvisited += 1;
-        } else {
-          l_visited.pop_back();
-          dropped_visited += 1;
-        }
-      }
-
-      if let Some(m) = &mut out_metrics {
-        m.iterations.push(SearchIterationMetrics {
-          dropped_candidates: neighbors.len() - new_unvisited.len(),
-          dropped_unvisited,
-          dropped_visited,
-          ground_truth_found: ground_truth_found.load(Ordering::Relaxed),
-          new_candidates: new_unvisited.len(),
-          unvisited_dist_mins: l_unvisited.front().map(|n| n.dist).unwrap_or_default(),
-          unvisited_dist_sum: l_unvisited.iter().map(|n| n.dist).sum(),
-          visited: all_visited.len(),
-        });
-      }
-    }
-
-    // Find the k closest points from both l_visited + l_unvisited (= L).
-    let mut closest = Vec::new();
-    while closest.len() < k {
-      match (l_visited.pop_front(), l_unvisited.pop_front()) {
-        (None, None) => break,
-        (Some(v), None) | (None, Some(v)) => closest.push(v),
-        (Some(a), Some(b)) => {
-          if a.dist < b.dist {
-            closest.push(a);
-            closest.push(b);
-          } else {
-            closest.push(b);
-            closest.push(a);
-          };
-        }
-      };
-    }
-    // We may have exceeded k due to pushing both a and b in the last match arm.
-    closest.truncate(k);
-    if let Some(out) = &mut out_visited {
-      out.extend(all_visited);
-    };
-    closest
-  }
-
-  fn find_shortest_spanning_tree(&'a self, start: Id) -> Vec<(Id, Id)> {
+  fn find_shortest_spanning_tree(&self, start: Id) -> Vec<(Id, Id)> {
     let mut visited = HashSet::<Id>::new();
     let mut path = Vec::<(Id, Id)>::new();
     // Why use Dijkstra instead of simply calculating min(dist_of_in_neighbors_edges) for each node? After all, we traverse and expand every node in both, but the latter can be a bit more parallel. The reason is that the latter will create lots of symmetric edges, because if A is closest to B then so is B to A, but this is bad for forming a dependency path to iterate through the graph as we'll frequently stop due to A already being visited once we get to B. Basically, we use Dijkstra because it has a `visited` set that forces a non-cyclic continuous path.
@@ -506,7 +555,7 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
 
       // Move on to neighbors of `to` in the base shard.
       let new = self
-        .get_out_neighbors(to)
+        .get_out_neighbors_sync(to)
         .0
         .iter()
         .filter_map(|neighbor| {
@@ -522,23 +571,33 @@ pub trait GreedySearchable<'a, T: Dtype>: Send + Sync + Sized {
     }
     path
   }
+}
 
-  fn query_builder(
+/// See corresponding method comments on GreedySearchableSync.
+pub trait GreedySearchableAsync<T: Dtype>: GreedySearchable<T> {
+  async fn get_out_neighbors_async<'a>(
     &'a self,
-    query: impl Into<Query<'a, 'a, T>>,
-    k: usize,
-  ) -> QueryBuilder<'a, T, Self> {
-    QueryBuilder {
-      g: self,
-      query: query.into(),
-      k,
-      search_list_cap: max(self.default_query_search_list_cap(), k),
-      beam_width: self.default_beam_width(),
-      start: self.medoid(),
-      filter: None,
-      out_visited: None,
-      out_metrics: None,
-      ground_truth: None,
+    id: Id,
+  ) -> (Self::Neighbors<'a>, Option<Self::FullVec>);
+
+  async fn greedy_search_async<F: Fn(Id) -> bool>(
+    &self,
+    mut params: GreedySearchParams<'_, T, F>,
+  ) -> Vec<PointDist> {
+    let mut state = self.gs_init(&params);
+    while let Some(nodes_to_expand) = self.gs_loop_itertion_nodes_to_expand(&mut state, &params) {
+      let expanded = nodes_to_expand
+        .into_iter()
+        // Parallelize as the purpose of beam width > 1 is to read from disk in parallel.
+        // Use map_concurrent and not tokio::spawn as we're mostly just awaiting I/O and don't need CPU parallelism.
+        .map_concurrent_unordered(async |p_star| {
+          let (p_neighbors, full_vec) = self.get_out_neighbors_async(p_star.id).await;
+          (p_star, p_neighbors, full_vec)
+        })
+        .collect_vec()
+        .await;
+      self.gs_loop_iteration_after_nodes_expanded(expanded, &mut state, &mut params);
     }
+    self.gs_final(state, params)
   }
 }

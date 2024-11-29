@@ -2,6 +2,7 @@ use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PrecomputedDists;
 use crate::search::GreedySearchable;
+use crate::search::GreedySearchableSync;
 use ahash::HashMap;
 use hnswlib_rs::HnswIndex;
 use hnswlib_rs::LabelType;
@@ -60,10 +61,16 @@ impl<'h> HnswGraph<'h> {
   }
 }
 
-impl<'a, 'h> GreedySearchable<'a, f32> for HnswGraph<'h> {
-  type FullVec = &'a [f32];
-  type Neighbors = &'a [LabelType];
-  type Point = &'a [f32];
+impl<'h> GreedySearchable<f32> for HnswGraph<'h> {
+  type FullVec = Vec<f32>;
+  type Neighbors<'a>
+    = &'a [LabelType]
+  where
+    Self: 'a;
+  type Point<'a>
+    = &'a [f32]
+  where
+    Self: 'a;
 
   fn medoid(&self) -> Id {
     self.hnsw.entry_label()
@@ -73,15 +80,17 @@ impl<'a, 'h> GreedySearchable<'a, f32> for HnswGraph<'h> {
     self.metric
   }
 
-  fn get_point(&'a self, id: Id) -> Self::Point {
+  fn get_point<'a>(&'a self, id: Id) -> Self::Point<'a> {
     self.hnsw.get_data_by_label(id)
-  }
-
-  fn get_out_neighbors(&'a self, id: Id) -> (Self::Neighbors, Option<Self::FullVec>) {
-    (self.graph.get(&id).unwrap(), None)
   }
 
   fn precomputed_dists(&self) -> Option<&PrecomputedDists> {
     None
+  }
+}
+
+impl<'h> GreedySearchableSync<f32> for HnswGraph<'h> {
+  fn get_out_neighbors_sync<'a>(&'a self, id: Id) -> (Self::Neighbors<'a>, Option<Self::FullVec>) {
+    (self.graph.get(&id).unwrap(), None)
   }
 }

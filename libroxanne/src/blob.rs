@@ -11,11 +11,9 @@ use ndarray::Array1;
 use rand::thread_rng;
 use rand::RngCore;
 use rmp_serde::from_slice;
+use rmp_serde::to_vec_named;
 use serde::Deserialize;
 use serde::Serialize;
-use std::fs;
-use std::fs::File;
-use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -61,29 +59,28 @@ pub struct BlobStore {
 }
 
 impl BlobStore {
-  pub fn open(dir: PathBuf) -> Self {
-    fs::create_dir_all(&dir).unwrap();
+  pub async fn open(dir: PathBuf) -> Self {
+    tokio::fs::create_dir_all(&dir).await.unwrap();
     Self { dir }
   }
 
-  fn write(&self, name: &str, val: &impl Serialize) {
+  async fn write(&self, name: &str, val: &impl Serialize) {
     let p = self.dir.join(name);
     let mut tmp_sfx = vec![0u8; 24];
     thread_rng().fill_bytes(&mut tmp_sfx);
     let p_tmp = p.with_added_extension(format!("tmp_{}", BASE64URL_NOPAD.encode(&tmp_sfx)));
-    let f = File::create(&p_tmp).unwrap();
-    let mut bw = BufWriter::new(f);
-    let mut s = rmp_serde::Serializer::new(&mut bw).with_struct_map();
-    val.serialize(&mut s).unwrap();
-    fs::rename(&p_tmp, p).unwrap();
+    tokio::fs::write(&p_tmp, to_vec_named(val).unwrap())
+      .await
+      .unwrap();
+    tokio::fs::rename(&p_tmp, p).await.unwrap();
   }
 
-  pub fn read_pq_model<T: Dtype + Float>(&self) -> ProductQuantizer<T> {
-    let raw = fs::read(self.dir.join("pq_model")).unwrap();
+  pub async fn read_pq_model<T: Dtype + Float>(&self) -> ProductQuantizer<T> {
+    let raw = tokio::fs::read(self.dir.join("pq_model")).await.unwrap();
     from_slice(&raw).unwrap()
   }
 
-  pub fn write_pq_model<T: Dtype + Float>(&self, pq_model: &ProductQuantizer<T>) {
-    self.write("pq_model", pq_model);
+  pub async fn write_pq_model<T: Dtype + Float>(&self, pq_model: &ProductQuantizer<T>) {
+    self.write("pq_model", pq_model).await;
   }
 }

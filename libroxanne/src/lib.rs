@@ -1,7 +1,11 @@
+#![feature(async_closure)]
 #![feature(duration_millis_float)]
 #![feature(f16)]
 #![feature(path_add_extension)]
+#![warn(clippy::future_not_send)]
+#![allow(async_fn_in_trait)]
 
+use crate::util::AsyncConcurrentIteratorExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
 use arbitrary_lock::ArbitraryLock;
@@ -15,45 +19,44 @@ use common::Metric;
 use common::PrecomputedDists;
 use dashmap::DashMap;
 use dashmap::DashSet;
-use dashmap::Entry;
 use db::Db;
 use db::DbIndexMode;
 use db::DbTransaction;
 use db::NodeData;
+use flume::Receiver;
+use flume::Sender;
+use futures::stream::iter;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use in_memory::InMemoryIndex;
 use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::Array2;
 use ndarray::ArrayView1;
-use parking_lot::Mutex;
-use parking_lot::RwLock;
 use pq::ProductQuantizer;
 use rand::seq::IteratorRandom;
 use rand::thread_rng;
-use rayon::iter::IndexedParallelIterator;
-use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
-use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
+use search::GreedySearchParams;
 use search::GreedySearchable;
+use search::GreedySearchableAsync;
 use search::INeighbors;
 use search::IVec;
 use search::Query;
+use signal_future::SignalFuture;
+use signal_future::SignalFutureController;
 use std::cmp::max;
 use std::cmp::min;
 use std::collections::BTreeMap;
-use std::fs;
 use std::iter::zip;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::thread;
 use std::time::Instant;
+use tokio::sync::RwLock;
 use util::ArcMap;
-use util::IoIteratorExt;
 use vamana::Vamana;
 use vamana::VamanaParams;
 
@@ -75,39 +78,14 @@ pub enum RoxanneDbError {
   Busy,
 }
 
-struct PqState<T: Dtype> {
-  db: Arc<Db>,
-  pq_vecs: DashMap<Id, Array1<u8>>,
-  pq: ProductQuantizer<T>,
-}
-
-impl<T: Dtype> PqState<T> {
-  pub fn get_pq_vec(&self, id: Id) -> Array1<T> {
-    // This holds a write lock on the entry, so multiple callers won't do repeated redundant calculations.
-    match self.pq_vecs.entry(id) {
-      Entry::Occupied(o) => {
-        let pq_vec = o.get();
-        self.pq.decode_1(&pq_vec.view())
-      }
-      Entry::Vacant(v) => {
-        let node = self.db.read_node(id);
-        let vec = Array1::from_vec(node.vector);
-        let pq_vec = self.pq.encode_1(&vec.view());
-        // Insert into cache.
-        v.insert(pq_vec);
-        vec
-      }
-    }
-  }
-}
-
 enum Mode<T: Dtype> {
   InMemory {
     graph: Arc<DashMap<Id, Vec<Id>>>,
     vectors: Arc<DashMap<Id, Array1<T>>>,
   },
   LTI {
-    pq: PqState<T>,
+    pq_vecs: DashMap<Id, Array1<u8>>,
+    pq: ProductQuantizer<T>,
   },
 }
 
@@ -118,6 +96,7 @@ struct Index<T: Dtype> {
   // - inserting into a Vamana graph with zero or only a few nodes has complications (e.g. RobustPrune may actually make a node unreachable)
   bf: RwLock<Option<Arc<BruteForceIndex<T>>>>,
   db: Arc<Db>,
+  // We use tokio::RwLock as it supports holding lock guards within Future when using join_all (parking_lot::RwLock does not).
   mode: RwLock<Mode<T>>,
   // This changes when we transition from BF to InMemory.
   medoid: AtomicUsize,
@@ -182,10 +161,10 @@ impl<'a, T> INeighbors for IndexNeighbors<'a, T> {
   }
 }
 
-impl<'a, T: Dtype> GreedySearchable<'a, T> for Index<T> {
+impl<T: Dtype> GreedySearchable<T> for Index<T> {
   type FullVec = Array1<T>;
-  type Neighbors = IndexNeighbors<'a, T>;
-  type Point = IndexPoint<'a, T>;
+  type Neighbors<'a> = IndexNeighbors<'a, T>;
+  type Point<'a> = IndexPoint<'a, T>;
 
   fn medoid(&self) -> Id {
     self.medoid.load(Ordering::Relaxed)
@@ -195,19 +174,31 @@ impl<'a, T: Dtype> GreedySearchable<'a, T> for Index<T> {
     self.metric
   }
 
-  fn get_point(&'a self, id: Id) -> Self::Point {
+  fn get_point<'a>(&'a self, id: Id) -> Self::Point<'a> {
     if let Some(temp) = self.temp_nodes.get(&id) {
       return IndexPoint::Temp(temp);
     }
-    match &*self.mode.read() {
+    match &*self.mode.blocking_read() {
       Mode::InMemory { vectors, .. } => {
         IndexPoint::InMemory(ArcMap::map(vectors.clone(), |v| v.get(&id).unwrap()))
       }
-      Mode::LTI { pq } => IndexPoint::LTI(pq.get_pq_vec(id)),
+      Mode::LTI { pq, pq_vecs } => IndexPoint::LTI({
+        let pq_vec = pq_vecs.get(&id).unwrap();
+        pq.decode_1(&pq_vec.view())
+      }),
     }
   }
 
-  fn get_out_neighbors(&'a self, id: Id) -> (Self::Neighbors, Option<Self::FullVec>) {
+  fn precomputed_dists(&self) -> Option<&PrecomputedDists> {
+    None
+  }
+}
+
+impl<T: Dtype> GreedySearchableAsync<T> for Index<T> {
+  async fn get_out_neighbors_async<'a>(
+    &'a self,
+    id: Id,
+  ) -> (Self::Neighbors<'a>, Option<Self::FullVec>) {
     if let Some(temp) = self.temp_nodes.get(&id) {
       // We don't need to add additional_out_neighbors, as temp_nodes is a full override.
       // We don't need to return a full vector as it's not from the disk.
@@ -219,7 +210,7 @@ impl<'a, T: Dtype> GreedySearchable<'a, T> for Index<T> {
         None,
       );
     }
-    match &*self.mode.read() {
+    match &*self.mode.read().await {
       Mode::InMemory { graph, .. } => (
         IndexNeighbors {
           base: IndexNeighborsBase::InMemory(ArcMap::map(Arc::clone(&graph), |g| {
@@ -230,7 +221,7 @@ impl<'a, T: Dtype> GreedySearchable<'a, T> for Index<T> {
         None,
       ),
       Mode::LTI { .. } => {
-        let n = self.db.read_node(id);
+        let n = self.db.read_node(id).await;
         (
           IndexNeighbors {
             base: IndexNeighborsBase::LTI(n.neighbors),
@@ -241,25 +232,13 @@ impl<'a, T: Dtype> GreedySearchable<'a, T> for Index<T> {
       }
     }
   }
-
-  fn precomputed_dists(&self) -> Option<&PrecomputedDists> {
-    None
-  }
 }
 
 // We only implement Vamana to be able to use compute_robust_pruned during updater_thread.
-// We don't use set_* as the update process is more sophisticated (see updater_thread).
-impl<'a, T: Dtype> Vamana<'a, T> for Index<T> {
+// We don't impl VamanaSync and use set_* as the update process is more sophisticated (see updater_thread).
+impl<T: Dtype> Vamana<T> for Index<T> {
   fn params(&self) -> &vamana::VamanaParams {
     &self.vamana_params
-  }
-
-  fn set_point(&self, _id: Id, _point: Array1<T>) {
-    unreachable!()
-  }
-
-  fn set_out_neighbors(&self, _id: Id, _neighbors: Vec<Id>) {
-    unreachable!()
   }
 }
 
@@ -269,20 +248,20 @@ pub struct RoxanneDb<T: Dtype> {
   db: Arc<Db>,
   deleted: DashSet<Id>,
   index: Index<T>,
-  key_locks: ArbitraryLock<String, Mutex<()>>,
+  key_locks: ArbitraryLock<String, parking_lot::Mutex<()>>,
   next_id: AtomicUsize,
-  update_sender: Sender<(Vec<Id>, Vec<Array1<T>>, Sender<()>)>,
+  update_sender: Sender<(Vec<Id>, Vec<Array1<T>>, SignalFutureController<()>)>,
 }
 
 impl<T: Dtype> RoxanneDb<T> {
   // Why do all updates from a single thread (i.e. serialized), instead of only the compaction process?
   // Because our Vamana implementation doesn't support parallel updates (it does batching instead), so a lot of complexity to split out insertion (thread-safe) and compaction (single thread) ultimately ends up being pointless. It's safer to get correct; if we need to optimize, we can profile in the future.
-  // NOTE: Many operations may seem incorrect due to only acquiring read locks (so it seems like changes could happen beneath our feet and we're not correctly looking at a stable consistent snapshot/view of the entire system/data), but remember that all updates are processed serially within this sole thread only.
-  fn updater_thread(
-    self: &Arc<RoxanneDb<T>>,
-    receiver: Receiver<(Vec<Id>, Vec<Array1<T>>, Sender<()>)>,
+  // NOTE: Many operations in this method may seem incorrect due to only acquiring read locks (so it seems like changes could happen beneath our feet and we're not correctly looking at a stable consistent snapshot/view of the entire system/data), but remember that all updates are processed serially within this sole single-threaded/serially-executed function only.
+  async fn updater_thread(
+    self: Arc<Self>,
+    receiver: Receiver<(Vec<Id>, Vec<Array1<T>>, SignalFutureController<()>)>,
   ) {
-    while let Ok(mut batch) = receiver.recv() {
+    while let Ok(mut batch) = receiver.recv_async().await {
       // Collect more if available.
       let mut batch_signals = vec![batch.2];
       while let Ok(e) = receiver.try_recv() {
@@ -297,12 +276,12 @@ impl<T: Dtype> RoxanneDb<T> {
       // If we are in brute force index mode, then handle differently (it's not a graph, so update process is different).
       // BruteForceIndex is wrapped in Arc so we can work on it while dropping the lock (so we can potentially replace it).
       // WARNING: Do not inline this to the `if` RHS; in Rust, given `a.b.c`, `a` is dropped but `b` is not, so if we inline this, we'll hold the lock.
-      let bf = self.index.bf.read().clone();
+      let bf = self.index.bf.read().await.clone();
       if let Some(index) = bf {
         tracing::debug!(current_size = index.len(), "brute force index exists");
-        batch_ids.par_iter().zip(batch_vecs).for_each(|(&id, v)| {
+        for (&id, v) in zip(&batch_ids, batch_vecs) {
           index.insert(id, v);
-        });
+        }
         if index.len() > self.cfg.brute_force_index_cap {
           tracing::info!(
             vectors = index.len(),
@@ -333,10 +312,10 @@ impl<T: Dtype> RoxanneDb<T> {
               vector: ann.vectors.get(&id).unwrap().to_vec(),
             });
           }
-          txn.commit(&self.db);
-          *self.index.bf.write() = None;
+          txn.commit(&self.db).await;
+          *self.index.bf.write().await = None;
           self.index.medoid.store(ann.medoid(), Ordering::Relaxed);
-          *self.index.mode.write() = Mode::InMemory {
+          *self.index.mode.write().await = Mode::InMemory {
             graph: ann.graph,
             vectors: ann.vectors,
           };
@@ -348,128 +327,148 @@ impl<T: Dtype> RoxanneDb<T> {
           );
         };
         for c in batch_signals {
-          c.send(()).unwrap();
+          c.signal(());
         }
         continue;
       };
 
-      let txn = Mutex::new(DbTransaction::new());
-      let touched_nodes = DashSet::new();
-      batch_ids
-        .into_par_iter()
-        .zip(batch_vecs)
-        .for_each(|(id, v)| {
-          let mut candidates = HashSet::new();
-          self.index.greedy_search(
-            Query::Vec(&v.view()),
-            1,
-            self.index.vamana_params.update_search_list_cap,
-            1,
-            self.index.medoid.load(Ordering::Relaxed),
-            |n| !self.deleted.contains(&n.id),
-            Some(&mut candidates),
-            None,
-            None,
-          );
-          let neighbors = self
-            .index
-            .compute_robust_pruned(Query::Vec(&v.view()), candidates);
-          match &*self.index.mode.read() {
-            Mode::InMemory { graph, vectors } => {
-              graph.insert(id, neighbors.clone());
-              vectors.insert(id, v.clone());
+      let txn = Arc::new(tokio::sync::Mutex::new(DbTransaction::new()));
+      let touched_nodes = Arc::new(DashSet::new());
+      zip(batch_ids, batch_vecs)
+        .map(|(id, v)| {
+          let roxanne = self.clone();
+          let txn = txn.clone();
+          let touched_nodes = touched_nodes.clone();
+          // Spawn as we'll do CPU-heavy `compute_robust_pruned` and `pq.encode_1` (.for_each_concurrent is not sufficient as it's single-threaded).
+          tokio::spawn(async move {
+            let mut candidates = HashSet::new();
+            roxanne
+              .index
+              .greedy_search_async(GreedySearchParams {
+                query: Query::Vec(&v.view()),
+                k: 1,
+                search_list_cap: roxanne.index.vamana_params.update_search_list_cap,
+                beam_width: 1,
+                start: roxanne.index.medoid.load(Ordering::Relaxed),
+                filter: |n| !roxanne.deleted.contains(&n),
+                out_visited: Some(&mut candidates),
+                out_metrics: None,
+                ground_truth: None,
+              })
+              .await;
+            // Don't run this in spawn_blocking; it's not I/O, it's CPU bound, and moving to a separate thread doesn't unblock that CPU that would be used.
+            let neighbors = roxanne
+              .index
+              .compute_robust_pruned(Query::Vec(&v.view()), candidates);
+            match &*roxanne.index.mode.read().await {
+              Mode::InMemory { graph, vectors } => {
+                graph.insert(id, neighbors.clone());
+                vectors.insert(id, v.clone());
+              }
+              Mode::LTI { pq, pq_vecs } => {
+                // We need to insert now because once we add to additional_out_neighbors, some queries may reach this new node and request its neighbors (and we haven't inserted it into the index yet). Also, later compute_robust_pruned calls from other nodes (when adding backedges) will fetch this vector, so insert into `temp_nodes` now.
+                // CORRECTNESS: our new `neighbors` can only contain current nodes and none from this insertion batch, so it's safe to expand any of the nodes in `neighbors` right now.
+                roxanne
+                  .index
+                  .temp_nodes
+                  .insert(id, (neighbors.clone(), v.clone()));
+                // We may as well pre-populate the cache now instead of reading from disk again later.
+                pq_vecs.insert(id, pq.encode_1(&v.view()));
+              }
             }
-            Mode::LTI { pq } => {
-              // We need to insert now because once we add to additional_out_neighbors, some queries may reach this new node and request its neighbors (and we haven't inserted it into the index yet). Also, later compute_robust_pruned calls from other nodes (when adding backedges) will fetch this vector, so insert into `temp_nodes` now.
-              // CORRECTNESS: our new `neighbors` can only contain current nodes and none from this insertion batch, so it's safe to expand any of the nodes in `neighbors` right now.
-              self
+            for j in neighbors.iter() {
+              // `id` cannot have existed in any existing out-neighbors of any node as it has just been created, so we don't need to check if it doesn't already exist in `out(j)` first.
+              roxanne
                 .index
-                .temp_nodes
-                .insert(id, (neighbors.clone(), v.clone()));
-              // We may as well pre-populate the cache now instead of reading from disk again later.
-              pq.pq_vecs.insert(id, pq.pq.encode_1(&v.view()));
+                .additional_out_neighbors
+                .entry(j)
+                .or_default()
+                .push(id);
+              roxanne
+                .index
+                .additional_edge_count
+                .fetch_add(1, Ordering::Relaxed);
+              touched_nodes.insert(j);
             }
-          }
-          for j in neighbors.iter() {
-            // `id` cannot have existed in any existing out-neighbors of any node as it has just been created, so we don't need to check if it doesn't already exist in `out(j)` first.
-            self
-              .index
-              .additional_out_neighbors
-              .entry(j)
-              .or_default()
-              .push(id);
-            self
-              .index
-              .additional_edge_count
-              .fetch_add(1, Ordering::Relaxed);
-            touched_nodes.insert(j);
-          }
-          txn.lock().write_node(id, &NodeData {
-            neighbors,
-            vector: v.to_vec(),
-          });
-        });
-      let flushed_adds_count = AtomicUsize::new(0);
+            txn.lock().await.write_node(id, &NodeData {
+              neighbors,
+              vector: v.to_vec(),
+            });
+          })
+        })
+        .collect::<FuturesUnordered<_>>()
+        .for_each(async |e| e.unwrap())
+        .await;
+      let flushed_adds_count = Arc::new(AtomicUsize::new(0));
       let touched_count = touched_nodes.len();
-      touched_nodes.into_iter().io_for_each(|id| {
-        let (new_neighbors, full_vec) = self.index.get_out_neighbors(id);
-        let mut new_neighbors = new_neighbors.into_vec();
-        // Clone so we can remove later if necessary (otherwise we'll deadlock).
-        let add_neighbors = self
-          .index
-          .additional_out_neighbors
-          .get(&id)
-          .unwrap()
-          .clone();
-        new_neighbors.extend(add_neighbors.iter());
-        if new_neighbors.len() <= self.cfg.max_degree_bound {
-          // Technically, we can always update the graph node's out neighbors if we're using in-memory index, but for a consistent code path we'll stick with using additional_out_neighbors even for in-memory.
-          let mut txn = txn.lock();
-          txn.write_additional_out_neighbors(id, &add_neighbors);
-        } else {
-          flushed_adds_count.fetch_add(1, Ordering::Relaxed);
-          // At this point, compute_robust_pruned will likely look up the vectors for our newly inserted vectors, which is why we have temp_nodes.
-          // Run in Rayon as we're currently in the I/O thread pool with thousands of threads, and this is CPU-bound, so we can't be running thousands of these.
-          let mut robust_pruned = Vec::new();
-          rayon::scope(|s| {
-            s.spawn(|_| {
-              robust_pruned = self
-                .index
-                .compute_robust_pruned(Query::Id(id), new_neighbors)
-            })
-          });
-          new_neighbors = robust_pruned;
-          let mut txn = txn.lock();
-          txn.write_node(id, &NodeData {
-            neighbors: new_neighbors.clone(),
-            // If LTI, full_vec will be Some; if in-memory, use get_point.
-            vector: full_vec
-              .map(|v| v.into_raw_vec())
-              // TODO Avoid cloning. (write_node should take a `&[T]`.)
-              .unwrap_or_else(|| self.index.get_point(id).into_vec()),
-          });
-          txn.delete_additional_out_neighbors(id);
-          drop(txn);
-          if let Mode::InMemory { graph, .. } = &*self.index.mode.read() {
-            graph.insert(id, new_neighbors);
-          };
-          // Technically, this affects LTI queries because we haven't committed the new NodeData yet; in reality, it's minor (very short period) and shouldn't matter.
-          self.index.additional_edge_count.fetch_sub(
-            self
+      touched_nodes
+        .iter()
+        .map(|id| {
+          let id = *id;
+          let roxanne = self.clone();
+          let flushed_adds_count = flushed_adds_count.clone();
+          let txn = txn.clone();
+          // Spawn as we'll do CPU-heavy compute_robust_pruned (.for_each_concurrent is not sufficient as it's single-threaded).
+          tokio::spawn(async move {
+            let (new_neighbors, full_vec) = roxanne.index.get_out_neighbors_async(id).await;
+            let mut new_neighbors = new_neighbors.into_vec();
+            // Clone so we can remove later if necessary (otherwise we'll deadlock).
+            let add_neighbors = roxanne
               .index
               .additional_out_neighbors
-              .remove(&id)
+              .get(&id)
               .unwrap()
-              .1
-              .len(),
-            Ordering::Relaxed,
-          );
-        }
-      });
-      txn.into_inner().commit(&self.db);
+              .clone();
+            new_neighbors.extend(add_neighbors.iter());
+            if new_neighbors.len() <= roxanne.cfg.max_degree_bound {
+              // Technically, we can always update the graph node's out neighbors if we're using in-memory index, but for a consistent code path we'll stick with using additional_out_neighbors even for in-memory.
+              let mut txn = txn.lock().await;
+              txn.write_additional_out_neighbors(id, &add_neighbors);
+            } else {
+              flushed_adds_count.fetch_add(1, Ordering::Relaxed);
+              // At this point, compute_robust_pruned will likely look up the vectors for our newly inserted vectors, which is why we have temp_nodes.
+              new_neighbors = roxanne
+                .index
+                .compute_robust_pruned(Query::Id(id), new_neighbors);
+              let mut txn = txn.lock().await;
+              txn.write_node(id, &NodeData {
+                neighbors: new_neighbors.clone(),
+                // If LTI, full_vec will be Some; if in-memory, use get_point.
+                vector: full_vec
+                  .map(|v| v.into_raw_vec())
+                  // TODO Avoid cloning. (write_node should take a `&[T]`.)
+                  .unwrap_or_else(|| roxanne.index.get_point(id).into_vec()),
+              });
+              txn.delete_additional_out_neighbors(id);
+              drop(txn);
+              if let Mode::InMemory { graph, .. } = &*roxanne.index.mode.read().await {
+                graph.insert(id, new_neighbors);
+              };
+              // Technically, this affects LTI queries because we haven't committed the new NodeData yet; in reality, it's minor (very short period) and shouldn't matter.
+              roxanne.index.additional_edge_count.fetch_sub(
+                roxanne
+                  .index
+                  .additional_out_neighbors
+                  .remove(&id)
+                  .unwrap()
+                  .1
+                  .len(),
+                Ordering::Relaxed,
+              );
+            }
+          })
+        })
+        .collect::<FuturesUnordered<_>>()
+        .for_each(async |e| e.unwrap())
+        .await;
+      Arc::into_inner(txn)
+        .unwrap()
+        .into_inner()
+        .commit(&self.db)
+        .await;
       self.index.temp_nodes.clear();
       for c in batch_signals {
-        c.send(()).unwrap();
+        c.signal(());
       }
       tracing::debug!(
         n = batch_n,
@@ -479,7 +478,7 @@ impl<T: Dtype> RoxanneDb<T> {
       );
 
       // Opportunity to transition from in-memory to long term index.
-      let new_mode = match &*self.index.mode.read() {
+      let new_mode = match &*self.index.mode.read().await {
         Mode::InMemory { vectors, .. } => {
           if vectors.len() <= self.cfg.in_memory_index_cap {
             // The subsequent code is StreamingMerge, which we don't (yet) support for in memory indices (only the on-disk LTI).
@@ -499,7 +498,7 @@ impl<T: Dtype> RoxanneDb<T> {
             mat.row_mut(i).assign(&*vec);
           }
           let pq = ProductQuantizer::train(&mat.view(), self.cfg.pq_subspaces);
-          self.blobs.write_pq_model(&pq);
+          self.blobs.write_pq_model(&pq).await;
           tracing::info!(
             sample_inputs = ss,
             subspaces = self.cfg.pq_subspaces,
@@ -510,7 +509,7 @@ impl<T: Dtype> RoxanneDb<T> {
 
           let mut txn = DbTransaction::new();
           txn.write_index_mode(DbIndexMode::LongTerm);
-          txn.commit(&self.db);
+          txn.commit(&self.db).await;
 
           // We may as well populate the cache now, instead of reading from disk again later.
           let pq_vecs = DashMap::new();
@@ -520,18 +519,12 @@ impl<T: Dtype> RoxanneDb<T> {
           });
 
           // We hold a read lock in this match arm, so we can't update yet.
-          Some(Mode::LTI {
-            pq: PqState {
-              db: self.db.clone(),
-              pq_vecs,
-              pq,
-            },
-          })
+          Some(Mode::LTI { pq_vecs, pq })
         }
         _ => None,
       };
       if let Some(m) = new_mode {
-        *self.index.mode.write() = m;
+        *self.index.mode.write().await = m;
         tracing::info!("transitioned to long term index");
         continue;
       };
@@ -561,63 +554,70 @@ impl<T: Dtype> RoxanneDb<T> {
       // In RocksDB, iterators view a snapshot of the entire DB at the time of iterator creation, so we can safely modify DB entries during iteration. https://github.com/facebook/rocksdb/wiki/Iterator
       let touched = AtomicUsize::new(0);
       // We iterate all nodes, as we don't know which nodes have edges to a node in `deleted` (backedges do exist but are regularly pruned). This is the approach in the FreshDiskANN paper.
-      self.db.iter_nodes::<T>().io_for_each(|(id, node)| {
-        if deleted.contains(&id) {
-          return;
-        };
-
-        let mut deleted_neighbors = Vec::new();
-        let new_neighbors = DashSet::new();
-        for n in node.neighbors.iter() {
-          if deleted.contains(&n) {
-            deleted_neighbors.push(n);
-          } else {
-            new_neighbors.insert(n);
+      self
+        .db
+        .iter_nodes::<T>()
+        .for_each_concurrent(None, async |(id, node)| {
+          if deleted.contains(&id) {
+            return;
           };
-        }
-        let add = self.index.additional_out_neighbors.remove(&id).map(|e| e.1);
-        if add.is_none() && deleted_neighbors.is_empty() {
-          // Node is untouched.
-          return;
-        };
-        touched.fetch_add(1, Ordering::Relaxed);
-        if let Some(add) = add {
-          self
-            .index
-            .additional_edge_count
-            .fetch_sub(add.len(), Ordering::Relaxed);
-          for n in add {
-            if !deleted.contains(&n) {
+
+          let mut deleted_neighbors = Vec::new();
+          let new_neighbors = DashSet::new();
+          for n in node.neighbors.iter() {
+            if deleted.contains(&n) {
+              deleted_neighbors.push(n);
+            } else {
               new_neighbors.insert(n);
             };
           }
-        }
-        deleted_neighbors.into_iter().io_for_each(|n_id| {
-          for n in self.db.read_node::<T>(n_id).neighbors {
-            if !deleted.contains(&n) {
-              new_neighbors.insert(n);
-            };
+          let add = self.index.additional_out_neighbors.remove(&id).map(|e| e.1);
+          if add.is_none() && deleted_neighbors.is_empty() {
+            // Node is untouched.
+            return;
+          };
+          touched.fetch_add(1, Ordering::Relaxed);
+          if let Some(add) = add {
+            self
+              .index
+              .additional_edge_count
+              .fetch_sub(add.len(), Ordering::Relaxed);
+            for n in add {
+              if !deleted.contains(&n) {
+                new_neighbors.insert(n);
+              };
+            }
           }
-        });
-        // We're in thousands of I/O threads right now, and this is CPU-parallel work, so use Rayon.
-        let mut robust_pruned = Vec::new();
-        rayon::scope(|s| {
-          s.spawn(|_| {
-            robust_pruned = self
+          iter(deleted_neighbors)
+            .for_each_concurrent(None, async |n_id| {
+              for n in self.db.read_node::<T>(n_id).await.neighbors {
+                if !deleted.contains(&n) {
+                  new_neighbors.insert(n);
+                };
+              }
+            })
+            .await;
+
+          // Spawn as we'll do CPU-heavy compute_robust_pruned (our current .for_each_concurrent is not sufficient as it's single-threaded).
+          let roxanne = self.clone();
+          tokio::spawn(async move {
+            // Don't run this in spawn_blocking; it's not I/O, it's CPU bound, and moving to a separate thread doesn't unblock that CPU that would be used.
+            let new_neighbors = roxanne
               .index
               .compute_robust_pruned(Query::Id(id), new_neighbors);
-          })
-        });
-        let new_neighbors = robust_pruned;
 
-        let mut txn = DbTransaction::new();
-        txn.write_node(id, &NodeData {
-          neighbors: new_neighbors,
-          vector: node.vector,
-        });
-        txn.delete_additional_out_neighbors(id);
-        txn.commit(&self.db);
-      });
+            let mut txn = DbTransaction::new();
+            txn.write_node(id, &NodeData {
+              neighbors: new_neighbors,
+              vector: node.vector,
+            });
+            txn.delete_additional_out_neighbors(id);
+            txn.commit(&roxanne.db).await;
+          })
+          .await
+          .unwrap();
+        })
+        .await;
 
       let mut txn = DbTransaction::new();
       for &id in deleted.iter() {
@@ -625,14 +625,14 @@ impl<T: Dtype> RoxanneDb<T> {
         txn.delete_additional_out_neighbors(id);
         txn.delete_node(id);
       }
-      txn.commit(&self.db);
+      txn.commit(&self.db).await;
 
-      let Mode::LTI { pq } = &*self.index.mode.read() else {
+      let Mode::LTI { pq_vecs, .. } = &*self.index.mode.read().await else {
         unreachable!();
       };
       for &id in deleted.iter() {
         self.deleted.remove(&id);
-        pq.pq_vecs.remove(&id);
+        pq_vecs.remove(&id);
         if let Some(add) = self.index.additional_out_neighbors.remove(&id) {
           self
             .index
@@ -650,10 +650,12 @@ impl<T: Dtype> RoxanneDb<T> {
 }
 
 impl<T: Dtype> RoxanneDb<T> {
-  pub fn open(dir: PathBuf) -> Arc<RoxanneDb<T>> {
-    let blobs = BlobStore::open(dir.join("blobs"));
-    let cfg: RoxanneDbCfg =
-      toml::from_str(&fs::read_to_string(dir.join("roxanne.toml")).unwrap()).unwrap();
+  pub async fn open(dir: PathBuf) -> Arc<RoxanneDb<T>> {
+    let blobs = BlobStore::open(dir.join("blobs")).await;
+    let cfg_raw = tokio::fs::read_to_string(dir.join("roxanne.toml"))
+      .await
+      .unwrap();
+    let cfg: RoxanneDbCfg = toml::from_str(&cfg_raw).unwrap();
     let metric = cfg.metric.get_fn::<T>();
     let vamana_params = VamanaParams {
       degree_bound: cfg.degree_bound,
@@ -662,70 +664,77 @@ impl<T: Dtype> RoxanneDb<T> {
       update_search_list_cap: cfg.update_search_list_cap,
     };
 
-    let db = Arc::new(Db::open(dir.join("db")));
-    let mut next_id = 0;
+    let db = Arc::new(Db::open(dir.join("db")).await);
+    let next_id = parking_lot::Mutex::new(0);
     let deleted = DashSet::new();
-    for id in db.iter_deleted() {
-      next_id = max(id + 1, next_id);
-      deleted.insert(id);
-    }
-    for (id, _) in db.iter_ids() {
-      next_id = max(id + 1, next_id);
-    }
+    db.iter_deleted()
+      .for_each(async |id| {
+        deleted.insert(id);
+        let mut next_id = next_id.lock();
+        *next_id = max(id + 1, *next_id);
+      })
+      .await;
+    db.iter_ids()
+      .for_each(async |(id, _)| {
+        let mut next_id = next_id.lock();
+        *next_id = max(id + 1, *next_id);
+      })
+      .await;
+    let next_id = next_id.into_inner();
 
     let additional_out_neighbors = DashMap::new();
     let additional_edge_count = AtomicUsize::new(0);
     db.iter_additional_out_neighbors()
-      .par_bridge()
-      .for_each(|(id, add)| {
+      .for_each(async |(id, add)| {
         additional_edge_count.fetch_add(add.len(), Ordering::Relaxed);
         additional_out_neighbors.insert(id, add);
-      });
+      })
+      .await;
 
-    let mode = db.read_index_mode();
+    let mode = db.read_index_mode().await;
 
     let index = Index {
       bf: RwLock::new(if mode == DbIndexMode::BruteForce {
         let bf = BruteForceIndex::new(metric);
         db.iter_brute_force_vecs::<T>()
-          .par_bridge()
-          .for_each(|(id, vec)| {
+          .for_each(async |(id, vec)| {
             bf.insert(id, Array1::from_vec(vec));
-          });
+          })
+          .await;
         Some(Arc::new(bf))
       } else {
         None
       }),
       db: db.clone(),
       // In BruteForce mode (e.g. init), there is no medoid.
-      medoid: db.maybe_read_medoid().unwrap_or(Id::MAX).into(),
+      medoid: db.maybe_read_medoid().await.unwrap_or(Id::MAX).into(),
       metric,
       vamana_params,
       additional_out_neighbors,
       additional_edge_count,
       temp_nodes: DashMap::new(),
       mode: RwLock::new(if mode == DbIndexMode::LongTerm {
-        let pq = blobs.read_pq_model();
+        let pq = blobs.read_pq_model().await;
+        // TODO Build pq_vecs from existing nodes.
         Mode::LTI {
-          pq: PqState {
-            db: db.clone(),
-            pq,
-            pq_vecs: DashMap::new(),
-          },
+          pq,
+          pq_vecs: DashMap::new(),
         }
       } else {
         // This also handles BruteForce mode (this'll be empty.)
         let graph = Arc::new(DashMap::new());
         let vectors = Arc::new(DashMap::new());
-        db.iter_nodes().par_bridge().for_each(|(id, n)| {
-          graph.insert(id, n.neighbors);
-          vectors.insert(id, Array1::from_vec(n.vector));
-        });
+        db.iter_nodes()
+          .for_each(async |(id, n)| {
+            graph.insert(id, n.neighbors);
+            vectors.insert(id, Array1::from_vec(n.vector));
+          })
+          .await;
         Mode::InMemory { graph, vectors }
       }),
     };
 
-    let (send, recv) = std::sync::mpsc::channel();
+    let (send, recv) = flume::unbounded();
     let roxanne = Arc::new(RoxanneDb {
       blobs,
       cfg,
@@ -736,33 +745,45 @@ impl<T: Dtype> RoxanneDb<T> {
       next_id: AtomicUsize::new(next_id),
       update_sender: send,
     });
-    thread::spawn({
+    tokio::spawn({
       let roxanne = roxanne.clone();
-      move || roxanne.updater_thread(recv)
+      async move {
+        roxanne.updater_thread(recv).await;
+      }
     });
     roxanne
   }
 
-  pub fn query(&self, query: &ArrayView1<T>, k: usize) -> Vec<(String, f64)> {
-    let res = match self.index.bf.read().as_ref() {
+  pub async fn query<'a>(&'a self, query: &'a ArrayView1<'a, T>, k: usize) -> Vec<(String, f64)> {
+    let res = match self.index.bf.read().await.as_ref() {
+      // Don't run this in spawn_blocking; it's not I/O, it's CPU bound, and moving to a separate thread doesn't unblock that CPU that would be used.
       Some(bf) => bf.query(query, k, |n| !self.deleted.contains(&n)),
-      None => self.index.greedy_search(
-        Query::Vec(query),
-        k,
-        self.cfg.query_search_list_cap,
-        self.cfg.beam_width,
-        self.index.medoid(),
-        |n| !self.deleted.contains(&n.id),
-        None,
-        None,
-        None,
-      ),
+      None => {
+        self
+          .index
+          .greedy_search_async(GreedySearchParams {
+            query: Query::Vec(query),
+            k,
+            search_list_cap: self.cfg.query_search_list_cap,
+            beam_width: self.cfg.beam_width,
+            start: self.index.medoid(),
+            filter: |n| !self.deleted.contains(&n),
+            out_visited: None,
+            out_metrics: None,
+            ground_truth: None,
+          })
+          .await
+      }
     };
-    res
-      .into_iter()
+    let keys = res
+      .iter()
+      .map_concurrent(|r| self.db.maybe_read_key(r.id))
+      .collect::<Vec<_>>()
+      .await;
+    zip(keys, res)
       // A node may have been deleted during the query (already collected, so didn't get filtered), or literally just after the end of the query but before here.
       // TODO DOCUMENT: it's possible to get less than k for the above reason.
-      .io_filter_map(|r| self.db.maybe_read_key(r.id).map(|k| (k, r.dist)))
+      .filter_map(|(k, r)| k.map(|k| (k, r.dist)))
       .collect()
   }
 
@@ -772,52 +793,59 @@ impl<T: Dtype> RoxanneDb<T> {
   // - Both above points means that we should have some mechanism of returning a "busy" signal to the caller, instead of just accepting into unbounded memory or blocking the caller.
   // - We don't want to perform any compaction within the function (instead running it in a background thread), as otherwise that negatively affects the insertion call latency for the one unlucky caller.
   // Require a Map to ensure there are no duplicate keys (which would otherwise complicate insertion).
-  pub fn insert(&self, entries: BTreeMap<String, Array1<T>>) -> Result<(), RoxanneDbError> {
+  pub async fn insert(&self, entries: BTreeMap<String, Array1<T>>) -> Result<(), RoxanneDbError> {
     let n = entries.len();
 
     let ids_base = self.next_id.fetch_add(n, Ordering::Relaxed);
     let ids = (0..n).map(|i| ids_base + i).collect_vec();
 
-    let vectors = zip(ids.clone(), entries)
-      .io_map(|(id, (k, v))| {
-        let locker = self.key_locks.get(k.clone());
-        let _lock = locker.lock();
-        // TODO FIX/DOCUMENT: For simplicity and performance reasons, the deletion of an existing vector with the same key is **not** atomic; always retry inserts. The alternative seems to be to hold a lock on the key for the entirety of its insert in updater_thread.
-        let mut txn = DbTransaction::new();
-        if let Some(ex_id) = self.db.maybe_read_id(&k) {
-          txn.write_deleted(ex_id);
-          txn.delete_key(ex_id);
-          self.deleted.insert(id);
-        };
-        // CORRECTNESS: even though we haven't actually inserted anything at ID, it's safe to commit the key <-> ID link now, as:
-        // - We don't support retrieving vectors by key.
-        // - If it gets marked as deleted later, that's fine as our algorithm doesn't expect delete-marked nodes to exist (even during merging).
-        // - No result will come back with this ID.
-        txn.write_key(id, &k);
-        txn.write_id(&k, id);
-        txn.commit(&self.db);
+    let vectors = zip(&ids, entries)
+      .map_concurrent(|(&id, (k, v))| {
+        async move {
+          let locker = self.key_locks.get(k.clone());
+          let _lock = locker.lock();
+          // TODO FIX/DOCUMENT: For simplicity and performance reasons, the deletion of an existing vector with the same key is **not** atomic; always retry inserts. The alternative seems to be to hold a lock on the key for the entirety of its insert in updater_thread.
+          let mut txn = DbTransaction::new();
+          if let Some(ex_id) = self.db.maybe_read_id(&k).await {
+            txn.write_deleted(ex_id);
+            txn.delete_key(ex_id);
+            self.deleted.insert(id);
+          };
+          // CORRECTNESS: even though we haven't actually inserted anything at ID, it's safe to commit the key <-> ID link now, as:
+          // - We don't support retrieving vectors by key.
+          // - If it gets marked as deleted later, that's fine as our algorithm doesn't expect delete-marked nodes to exist (even during merging).
+          // - No result will come back with this ID.
+          txn.write_key(id, &k);
+          txn.write_id(&k, id);
+          txn.commit(&self.db).await;
 
-        // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
-        v.mapv(nan_to_num)
+          // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
+          v.mapv(nan_to_num)
+        }
       })
-      .collect();
+      .collect::<Vec<_>>()
+      .await;
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    self.update_sender.send((ids, vectors, tx)).unwrap();
-    rx.recv().unwrap();
+    let (signal, ctl) = SignalFuture::new();
+    self
+      .update_sender
+      .send_async((ids, vectors, ctl))
+      .await
+      .unwrap();
+    signal.await;
     Ok(())
   }
 
-  pub fn delete(&self, key: &str) -> Result<(), RoxanneDbError> {
+  pub async fn delete(&self, key: &str) -> Result<(), RoxanneDbError> {
     let locker = self.key_locks.get(key.to_string());
     let lock = locker.lock();
-    let id = self.db.maybe_read_id(key);
+    let id = self.db.maybe_read_id(key).await;
     if let Some(id) = id {
       let mut txn = DbTransaction::new();
       txn.write_deleted(id);
       txn.delete_id(key);
       txn.delete_key(id);
-      txn.commit(&self.db);
+      txn.commit(&self.db).await;
     };
     drop(lock);
 
@@ -1113,8 +1141,8 @@ mod tests {
       Mode::InMemory { .. } => {
         unreachable!();
       }
-      Mode::LTI { pq } => {
-        assert_eq!(pq.pq_vecs.len(), 2722);
+      Mode::LTI { pq_vecs, .. } => {
+        assert_eq!(pq_vecs.len(), 2722);
       }
     };
     assert_eq!(db.db.iter_brute_force_vecs::<f32>().count(), 0);
@@ -1154,8 +1182,8 @@ mod tests {
       Mode::InMemory { .. } => {
         unreachable!();
       }
-      Mode::LTI { pq } => {
-        assert_eq!(pq.pq_vecs.len(), expected_post_merge_nodes);
+      Mode::LTI { pq_vecs, .. } => {
+        assert_eq!(pq_vecs.len(), expected_post_merge_nodes);
       }
     };
     assert_eq!(db.db.iter_nodes::<f32>().count(), expected_post_merge_nodes);
