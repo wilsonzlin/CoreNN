@@ -46,8 +46,7 @@ fn default_query_search_list_cap() -> usize {
 }
 
 fn update_batch_size() -> usize {
-  // Enough to saturate 100-core machine.
-  1024
+  64
 }
 
 fn update_search_list_cap() -> usize {
