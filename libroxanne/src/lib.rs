@@ -33,6 +33,8 @@ use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::Array2;
 use ndarray::ArrayView1;
+use parking_lot::Mutex;
+use parking_lot::RwLock;
 use pq::ProductQuantizer;
 use rand::seq::IteratorRandom;
 use rand::thread_rng;
@@ -55,7 +57,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::RwLock;
 use util::ArcMap;
 use vamana::Vamana;
 use vamana::VamanaParams;
@@ -96,7 +97,6 @@ struct Index<T: Dtype> {
   // - inserting into a Vamana graph with zero or only a few nodes has complications (e.g. RobustPrune may actually make a node unreachable)
   bf: RwLock<Option<Arc<BruteForceIndex<T>>>>,
   db: Arc<Db>,
-  // We use tokio::RwLock as it supports holding lock guards within Future when using join_all (parking_lot::RwLock does not).
   mode: RwLock<Mode<T>>,
   // This changes when we transition from BF to InMemory.
   medoid: AtomicUsize,
@@ -178,7 +178,7 @@ impl<T: Dtype> GreedySearchable<T> for Index<T> {
     if let Some(temp) = self.temp_nodes.get(&id) {
       return IndexPoint::Temp(temp);
     }
-    match &*self.mode.blocking_read() {
+    match &*self.mode.read() {
       Mode::InMemory { vectors, .. } => {
         IndexPoint::InMemory(ArcMap::map(vectors.clone(), |v| v.get(&id).unwrap()))
       }
@@ -210,8 +210,9 @@ impl<T: Dtype> GreedySearchableAsync<T> for Index<T> {
         None,
       );
     }
-    match &*self.mode.read().await {
-      Mode::InMemory { graph, .. } => (
+    // Don't use `match` as we can't hold lock across await in Mode::LTI branch.
+    if let Mode::InMemory { graph, .. } = &*self.mode.read() {
+      return (
         IndexNeighbors {
           base: IndexNeighborsBase::InMemory(ArcMap::map(Arc::clone(&graph), |g| {
             g.get(&id).unwrap()
@@ -219,18 +220,16 @@ impl<T: Dtype> GreedySearchableAsync<T> for Index<T> {
           add: self.additional_out_neighbors.get(&id),
         },
         None,
-      ),
-      Mode::LTI { .. } => {
-        let n = self.db.read_node(id).await;
-        (
-          IndexNeighbors {
-            base: IndexNeighborsBase::LTI(n.neighbors),
-            add: self.additional_out_neighbors.get(&id),
-          },
-          Some(Array1::from(n.vector)),
-        )
-      }
-    }
+      );
+    };
+    let n = self.db.read_node(id).await;
+    (
+      IndexNeighbors {
+        base: IndexNeighborsBase::LTI(n.neighbors),
+        add: self.additional_out_neighbors.get(&id),
+      },
+      Some(Array1::from(n.vector)),
+    )
   }
 }
 
@@ -248,7 +247,7 @@ pub struct RoxanneDb<T: Dtype> {
   db: Arc<Db>,
   deleted: DashSet<Id>,
   index: Index<T>,
-  key_locks: ArbitraryLock<String, parking_lot::Mutex<()>>,
+  key_locks: ArbitraryLock<String, Mutex<()>>,
   next_id: AtomicUsize,
   update_sender: Sender<(Vec<Id>, Vec<Array1<T>>, SignalFutureController<()>)>,
 }
@@ -276,7 +275,7 @@ impl<T: Dtype> RoxanneDb<T> {
       // If we are in brute force index mode, then handle differently (it's not a graph, so update process is different).
       // BruteForceIndex is wrapped in Arc so we can work on it while dropping the lock (so we can potentially replace it).
       // WARNING: Do not inline this to the `if` RHS; in Rust, given `a.b.c`, `a` is dropped but `b` is not, so if we inline this, we'll hold the lock.
-      let bf = self.index.bf.read().await.clone();
+      let bf = self.index.bf.read().clone();
       if let Some(index) = bf {
         tracing::debug!(current_size = index.len(), "brute force index exists");
         for (&id, v) in zip(&batch_ids, batch_vecs) {
@@ -313,9 +312,9 @@ impl<T: Dtype> RoxanneDb<T> {
             });
           }
           txn.commit(&self.db).await;
-          *self.index.bf.write().await = None;
+          *self.index.bf.write() = None;
           self.index.medoid.store(ann.medoid(), Ordering::Relaxed);
-          *self.index.mode.write().await = Mode::InMemory {
+          *self.index.mode.write() = Mode::InMemory {
             graph: ann.graph,
             vectors: ann.vectors,
           };
@@ -332,6 +331,7 @@ impl<T: Dtype> RoxanneDb<T> {
         continue;
       };
 
+      // We must use Tokio's lock as we need to hold across await.
       let txn = Arc::new(tokio::sync::Mutex::new(DbTransaction::new()));
       let touched_nodes = Arc::new(DashSet::new());
       zip(batch_ids, batch_vecs)
@@ -360,7 +360,7 @@ impl<T: Dtype> RoxanneDb<T> {
             let neighbors = roxanne
               .index
               .compute_robust_pruned(Query::Vec(&v.view()), candidates);
-            match &*roxanne.index.mode.read().await {
+            match &*roxanne.index.mode.read() {
               Mode::InMemory { graph, vectors } => {
                 graph.insert(id, neighbors.clone());
                 vectors.insert(id, v.clone());
@@ -441,7 +441,7 @@ impl<T: Dtype> RoxanneDb<T> {
               });
               txn.delete_additional_out_neighbors(id);
               drop(txn);
-              if let Mode::InMemory { graph, .. } = &*roxanne.index.mode.read().await {
+              if let Mode::InMemory { graph, .. } = &*roxanne.index.mode.read() {
                 graph.insert(id, new_neighbors);
               };
               // Technically, this affects LTI queries because we haven't committed the new NodeData yet; in reality, it's minor (very short period) and shouldn't matter.
@@ -478,53 +478,51 @@ impl<T: Dtype> RoxanneDb<T> {
       );
 
       // Opportunity to transition from in-memory to long term index.
-      let new_mode = match &*self.index.mode.read().await {
-        Mode::InMemory { vectors, .. } => {
-          if vectors.len() <= self.cfg.in_memory_index_cap {
-            // The subsequent code is StreamingMerge, which we don't (yet) support for in memory indices (only the on-disk LTI).
-            // TODO Should we support it?
-            continue;
-          };
-          tracing::info!("transitioning in-memory index to long term index");
-          // Since we've never built a LTI before, we need to build the PQ now.
-          let ss = min(vectors.len(), self.cfg.pq_sample_size);
-          let mut mat = Array2::zeros((ss, self.cfg.dim));
-          for (i, vec) in vectors
-            .iter()
-            .choose_multiple(&mut thread_rng(), ss)
-            .into_iter()
-            .enumerate()
-          {
-            mat.row_mut(i).assign(&*vec);
-          }
-          let pq = ProductQuantizer::train(&mat.view(), self.cfg.pq_subspaces);
-          self.blobs.write_pq_model(&pq).await;
-          tracing::info!(
-            sample_inputs = ss,
-            subspaces = self.cfg.pq_subspaces,
-            "trained PQ"
-          );
-          // Free memory now.
-          drop(mat);
-
-          let mut txn = DbTransaction::new();
-          txn.write_index_mode(DbIndexMode::LongTerm);
-          txn.commit(&self.db).await;
-
-          // We may as well populate the cache now, instead of reading from disk again later.
-          let pq_vecs = DashMap::new();
-          vectors.par_iter().for_each(|e| {
-            let (&id, vec) = e.pair();
-            pq_vecs.insert(id, pq.encode_1(&vec.view()));
-          });
-
-          // We hold a read lock in this match arm, so we can't update yet.
-          Some(Mode::LTI { pq_vecs, pq })
-        }
+      // Clone (cheap Arc) so we can release lock and not have to hold it across .await.
+      let in_memory_vecs = match &*self.index.mode.read() {
+        Mode::InMemory { vectors, .. } => Some(vectors.clone()),
         _ => None,
       };
-      if let Some(m) = new_mode {
-        *self.index.mode.write().await = m;
+      if let Some(vectors) = in_memory_vecs {
+        // The subsequent code is StreamingMerge, which we don't (yet) support for in memory indices (only the on-disk LTI).
+        if vectors.len() <= self.cfg.in_memory_index_cap {
+          // TODO Should we support it?
+          continue;
+        };
+        tracing::info!("transitioning in-memory index to long term index");
+        // Since we've never built a LTI before, we need to build the PQ now.
+        let ss = min(vectors.len(), self.cfg.pq_sample_size);
+        let mut mat = Array2::zeros((ss, self.cfg.dim));
+        for (i, vec) in vectors
+          .iter()
+          .choose_multiple(&mut thread_rng(), ss)
+          .into_iter()
+          .enumerate()
+        {
+          mat.row_mut(i).assign(&*vec);
+        }
+        let pq = ProductQuantizer::train(&mat.view(), self.cfg.pq_subspaces);
+        self.blobs.write_pq_model(&pq).await;
+        tracing::info!(
+          sample_inputs = ss,
+          subspaces = self.cfg.pq_subspaces,
+          "trained PQ"
+        );
+        // Free memory now.
+        drop(mat);
+
+        let mut txn = DbTransaction::new();
+        txn.write_index_mode(DbIndexMode::LongTerm);
+        txn.commit(&self.db).await;
+
+        // We may as well populate the cache now, instead of reading from disk again later.
+        let pq_vecs = DashMap::new();
+        vectors.par_iter().for_each(|e| {
+          let (&id, vec) = e.pair();
+          pq_vecs.insert(id, pq.encode_1(&vec.view()));
+        });
+
+        *self.index.mode.write() = Mode::LTI { pq_vecs, pq };
         tracing::info!("transitioned to long term index");
         continue;
       };
@@ -627,7 +625,7 @@ impl<T: Dtype> RoxanneDb<T> {
       }
       txn.commit(&self.db).await;
 
-      let Mode::LTI { pq_vecs, .. } = &*self.index.mode.read().await else {
+      let Mode::LTI { pq_vecs, .. } = &*self.index.mode.read() else {
         unreachable!();
       };
       for &id in deleted.iter() {
@@ -665,7 +663,7 @@ impl<T: Dtype> RoxanneDb<T> {
     };
 
     let db = Arc::new(Db::open(dir.join("db")).await);
-    let next_id = parking_lot::Mutex::new(0);
+    let next_id = Mutex::new(0);
     let deleted = DashSet::new();
     db.iter_deleted()
       .for_each(async |id| {
@@ -755,25 +753,26 @@ impl<T: Dtype> RoxanneDb<T> {
   }
 
   pub async fn query<'a>(&'a self, query: &'a ArrayView1<'a, T>, k: usize) -> Vec<(String, f64)> {
-    let res = match self.index.bf.read().await.as_ref() {
+    // We must (cheaply) clone to avoid holding lock across await.
+    let bf = self.index.bf.read().clone();
+    let res = if let Some(bf) = bf {
       // Don't run this in spawn_blocking; it's not I/O, it's CPU bound, and moving to a separate thread doesn't unblock that CPU that would be used.
-      Some(bf) => bf.query(query, k, |n| !self.deleted.contains(&n)),
-      None => {
-        self
-          .index
-          .greedy_search_async(GreedySearchParams {
-            query: Query::Vec(query),
-            k,
-            search_list_cap: self.cfg.query_search_list_cap,
-            beam_width: self.cfg.beam_width,
-            start: self.index.medoid(),
-            filter: |n| !self.deleted.contains(&n),
-            out_visited: None,
-            out_metrics: None,
-            ground_truth: None,
-          })
-          .await
-      }
+      bf.query(query, k, |n| !self.deleted.contains(&n))
+    } else {
+      self
+        .index
+        .greedy_search_async(GreedySearchParams {
+          query: Query::Vec(query),
+          k,
+          search_list_cap: self.cfg.query_search_list_cap,
+          beam_width: self.cfg.beam_width,
+          start: self.index.medoid(),
+          filter: |n| !self.deleted.contains(&n),
+          out_visited: None,
+          out_metrics: None,
+          ground_truth: None,
+        })
+        .await
     };
     let keys = res
       .iter()
@@ -864,11 +863,14 @@ mod tests {
   use crate::common::StdMetric;
   use crate::db::DbIndexMode;
   use crate::in_memory::calc_approx_medoid;
-  use crate::util::IoIteratorExt;
+  use crate::util::AsyncConcurrentIteratorExt;
+  use crate::util::AsyncConcurrentStreamExt;
   use crate::Mode;
   use crate::RoxanneDb;
   use ahash::HashSet;
   use dashmap::DashSet;
+  use futures::stream::iter;
+  use futures::StreamExt;
   use itertools::Itertools;
   use ndarray::Array1;
   use ordered_float::OrderedFloat;
@@ -876,20 +878,17 @@ mod tests {
   use rand::thread_rng;
   use rand::Rng;
   use rayon::iter::IntoParallelIterator;
-  use rayon::iter::IntoParallelRefIterator;
-  use rayon::iter::ParallelBridge;
   use rayon::iter::ParallelIterator;
   use std::fs;
   use std::iter::once;
   use std::path::PathBuf;
-  use std::sync::atomic::AtomicUsize;
   use std::sync::atomic::Ordering;
   use std::thread::sleep;
   use std::time::Duration;
   use std::time::Instant;
 
-  #[test]
-  fn test_roxanne() {
+  #[tokio::test]
+  async fn test_roxanne() {
     tracing_subscriber::fmt()
       .with_max_level(tracing::Level::DEBUG)
       .init();
@@ -946,90 +945,105 @@ mod tests {
       .unwrap(),
     )
     .unwrap();
-    let db = RoxanneDb::open(dir);
+    let rx = RoxanneDb::open(dir).await;
     tracing::info!("opened database");
 
     // First test: an empty DB should provide no results.
-    let res = db.query(&gen().view(), 100);
+    let res = rx.query(&gen().view(), 100).await;
     assert_eq!(res.len(), 0);
 
     let deleted = DashSet::new();
-    let assert_accuracy = |below_i: usize, exp_acc: f64| {
-      let mode = db.db.read_index_mode();
-      let start = Instant::now();
-      let correct = AtomicUsize::new(0);
-      let total = AtomicUsize::new(0);
-      // When BruteForce or InMemory, we should use Rayon, but for simplicity we'll just always use I/O thread pool.
-      // (For LongTerm, we want to use I/O thread pool.)
-      (0..below_i).io_for_each(|i| {
-        let res = db.query(&vecs[i].view(), 100);
-        let got = res
-          .iter()
-          .map(|e| e.0.parse::<usize>().unwrap())
-          .collect::<HashSet<_>>();
-        let want = nn[i]
-          .iter()
-          .cloned()
-          .filter(|&n| n < below_i && !deleted.contains(&n))
-          .take(100)
-          .collect::<HashSet<_>>();
-        total.fetch_add(want.len(), Ordering::Relaxed);
-        correct.fetch_add(want.intersection(&got).count(), Ordering::Relaxed);
-      });
-      let accuracy = correct.load(Ordering::Relaxed) as f64 / total.load(Ordering::Relaxed) as f64;
-      let exec_ms = start.elapsed().as_millis_f64();
-      tracing::info!(
-        mode = format!("{:?}", mode),
-        accuracy,
-        qps = below_i as f64 / exec_ms * 1000.0,
-        "accuracy"
-      );
-      assert!(accuracy >= exp_acc);
-    };
+    macro_rules! assert_accuracy {
+      ($below_i:expr, $exp_acc:expr) => {{
+        tracing::debug!(n = $below_i, "running queries");
+        let mode = rx.db.read_index_mode().await;
+        let start = Instant::now();
+        let mut correct = 0;
+        let mut total = 0;
+        let results = (0..$below_i)
+          .map_concurrent(async |i| {
+            tokio::spawn({
+              let rx = rx.clone();
+              let vec = vecs[i].clone();
+              async move { rx.query(&vec.view(), 100).await }
+            })
+            .await
+            .unwrap()
+          })
+          .collect_vec()
+          .await;
+        for (i, res) in results.into_iter().enumerate() {
+          let got = res
+            .iter()
+            .map(|e| e.0.parse::<usize>().unwrap())
+            .collect::<HashSet<_>>();
+          let want = nn[i]
+            .iter()
+            .cloned()
+            .filter(|&n| n < $below_i && !deleted.contains(&n))
+            .take(100)
+            .collect::<HashSet<_>>();
+          total += want.len();
+          correct += want.intersection(&got).count();
+        }
+        let accuracy = correct as f64 / total as f64;
+        let exec_ms = start.elapsed().as_millis_f64();
+        tracing::info!(
+          mode = format!("{:?}", mode),
+          accuracy,
+          qps = $below_i as f64 / exec_ms * 1000.0,
+          "accuracy"
+        );
+        assert!(accuracy >= $exp_acc);
+      }};
+    }
 
     // Insert below brute force index cap.
-    db.insert([("0".to_string(), vecs[0].clone())].into_iter().collect())
+    rx.insert([("0".to_string(), vecs[0].clone())].into_iter().collect())
+      .await
       .unwrap();
-    let res = db.query(&vecs[0].view(), 100);
+    let res = rx.query(&vecs[0].view(), 100).await;
     assert_eq!(res.len(), 1);
     assert_eq!(&res[0].0, "0");
 
     // Still below brute force index cap.
-    db.insert((1..734).map(|i| (i.to_string(), vecs[i].clone())).collect())
+    rx.insert((1..734).map(|i| (i.to_string(), vecs[i].clone())).collect())
+      .await
       .unwrap();
     // It's tempting to directly compare against `nn[i]` given BF's 100% accuracy, but it's still complicated due to 1) non-deterministic DB internal IDs assigned, and 2) unstable sorting (i.e. two same dists).
     // Accuracy can be very slightly less than 1.0 due to non-deterministic sorting of equal dist points.
-    assert_accuracy(734, 0.99);
+    assert_accuracy!(734, 0.99);
     tracing::info!("inserted 734 so far");
 
     // Delete some keys.
     // Deleting non-existent keys should do nothing.
     for i in [5, 90, 734, 735, 900, 10002] {
-      db.delete(&i.to_string()).unwrap();
+      rx.delete(&i.to_string()).await.unwrap();
     }
-    assert_eq!(db.deleted.len(), 2);
+    assert_eq!(rx.deleted.len(), 2);
     deleted.insert(5);
     deleted.insert(90);
 
     // Still below brute force index cap.
-    db.insert(
+    rx.insert(
       (734..1000)
         .map(|i| (i.to_string(), vecs[i].clone()))
         .collect(),
     )
+    .await
     .unwrap();
     // Accuracy can be very slightly less than 1.0 due to non-deterministic sorting of equal dist points.
-    assert_accuracy(1000, 0.99);
+    assert_accuracy!(1000, 0.99);
     tracing::info!("inserted 1000 so far");
     // Ensure the updater_thread isn't doing anything.
     sleep(Duration::from_secs(1));
 
-    assert_eq!(db.deleted.len(), 2);
-    assert_eq!(db.next_id.load(Ordering::Relaxed), 1000);
-    assert_eq!(db.index.bf.read().clone().unwrap().len(), 1000);
-    assert_eq!(db.index.additional_out_neighbors.len(), 0);
-    assert_eq!(db.index.temp_nodes.len(), 0);
-    match &*db.index.mode.read() {
+    assert_eq!(rx.deleted.len(), 2);
+    assert_eq!(rx.next_id.load(Ordering::Relaxed), 1000);
+    assert_eq!(rx.index.bf.read().clone().unwrap().len(), 1000);
+    assert_eq!(rx.index.additional_out_neighbors.len(), 0);
+    assert_eq!(rx.index.temp_nodes.len(), 0);
+    match &*rx.index.mode.read() {
       Mode::InMemory { graph, vectors } => {
         assert_eq!(graph.len(), 0);
         assert_eq!(vectors.len(), 0);
@@ -1038,11 +1052,12 @@ mod tests {
     };
 
     // Now, it should build the in-memory index.
-    db.insert(
+    rx.insert(
       (1000..1313)
         .map(|i| (i.to_string(), vecs[i].clone()))
         .collect(),
     )
+    .await
     .unwrap();
     tracing::info!("inserted 1313 so far");
     let expected_medoid_i = calc_approx_medoid(
@@ -1053,36 +1068,36 @@ mod tests {
     );
     let expected_medoid_key = expected_medoid_i.to_string();
     tracing::info!("calculated expected medoid");
-    let expected_medoid_id = db.db.maybe_read_id(&expected_medoid_key).unwrap();
-    assert_eq!(db.index.medoid.load(Ordering::Relaxed), expected_medoid_id);
-    assert!(db.index.bf.read().is_none());
-    assert_eq!(db.index.additional_out_neighbors.len(), 0);
-    assert_eq!(db.index.temp_nodes.len(), 0);
-    match &*db.index.mode.read() {
+    let expected_medoid_id = rx.db.maybe_read_id(&expected_medoid_key).await.unwrap();
+    assert_eq!(rx.index.medoid.load(Ordering::Relaxed), expected_medoid_id);
+    assert!(rx.index.bf.read().is_none());
+    assert_eq!(rx.index.additional_out_neighbors.len(), 0);
+    assert_eq!(rx.index.temp_nodes.len(), 0);
+    match &*rx.index.mode.read() {
       Mode::InMemory { graph, vectors } => {
         assert_eq!(graph.len(), 1313);
         assert_eq!(vectors.len(), 1313);
       }
       Mode::LTI { .. } => unreachable!(),
     };
-    assert_eq!(db.db.iter_brute_force_vecs::<f32>().count(), 0);
-    assert_eq!(db.db.maybe_read_medoid(), Some(expected_medoid_id));
-    assert_eq!(db.db.read_index_mode(), DbIndexMode::InMemory);
-    assert_eq!(db.db.iter_nodes::<f32>().count(), 1313);
-    let missing_nodes = db
+    assert_eq!(rx.db.iter_brute_force_vecs::<f32>().count().await, 0);
+    assert_eq!(rx.db.maybe_read_medoid().await, Some(expected_medoid_id));
+    assert_eq!(rx.db.read_index_mode().await, DbIndexMode::InMemory);
+    assert_eq!(rx.db.iter_nodes::<f32>().count().await, 1313);
+    let missing_nodes = rx
       .db
       .iter_nodes::<f32>()
-      .par_bridge()
-      .map(|(internal_id, n)| {
+      .filter_map(async |(internal_id, n)| {
         // We don't know the internal ID so we can't just skip if it matches our ID.
-        let Some(key) = db.db.maybe_read_key(internal_id) else {
-          return 1;
+        let Some(key) = rx.db.maybe_read_key(internal_id).await else {
+          return Some(());
         };
         let i = key.parse::<usize>().unwrap();
         assert_eq!(n.vector, vecs[i].to_vec());
-        0
+        None
       })
-      .sum::<usize>();
+      .count()
+      .await;
     assert_eq!(missing_nodes, deleted.len());
 
     // Delete some keys.
@@ -1092,52 +1107,57 @@ mod tests {
       .map(|_| thread_rng().gen_range(0..1313))
       .chain(once(expected_medoid_i))
       .collect::<Vec<_>>();
-    to_delete.par_iter().for_each(|&i| {
-      db.delete(&i.to_string()).unwrap();
-      deleted.insert(i); // Handles already deleted, duplicate delete requests.
-    });
-    assert_eq!(db.deleted.len(), deleted.len());
+    iter(&to_delete)
+      .for_each_concurrent(None, async |&i| {
+        rx.delete(&i.to_string()).await.unwrap();
+        deleted.insert(i); // Handles already deleted, duplicate delete requests.
+      })
+      .await;
+    assert_eq!(rx.deleted.len(), deleted.len());
 
     // Still under in-memory index cap.
-    db.insert(
+    rx.insert(
       (1313..2090)
         .map(|i| (i.to_string(), vecs[i].clone()))
         .collect(),
     )
+    .await
     .unwrap();
     tracing::info!("inserted 2090 so far");
     // Medoid must not have changed.
-    assert_eq!(db.index.medoid.load(Ordering::Relaxed), expected_medoid_id);
-    assert!(db.index.bf.read().is_none());
-    assert_eq!(db.index.temp_nodes.len(), 0);
-    match &*db.index.mode.read() {
+    assert_eq!(rx.index.medoid.load(Ordering::Relaxed), expected_medoid_id);
+    assert!(rx.index.bf.read().is_none());
+    assert_eq!(rx.index.temp_nodes.len(), 0);
+    match &*rx.index.mode.read() {
       Mode::InMemory { graph, vectors } => {
         assert_eq!(graph.len(), 2090);
         assert_eq!(vectors.len(), 2090);
       }
       Mode::LTI { .. } => unreachable!(),
     };
-    assert_eq!(db.db.iter_nodes::<f32>().count(), 2090);
-    assert_accuracy(2090, 0.95);
+    assert_eq!(rx.db.iter_nodes::<f32>().count().await, 2090);
+    assert_accuracy!(2090, 0.95);
 
     // Now, it should transition to LTI.
-    db.insert(
+    rx.insert(
       (2090..2671)
         .map(|i| (i.to_string(), vecs[i].clone()))
         .collect(),
     )
+    .await
     .unwrap();
     // Do another insert to wait on the updater_thread to complete the transition.
-    db.insert(
+    rx.insert(
       (2671..2722)
         .map(|i| (i.to_string(), vecs[i].clone()))
         .collect(),
     )
+    .await
     .unwrap();
-    assert_eq!(db.index.medoid.load(Ordering::Relaxed), expected_medoid_id);
-    assert!(db.index.bf.read().is_none());
-    assert_eq!(db.index.temp_nodes.len(), 0);
-    match &*db.index.mode.read() {
+    assert_eq!(rx.index.medoid.load(Ordering::Relaxed), expected_medoid_id);
+    assert!(rx.index.bf.read().is_none());
+    assert_eq!(rx.index.temp_nodes.len(), 0);
+    match &*rx.index.mode.read() {
       Mode::InMemory { .. } => {
         unreachable!();
       }
@@ -1145,40 +1165,44 @@ mod tests {
         assert_eq!(pq_vecs.len(), 2722);
       }
     };
-    assert_eq!(db.db.iter_brute_force_vecs::<f32>().count(), 0);
-    assert_eq!(db.db.maybe_read_medoid(), Some(expected_medoid_id));
-    assert_eq!(db.db.read_index_mode(), DbIndexMode::LongTerm);
-    assert_eq!(db.db.iter_nodes::<f32>().count(), 2722);
-    assert_accuracy(2722, 0.85);
+    assert_eq!(rx.db.iter_brute_force_vecs::<f32>().count().await, 0);
+    assert_eq!(rx.db.maybe_read_medoid().await, Some(expected_medoid_id));
+    assert_eq!(rx.db.read_index_mode().await, DbIndexMode::LongTerm);
+    assert_eq!(rx.db.iter_nodes::<f32>().count().await, 2722);
+    assert_accuracy!(2722, 0.85);
 
     // Trigger merge due to excessive deletes.
     let to_delete = (0..2722)
       .filter(|&i| !deleted.contains(&i))
       .choose_multiple(&mut thread_rng(), 200);
-    to_delete.par_iter().for_each(|&i| {
-      db.delete(&i.to_string()).unwrap();
-      deleted.insert(i);
-    });
-    assert_eq!(db.deleted.len(), deleted.len());
+    iter(&to_delete)
+      .for_each_concurrent(None, async |&i| {
+        rx.delete(&i.to_string()).await.unwrap();
+        deleted.insert(i);
+      })
+      .await;
+    assert_eq!(rx.deleted.len(), deleted.len());
     tracing::info!(n = to_delete.len(), "deleted vectors");
-    assert_accuracy(2722, 0.84);
+    assert_accuracy!(2722, 0.84);
     // Do insert to trigger the updater_thread to start the merge.
-    db.insert(
+    rx.insert(
       (2722..2799)
         .map(|i| (i.to_string(), vecs[i].clone()))
         .collect(),
     )
+    .await
     .unwrap();
     // Do another insert to wait for the updater_thread to finish the merge.
-    db.insert(
+    rx.insert(
       [("2799".to_string(), vecs[2799].clone())]
         .into_iter()
         .collect(),
     )
+    .await
     .unwrap();
     // The medoid is never permanently deleted, so add 1.
     let expected_post_merge_nodes = 2800 - deleted.len() + 1;
-    match &*db.index.mode.read() {
+    match &*rx.index.mode.read() {
       Mode::InMemory { .. } => {
         unreachable!();
       }
@@ -1186,22 +1210,26 @@ mod tests {
         assert_eq!(pq_vecs.len(), expected_post_merge_nodes);
       }
     };
-    assert_eq!(db.db.iter_nodes::<f32>().count(), expected_post_merge_nodes);
+    assert_eq!(
+      rx.db.iter_nodes::<f32>().count().await,
+      expected_post_merge_nodes
+    );
     // The medoid is never permanently deleted.
-    assert_eq!(db.deleted.len(), 1);
-    assert_eq!(db.db.iter_deleted().count(), 1);
+    assert_eq!(rx.deleted.len(), 1);
+    assert_eq!(rx.db.iter_deleted().count().await, 1);
     // NOTE: We don't update our `deleted` as they are deleted, it's not the same as the soft-delete markers `db.deleted`.
-    assert_accuracy(2800, 0.84);
+    assert_accuracy!(2800, 0.84);
 
     // Finally, insert all remaining vectors.
-    db.insert(
+    rx.insert(
       (2800..n)
         .map(|i| (i.to_string(), vecs[i].clone()))
         .collect(),
     )
+    .await
     .unwrap();
     tracing::info!("inserted all vectors");
     // Do final query.
-    assert_accuracy(n, 0.8);
+    assert_accuracy!(n, 0.8);
   }
 }
