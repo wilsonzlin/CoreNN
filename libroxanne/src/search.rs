@@ -8,6 +8,7 @@ use crate::util::AsyncConcurrentStreamExt;
 use crate::util::CollectionExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
+use core::slice::SlicePattern;
 use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::ArrayView1;
@@ -158,16 +159,18 @@ pub struct SearchMetrics {
 // - Create a new trait.
 //   - Allows implementing on most types without using a bunch of newtype wrappers. Downstream users will still need to wrap in a newtype, but we should impl for most common external/std library types.
 
-pub trait IVec<T: Dtype>: Sized {
-  fn view(&self) -> ArrayView1<T>;
+// Avoid naming IVec as it sounds too similar to Vec.
+pub trait IPoint<T: Dtype>: Sized {
+  // Avoid naming as `view` to avoid unintentional confusion with ArrayBase::view().
+  fn point(&self) -> ArrayView1<T>;
 
   fn into_vec(self) -> Vec<T> {
-    self.view().to_vec()
+    self.point().to_vec()
   }
 }
 
-impl<T: Dtype> IVec<T> for Array1<T> {
-  fn view(&self) -> ArrayView1<T> {
+impl<T: Dtype> IPoint<T> for Array1<T> {
+  fn point(&self) -> ArrayView1<T> {
     self.view()
   }
 
@@ -177,14 +180,14 @@ impl<T: Dtype> IVec<T> for Array1<T> {
   }
 }
 
-impl<T: Dtype> IVec<T> for &Array1<T> {
-  fn view(&self) -> ArrayView1<T> {
+impl<T: Dtype> IPoint<T> for &Array1<T> {
+  fn point(&self) -> ArrayView1<T> {
     Array1::view(self)
   }
 }
 
-impl<T: Dtype> IVec<T> for Cow<'_, [T]> {
-  fn view(&self) -> ArrayView1<T> {
+impl<T: Dtype> IPoint<T> for Cow<'_, [T]> {
+  fn point(&self) -> ArrayView1<T> {
     ArrayView1::from(&*self)
   }
 
@@ -193,8 +196,8 @@ impl<T: Dtype> IVec<T> for Cow<'_, [T]> {
   }
 }
 
-impl<T: Dtype> IVec<T> for &'_ [T] {
-  fn view(&self) -> ArrayView1<T> {
+impl<T: Dtype> IPoint<T> for &'_ [T] {
+  fn point(&self) -> ArrayView1<T> {
     ArrayView1::from(self)
   }
 
@@ -203,8 +206,8 @@ impl<T: Dtype> IVec<T> for &'_ [T] {
   }
 }
 
-impl<T: Dtype> IVec<T> for Vec<T> {
-  fn view(&self) -> ArrayView1<T> {
+impl<T: Dtype> IPoint<T> for Vec<T> {
+  fn point(&self) -> ArrayView1<T> {
     ArrayView1::from(self.as_slice())
   }
 
@@ -213,8 +216,8 @@ impl<T: Dtype> IVec<T> for Vec<T> {
   }
 }
 
-impl<'r, K: Eq + Hash, T: Dtype> IVec<T> for dashmap::mapref::one::Ref<'r, K, Array1<T>> {
-  fn view(&self) -> ArrayView1<T> {
+impl<'r, K: Eq + Hash, T: Dtype> IPoint<T> for dashmap::mapref::one::Ref<'r, K, Array1<T>> {
+  fn point(&self) -> ArrayView1<T> {
     self.value().view()
   }
 }
@@ -224,15 +227,16 @@ impl<'r, K: Eq + Hash, T: Dtype> IVec<T> for dashmap::mapref::one::Ref<'r, K, Ar
 // - Some types iterate `&Id`, others `Id`; with our own trait, we can specify a return type of `impl IntoIterator<Item=Id>` for this trait's method so the implementer can use any complex chain of iterators if necessary. However, it's currently unstable to use `type Neighbors: impl IntoIterator<Item=Id>`.
 // Unintended bonus: we can have self-moving trait methods for getting as owned Vec, HashSet, etc.; by default they just self.iter().collect(), but downstream implementers can use more optimized versions (e.g. the Self is already an owned Vec, so just move it, or is already a reference to one, so just clone it).
 pub trait INeighbors: Sized {
-  fn iter(&self) -> impl Iterator<Item = Id>;
+  // Avoid naming as `iter` to avoid unintentional use over Iterator::iter (both are traits and can be confusing when both are imported).
+  fn neighbors(&self) -> impl Iterator<Item = Id>;
 
   fn into_vec(self) -> Vec<Id> {
-    self.iter().collect_vec()
+    self.neighbors().collect_vec()
   }
 }
 
 impl INeighbors for &[Id] {
-  fn iter(&self) -> impl Iterator<Item = Id> {
+  fn neighbors(&self) -> impl Iterator<Item = Id> {
     self.into_iter().map(|id| *id)
   }
 
@@ -242,8 +246,8 @@ impl INeighbors for &[Id] {
 }
 
 impl INeighbors for Vec<Id> {
-  fn iter(&self) -> impl Iterator<Item = Id> {
-    self.as_slice().iter().map(|id| *id)
+  fn neighbors(&self) -> impl Iterator<Item = Id> {
+    self.as_slice().neighbors()
   }
 
   fn into_vec(self) -> Vec<Id> {
@@ -252,8 +256,8 @@ impl INeighbors for Vec<Id> {
 }
 
 impl INeighbors for Cow<'_, [Id]> {
-  fn iter(&self) -> impl Iterator<Item = Id> {
-    self.into_iter().map(|id| *id)
+  fn neighbors(&self) -> impl Iterator<Item = Id> {
+    self.as_slice().neighbors()
   }
 
   fn into_vec(self) -> Vec<Id> {
@@ -262,8 +266,8 @@ impl INeighbors for Cow<'_, [Id]> {
 }
 
 impl<'r, K: Eq + Hash> INeighbors for dashmap::mapref::one::Ref<'r, K, Vec<Id>> {
-  fn iter(&self) -> impl Iterator<Item = Id> {
-    self.value().iter()
+  fn neighbors(&self) -> impl Iterator<Item = Id> {
+    self.value().neighbors()
   }
 
   fn into_vec(self) -> Vec<Id> {
@@ -289,13 +293,13 @@ pub struct GreedySearchState {
 // Don't use `GreedySearchable<'a>` instead of `type XXX<'a>: ...` as the former constrains the entire trait, which causes lifetime issues within async contexts.
 pub trait GreedySearchable<T: Dtype>: Send + Sync + Sized {
   // These generics allow for owned and borrowed variants in various forms (e.g. DashMap::Ref, slice, ArrayView, &Array); the complexity allows for avoiding copying where possible, which gets really expensive for in-memory usages, while supporting copied owned data for reading from disk.
-  type Point<'a>: IVec<T>
+  type Point<'a>: IPoint<T>
   where
     Self: 'a;
   type Neighbors<'a>: INeighbors
   where
     Self: 'a;
-  type FullVec: IVec<T>;
+  type FullVec: IPoint<T>;
 
   fn medoid(&self) -> Id;
   fn metric(&self) -> Metric<T>;
@@ -311,7 +315,7 @@ pub trait GreedySearchable<T: Dtype>: Send + Sync + Sized {
     };
     let a = self.get_point(a);
     let b = self.get_point(b);
-    self.metric()(&a.view(), &b.view())
+    self.metric()(&a.point(), &b.point())
   }
 
   /// Calculate the distance between a point and a query.
@@ -319,7 +323,7 @@ pub trait GreedySearchable<T: Dtype>: Send + Sync + Sized {
   fn dist2(&self, a: Id, b: Query<T>) -> f64 {
     match b {
       Query::Id(b) => self.dist(a, b),
-      Query::Vec(b) => self.metric()(&self.get_point(a).view(), b),
+      Query::Vec(b) => self.metric()(&self.get_point(a).point(), b),
     }
   }
 
@@ -327,7 +331,7 @@ pub trait GreedySearchable<T: Dtype>: Send + Sync + Sized {
   /// NOTE: This isn't I/O. Therefore, don't use ThreadPool when calling this multiple times.
   fn dist3(&self, a: &ArrayView1<T>, b: Query<T>) -> f64 {
     match b {
-      Query::Id(b) => self.metric()(a, &self.get_point(b).view()),
+      Query::Id(b) => self.metric()(a, &self.get_point(b).point()),
       Query::Vec(b) => self.metric()(a, b),
     }
   }
@@ -371,9 +375,9 @@ pub trait GreedySearchable<T: Dtype>: Send + Sync + Sized {
     let mut neighbors = HashSet::new();
     for (mut p_star, p_neighbors, full_vec) in expanded {
       if let Some(v) = full_vec {
-        p_star.dist = self.dist3(&v.view(), params.query);
+        p_star.dist = self.dist3(&v.point(), params.query);
       }
-      for j in p_neighbors.iter() {
+      for j in p_neighbors.neighbors() {
         neighbors.insert(j);
       }
       // Move to visited section.
@@ -512,9 +516,9 @@ pub trait GreedySearchableSync<T: Dtype>: GreedySearchable<T> {
       let cur_id = cur.id;
       let (neighbors, full_vec) = self.get_out_neighbors_sync(cur_id);
       if let Some(v) = full_vec {
-        cur.dist = self.dist3(&v.view(), query);
+        cur.dist = self.dist3(&v.point(), query);
       };
-      for n_id in neighbors.iter() {
+      for n_id in neighbors.neighbors() {
         // If this node is a neighbor of a future expanded node, we don't need to compare the distance to this node, as if it's not the shortest now, it won't be then either.
         if !seen.insert(n_id) {
           continue;
@@ -557,7 +561,7 @@ pub trait GreedySearchableSync<T: Dtype>: GreedySearchable<T> {
       let new = self
         .get_out_neighbors_sync(to)
         .0
-        .iter()
+        .neighbors()
         .filter_map(|neighbor| {
           if visited.contains(&neighbor) {
             return None;
