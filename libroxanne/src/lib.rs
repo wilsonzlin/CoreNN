@@ -1,6 +1,5 @@
 #![feature(async_closure)]
 #![feature(duration_millis_float)]
-#![feature(f16)]
 #![feature(path_add_extension)]
 #![warn(clippy::future_not_send)]
 #![allow(async_fn_in_trait)]
@@ -10,10 +9,13 @@ use bf::BruteForceIndex;
 use blob::BlobStore;
 use cfg::RoxanneDbCfg;
 use common::nan_to_num;
+use common::to_calc;
 use common::Dtype;
+use common::DtypeCalc;
 use common::Id;
 use common::Metric;
 use common::PrecomputedDists;
+use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use dashmap::DashSet;
 use db::Db;
@@ -30,6 +32,7 @@ use search::GreedySearchable;
 use search::GreedySearchableAsync;
 use search::INeighbors;
 use search::IPoint;
+use search::Points;
 use search::Query;
 use signal_future::SignalFuture;
 use std::cmp::max;
@@ -58,33 +61,55 @@ pub mod updater;
 pub mod util;
 pub mod vamana;
 
+pub struct RoxanneDbDir {
+  root: PathBuf,
+}
+
+impl RoxanneDbDir {
+  pub fn new(root: PathBuf) -> Self {
+    Self { root }
+  }
+
+  pub fn blobs(&self) -> PathBuf {
+    self.root.join("blobs")
+  }
+
+  pub fn db(&self) -> PathBuf {
+    self.root.join("db")
+  }
+
+  pub fn cfg(&self) -> PathBuf {
+    self.root.join("roxanne.toml")
+  }
+}
+
 #[derive(Debug)]
 pub enum RoxanneDbError {
   Busy,
 }
 
-enum Mode<T: Dtype> {
+enum Mode<T: Dtype, C: DtypeCalc> {
   InMemory {
     graph: Arc<DashMap<Id, Vec<Id>>>,
     vectors: Arc<DashMap<Id, Array1<T>>>,
   },
   LTI {
     pq_vecs: DashMap<Id, Array1<u8>>,
-    pq: ProductQuantizer<T>,
+    pq: ProductQuantizer<C>,
   },
 }
 
-struct Index<T: Dtype> {
+struct Index<T: Dtype, C: DtypeCalc> {
   // We use a brute force index for the first few points, because:
   // - we want a decent sized sample to calculate the medoid
   // - it's fast enough to query
   // - inserting into a Vamana graph with zero or only a few nodes has complications (e.g. RobustPrune may actually make a node unreachable)
-  bf: RwLock<Option<Arc<BruteForceIndex<T>>>>,
+  bf: RwLock<Option<Arc<BruteForceIndex<T, C>>>>,
   db: Arc<Db>,
-  mode: RwLock<Mode<T>>,
+  mode: RwLock<Mode<T, C>>,
   // This changes when we transition from BF to InMemory.
   medoid: AtomicUsize,
-  metric: Metric<T>,
+  metric: Metric<C>,
   vamana_params: VamanaParams,
   additional_out_neighbors: DashMap<Id, Vec<Id>>,
   additional_edge_count: AtomicUsize,
@@ -92,33 +117,41 @@ struct Index<T: Dtype> {
   temp_nodes: DashMap<Id, (Vec<Id>, Array1<T>)>,
 }
 
-enum IndexPoint<'a, T> {
-  LTI(Array1<T>),
-  Temp(dashmap::mapref::one::Ref<'a, Id, (Vec<Id>, Array1<T>)>),
+enum IndexPoint<'a, T, C> {
+  LTI(Array1<C>),
+  Temp(Ref<'a, Id, (Vec<Id>, Array1<T>)>),
   // I'd prefer to use MappedRwLockReadGuard but we're blocked on https://github.com/Amanieu/parking_lot/issues/289.
-  InMemory(ArcMap<DashMap<Id, Array1<T>>, dashmap::mapref::one::Ref<'a, Id, Array1<T>>>),
+  InMemory(ArcMap<DashMap<Id, Array1<T>>, Ref<'a, Id, Array1<T>>>),
 }
 
-impl<'a, T: Dtype> IPoint<T> for IndexPoint<'a, T> {
+impl<'a, T: Dtype, C: DtypeCalc> IPoint<T, C> for IndexPoint<'a, T, C> {
   fn point(&self) -> ArrayView1<T> {
     match self {
       IndexPoint::InMemory(v) => v.value().view(),
-      IndexPoint::LTI(v) => v.view(),
+      IndexPoint::LTI(_) => panic!("tried to get Dtype view of PQ decoded DtypeCalc vector"),
       IndexPoint::Temp(v) => v.value().1.view(),
+    }
+  }
+
+  fn into_calc(self) -> Array1<C> {
+    if let IndexPoint::LTI(v) = self {
+      v
+    } else {
+      to_calc(&self.point())
     }
   }
 }
 
 enum IndexNeighborsBase<'a, T> {
-  Temp(dashmap::mapref::one::Ref<'a, Id, (Vec<Id>, Array1<T>)>),
+  Temp(Ref<'a, Id, (Vec<Id>, Array1<T>)>),
   // I'd prefer to use MappedRwLockReadGuard but we're blocked on https://github.com/Amanieu/parking_lot/issues/289.
-  InMemory(ArcMap<DashMap<Id, Vec<Id>>, dashmap::mapref::one::Ref<'a, Id, Vec<Id>>>),
+  InMemory(ArcMap<DashMap<Id, Vec<Id>>, Ref<'a, Id, Vec<Id>>>),
   LTI(Vec<Id>),
 }
 
 struct IndexNeighbors<'a, T> {
   base: IndexNeighborsBase<'a, T>,
-  add: Option<dashmap::mapref::one::Ref<'a, Id, Vec<Id>>>,
+  add: Option<Ref<'a, Id, Vec<Id>>>,
 }
 
 impl<'a, T> IndexNeighbors<'a, T> {
@@ -145,16 +178,10 @@ impl<'a, T> INeighbors for IndexNeighbors<'a, T> {
   }
 }
 
-impl<T: Dtype> GreedySearchable<T> for Index<T> {
-  type FullVec = Array1<T>;
-  type Neighbors<'a> = IndexNeighbors<'a, T>;
-  type Point<'a> = IndexPoint<'a, T>;
+impl<T: Dtype, C: DtypeCalc> Points<T, C> for Index<T, C> {
+  type Point<'a> = IndexPoint<'a, T, C>;
 
-  fn medoid(&self) -> Id {
-    self.medoid.load(Ordering::Relaxed)
-  }
-
-  fn metric(&self) -> Metric<T> {
+  fn metric(&self) -> Metric<C> {
     self.metric
   }
 
@@ -178,7 +205,16 @@ impl<T: Dtype> GreedySearchable<T> for Index<T> {
   }
 }
 
-impl<T: Dtype> GreedySearchableAsync<T> for Index<T> {
+impl<T: Dtype, C: DtypeCalc> GreedySearchable<T, C> for Index<T, C> {
+  type FullVec = Array1<T>;
+  type Neighbors<'a> = IndexNeighbors<'a, T>;
+
+  fn medoid(&self) -> Id {
+    self.medoid.load(Ordering::Relaxed)
+  }
+}
+
+impl<T: Dtype, C: DtypeCalc> GreedySearchableAsync<T, C> for Index<T, C> {
   async fn get_out_neighbors_async<'a>(
     &'a self,
     id: Id,
@@ -219,29 +255,29 @@ impl<T: Dtype> GreedySearchableAsync<T> for Index<T> {
 
 // We only implement Vamana to be able to use compute_robust_pruned during updater_thread.
 // We don't impl VamanaSync and use set_* as the update process is more sophisticated (see updater_thread).
-impl<T: Dtype> Vamana<T> for Index<T> {
+impl<T: Dtype, C: DtypeCalc> Vamana<T, C> for Index<T, C> {
   fn params(&self) -> &vamana::VamanaParams {
     &self.vamana_params
   }
 }
 
-pub struct RoxanneDb<T: Dtype> {
+pub struct RoxanneDb<T: Dtype, C: DtypeCalc> {
   blobs: BlobStore,
   cfg: RoxanneDbCfg,
   db: Arc<Db>,
   deleted: DashSet<Id>,
-  index: Index<T>,
+  index: Index<T, C>,
   update_sender: Sender<Update<T>>,
 }
 
-impl<T: Dtype> RoxanneDb<T> {
-  pub async fn open(dir: PathBuf) -> Arc<RoxanneDb<T>> {
-    let blobs = BlobStore::open(dir.join("blobs")).await;
-    let cfg_raw = tokio::fs::read_to_string(dir.join("roxanne.toml"))
-      .await
-      .unwrap();
+impl<T: Dtype, C: DtypeCalc> RoxanneDb<T, C> {
+  pub async fn open(dir: PathBuf) -> Arc<RoxanneDb<T, C>> {
+    let dir = RoxanneDbDir::new(dir);
+
+    let blobs = BlobStore::open(dir.blobs()).await;
+    let cfg_raw = tokio::fs::read_to_string(dir.cfg()).await.unwrap();
     let cfg: RoxanneDbCfg = toml::from_str(&cfg_raw).unwrap();
-    let metric = cfg.metric.get_fn::<T>();
+    let metric = cfg.metric.get_fn::<C>();
     let vamana_params = VamanaParams {
       degree_bound: cfg.degree_bound,
       distance_threshold: cfg.distance_threshold,
@@ -249,7 +285,7 @@ impl<T: Dtype> RoxanneDb<T> {
       update_search_list_cap: cfg.update_search_list_cap,
     };
 
-    let db = Arc::new(Db::open(dir.join("db")).await);
+    let db = Arc::new(Db::open(dir.db()).await);
     let next_id = Mutex::new(0);
     let deleted = DashSet::new();
     db.iter_deleted()
@@ -421,6 +457,7 @@ mod tests {
   use crate::util::AsyncConcurrentStreamExt;
   use crate::Mode;
   use crate::RoxanneDb;
+  use crate::RoxanneDbDir;
   use ahash::HashSet;
   use dashmap::DashSet;
   use futures::stream::iter;
@@ -449,7 +486,8 @@ mod tests {
       .init();
 
     // Parameters.
-    let dir = PathBuf::from("/dev/shm/roxannedb-test");
+    let dir_raw = PathBuf::from("/dev/shm/roxannedb-test");
+    let dir = RoxanneDbDir::new(dir_raw.clone());
     let dim = 512;
     let degree_bound = 40;
     let max_degree_bound = 80;
@@ -477,12 +515,12 @@ mod tests {
     tracing::info!("calculated nearest neighbors");
 
     // Create and open DB.
-    if fs::exists(&dir).unwrap() {
-      fs::remove_dir_all(&dir).unwrap();
+    if fs::exists(&dir_raw).unwrap() {
+      fs::remove_dir_all(&dir_raw).unwrap();
     }
-    fs::create_dir(&dir).unwrap();
+    fs::create_dir(&dir_raw).unwrap();
     fs::write(
-      dir.join("roxanne.toml"),
+      dir.cfg(),
       toml::to_string(&RoxanneDbCfg {
         brute_force_index_cap: 1000,
         degree_bound,
@@ -500,7 +538,7 @@ mod tests {
       .unwrap(),
     )
     .unwrap();
-    let rx = RoxanneDb::open(dir).await;
+    let rx = RoxanneDb::open(dir_raw).await;
     tracing::info!("opened database");
 
     // First test: an empty DB should provide no results.

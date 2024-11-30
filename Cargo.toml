@@ -3,11 +3,10 @@ resolver = "2"
 members = [
   "analysis",
   "eval",
-  "export-vectors",
   "hnsw-sharded-to-roxanne",
-  "hnsw-to-roxanne",
   "hnswlib-rs",
   "libroxanne",
+  "roxanne",
 ]
 
 [profile.release]

@@ -1,10 +1,13 @@
 use crate::common::metric_euclidean;
+use crate::common::to_calc;
 use crate::common::Dtype;
+use crate::common::DtypeCalc;
 use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PrecomputedDists;
 use crate::search::GreedySearchable;
 use crate::search::GreedySearchableSync;
+use crate::search::Points;
 use crate::vamana::Vamana;
 use crate::vamana::VamanaParams;
 use crate::vamana::VamanaSync;
@@ -20,9 +23,9 @@ use rayon::iter::ParallelIterator;
 use std::iter::zip;
 use std::sync::Arc;
 
-pub fn calc_approx_medoid<T: Dtype>(
+pub fn calc_approx_medoid<T: Dtype, C: DtypeCalc>(
   id_to_point: &DashMap<Id, Array1<T>>,
-  metric: Metric<T>,
+  metric: Metric<C>,
   sample_size: usize,
   precomputed_dists: Option<&PrecomputedDists>,
 ) -> Id {
@@ -41,8 +44,8 @@ pub fn calc_approx_medoid<T: Dtype>(
           .map(|&j| {
             precomputed_dists.map(|pd| pd.get(i, j)).unwrap_or_else(|| {
               metric(
-                &id_to_point.get(&i).unwrap().view(),
-                &id_to_point.get(&j).unwrap().view(),
+                &to_calc(&id_to_point.get(&i).unwrap().view()).view(),
+                &to_calc(&id_to_point.get(&j).unwrap().view()).view(),
               )
             })
           })
@@ -68,18 +71,18 @@ pub fn random_r_regular_graph(ids: &[Id], degree_bound: usize) -> DashMap<Id, Ve
 }
 
 /// Constructed via InMemoryIndex::builder().
-pub struct InMemoryIndexBuilder<'a, T: Dtype> {
+pub struct InMemoryIndexBuilder<'a, T: Dtype, C: DtypeCalc> {
   ids: Vec<Id>,
   vectors: Vec<Array1<T>>,
-  metric: Metric<T>,
+  metric: Metric<C>,
   // Calculating the medoid is expensive, so we approximate it via a smaller random sample of points instead.
   medoid_sample_size: usize,
   precomputed_dists: Option<Arc<PrecomputedDists>>,
-  on_progress: Option<Box<dyn Fn(usize) + 'a>>,
+  on_progress: Option<Box<dyn Fn(usize) + 'a>>, // TODO Unbox.
   params: VamanaParams,
 }
 
-impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
+impl<'a, T: Dtype, C: DtypeCalc> InMemoryIndexBuilder<'a, T, C> {
   pub fn degree_bound(mut self, degree_bound: usize) -> Self {
     self.params.degree_bound = degree_bound;
     self
@@ -95,7 +98,7 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
     self
   }
 
-  pub fn metric(mut self, metric: Metric<T>) -> Self {
+  pub fn metric(mut self, metric: Metric<C>) -> Self {
     self.metric = metric;
     self
   }
@@ -125,7 +128,7 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
 
   // The paper mentions running two passes, one with a=1.0. If you find that it gives more accuracy, you can do so by building initially with a=1.0, then updating a=$target and running optimize() again.
   // We won't do this here by default as it's costly.
-  pub fn build(self) -> InMemoryIndex<T> {
+  pub fn build(self) -> InMemoryIndex<T, C> {
     let InMemoryIndexBuilder {
       ids,
       medoid_sample_size,
@@ -167,7 +170,7 @@ impl<'a, T: Dtype> InMemoryIndexBuilder<'a, T> {
 }
 
 #[derive(Clone)]
-pub struct InMemoryIndex<T: Dtype> {
+pub struct InMemoryIndex<T: Dtype, C: DtypeCalc> {
   /// This can be useful for serializing to disk. Usually the points are already stored elsewhere, so serializing the graph alone can save space. To deserialize, collect the points, deserialize this graph, and use InMemoryVamana::new.
   /// This can also be used to introspect the graph, e.g. for debugging, analysis, or research.
   // This is Arc so it can be easily shared with InMemoryIndexBlob for serialization.
@@ -175,13 +178,13 @@ pub struct InMemoryIndex<T: Dtype> {
   // This is Arc so it can be easily shared with InMemoryIndexBlob for serialization.
   pub vectors: Arc<DashMap<Id, Array1<T>>>,
   pub medoid: Id,
-  pub metric: Metric<T>,
+  pub metric: Metric<C>,
   pub params: VamanaParams,
   pub precomputed_dists: Option<Arc<PrecomputedDists>>,
 }
 
-impl<T: Dtype> InMemoryIndex<T> {
-  pub fn builder<'a>(ids: Vec<Id>, vectors: Vec<Array1<T>>) -> InMemoryIndexBuilder<'a, T> {
+impl<T: Dtype, C: DtypeCalc> InMemoryIndex<T, C> {
+  pub fn builder<'a>(ids: Vec<Id>, vectors: Vec<Array1<T>>) -> InMemoryIndexBuilder<'a, T, C> {
     InMemoryIndexBuilder {
       ids,
       medoid_sample_size: 10_000,
@@ -203,16 +206,10 @@ impl<T: Dtype> InMemoryIndex<T> {
   }
 }
 
-impl<T: Dtype> GreedySearchable<T> for InMemoryIndex<T> {
-  type FullVec = Vec<T>;
-  type Neighbors<'a> = Ref<'a, Id, Vec<Id>>;
+impl<T: Dtype, C: DtypeCalc> Points<T, C> for InMemoryIndex<T, C> {
   type Point<'a> = Ref<'a, Id, Array1<T>>;
 
-  fn medoid(&self) -> Id {
-    self.medoid
-  }
-
-  fn metric(&self) -> Metric<T> {
+  fn metric(&self) -> Metric<C> {
     self.metric
   }
 
@@ -225,19 +222,28 @@ impl<T: Dtype> GreedySearchable<T> for InMemoryIndex<T> {
   }
 }
 
-impl<T: Dtype> GreedySearchableSync<T> for InMemoryIndex<T> {
+impl<T: Dtype, C: DtypeCalc> GreedySearchable<T, C> for InMemoryIndex<T, C> {
+  type FullVec = Vec<T>;
+  type Neighbors<'a> = Ref<'a, Id, Vec<Id>>;
+
+  fn medoid(&self) -> Id {
+    self.medoid
+  }
+}
+
+impl<T: Dtype, C: DtypeCalc> GreedySearchableSync<T, C> for InMemoryIndex<T, C> {
   fn get_out_neighbors_sync<'a>(&'a self, id: Id) -> (Self::Neighbors<'a>, Option<Self::FullVec>) {
     (self.graph.get(&id).unwrap(), None)
   }
 }
 
-impl<T: Dtype> Vamana<T> for InMemoryIndex<T> {
+impl<T: Dtype, C: DtypeCalc> Vamana<T, C> for InMemoryIndex<T, C> {
   fn params(&self) -> &VamanaParams {
     &self.params
   }
 }
 
-impl<T: Dtype> VamanaSync<T> for InMemoryIndex<T> {
+impl<T: Dtype, C: DtypeCalc> VamanaSync<T, C> for InMemoryIndex<T, C> {
   fn set_point(&self, id: Id, point: Array1<T>) {
     self.vectors.insert(id, point);
   }

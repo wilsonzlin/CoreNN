@@ -1,0 +1,19 @@
+[package]
+name = "roxanne"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ahash = "0.8.11"
+bytemuck = "1.20.0"
+clap = { version = "4.5.21", features = ["derive"] }
+futures = "0.3.31"
+half = "2.4.1"
+hnswlib-rs = { version = "0.2.0", path = "../hnswlib-rs" }
+indicatif = "0.17.9"
+itertools = "0.13.0"
+libroxanne = { version = "0.2.0", path = "../libroxanne" }
+tokio = { version = "1.41.1", features = ["full"] }
+toml = "0.8.19"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"

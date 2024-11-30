@@ -1,6 +1,8 @@
 use crate::bf::BruteForceIndex;
 use crate::cfg::RoxanneDbCfg;
+use crate::common::to_calc;
 use crate::common::Dtype;
+use crate::common::DtypeCalc;
 use crate::common::Id;
 use crate::db::DbIndexMode;
 use crate::db::DbTransaction;
@@ -12,6 +14,7 @@ use crate::search::GreedySearchable;
 use crate::search::GreedySearchableAsync;
 use crate::search::INeighbors;
 use crate::search::IPoint;
+use crate::search::Points;
 use crate::search::Query;
 use crate::util::AsyncConcurrentIteratorExt;
 use crate::vamana::Vamana;
@@ -100,11 +103,11 @@ impl<T: Dtype> Updates<T> {
   }
 }
 
-fn brute_force_index_mode_update<T: Dtype>(
+fn brute_force_index_mode_update<T: Dtype, C: DtypeCalc>(
   txn: &mut DbTransaction,
-  bf: &BruteForceIndex<T>,
+  bf: &BruteForceIndex<T, C>,
   cfg: &RoxanneDbCfg,
-  idx: &Index<T>,
+  idx: &Index<T, C>,
   insert_ids: Vec<Id>,
   insert_vecs: Vec<Array1<T>>,
 ) {
@@ -161,9 +164,9 @@ fn brute_force_index_mode_update<T: Dtype>(
   );
 }
 
-async fn graph_index_update<T: Dtype>(
+async fn graph_index_update<T: Dtype, C: DtypeCalc>(
   txn: &Arc<tokio::sync::Mutex<DbTransaction>>,
-  rx: &Arc<RoxanneDb<T>>,
+  rx: &Arc<RoxanneDb<T, C>>,
   insert_ids: Vec<Id>,
   insert_vecs: Vec<Array1<T>>,
 ) {
@@ -176,7 +179,7 @@ async fn graph_index_update<T: Dtype>(
       .par_iter()
       .zip(&insert_vecs)
       .for_each(|(&id, v)| {
-        pq_vecs.insert(id, pq.encode_1(&v.view()));
+        pq_vecs.insert(id, pq.encode_1(&to_calc(&v.view()).view()));
       });
   };
 
@@ -266,7 +269,6 @@ async fn graph_index_update<T: Dtype>(
                 // If LTI, full_vec will be Some; if in-memory, use get_point.
                 vector: full_vec
                   .map(|v| v.into_raw_vec())
-                  // TODO Avoid cloning. (write_node should take a `&[T]`.)
                   .unwrap_or_else(|| idx.get_point(id).into_vec()),
               });
               txn.delete_additional_out_neighbors(id);
@@ -290,9 +292,7 @@ async fn graph_index_update<T: Dtype>(
     // Don't remove from temp_nodes yet as we haven't committed to disk yet.
     let neighbors = idx.temp_nodes.get(&id).unwrap().0.clone();
     txn.write_node(id, &NodeData {
-      // TODO Avoid cloning. (write_node should take a `&[Id]`.)
       neighbors: neighbors.clone(),
-      // TODO Avoid cloning. (write_node should take a `&[T]`.)
       vector: v.to_vec(),
     });
     if let Mode::InMemory { graph, vectors } = &*idx.mode.read() {
@@ -302,7 +302,10 @@ async fn graph_index_update<T: Dtype>(
   }
 }
 
-async fn maybe_transition_to_lti<T: Dtype>(rx: &RoxanneDb<T>, vectors: &DashMap<Id, Array1<T>>) {
+async fn maybe_transition_to_lti<T: Dtype, C: DtypeCalc>(
+  rx: &RoxanneDb<T, C>,
+  vectors: &DashMap<Id, Array1<T>>,
+) {
   let cfg = &rx.cfg;
   if vectors.len() <= cfg.in_memory_index_cap {
     return;
@@ -317,7 +320,7 @@ async fn maybe_transition_to_lti<T: Dtype>(rx: &RoxanneDb<T>, vectors: &DashMap<
     .into_iter()
     .enumerate()
   {
-    mat.row_mut(i).assign(&*vec);
+    mat.row_mut(i).assign(&to_calc(&vec.view()));
   }
   let pq = ProductQuantizer::train(&mat.view(), cfg.pq_subspaces);
   rx.blobs.write_pq_model(&pq).await;
@@ -336,14 +339,14 @@ async fn maybe_transition_to_lti<T: Dtype>(rx: &RoxanneDb<T>, vectors: &DashMap<
   let pq_vecs = DashMap::new();
   vectors.par_iter().for_each(|e| {
     let (&id, vec) = e.pair();
-    pq_vecs.insert(id, pq.encode_1(&vec.view()));
+    pq_vecs.insert(id, pq.encode_1(&to_calc(&vec.view()).view()));
   });
 
   *rx.index.mode.write() = Mode::LTI { pq_vecs, pq };
   tracing::info!("transitioned to long term index");
 }
 
-async fn maybe_merge<T: Dtype>(rx: &Arc<RoxanneDb<T>>) {
+async fn maybe_merge<T: Dtype, C: DtypeCalc>(rx: &Arc<RoxanneDb<T, C>>) {
   let cfg = &rx.cfg;
   let db = &rx.db;
   let idx = &rx.index;
@@ -462,8 +465,8 @@ async fn maybe_merge<T: Dtype>(rx: &Arc<RoxanneDb<T>>) {
 // Why do all updates from a single thread (i.e. serialized), instead of only the compaction process?
 // Because our Vamana implementation doesn't support parallel updates (it does batching instead), so a lot of complexity to split out insertion (thread-safe) and compaction (single thread) ultimately ends up being pointless. It's safer to get correct; if we need to optimize, we can profile in the future.
 // NOTE: Many operations in this method may seem incorrect due to only acquiring read locks (so it seems like changes could happen beneath our feet and we're not correctly looking at a stable consistent snapshot/view of the entire system/data), but remember that all updates are processed serially within this sole single-threaded/serially-executed function only.
-pub async fn updater_thread<T: Dtype>(
-  rx: Arc<RoxanneDb<T>>,
+pub async fn updater_thread<T: Dtype, C: DtypeCalc>(
+  rx: Arc<RoxanneDb<T, C>>,
   receiver: Receiver<Update<T>>,
   mut next_id: Id,
 ) {

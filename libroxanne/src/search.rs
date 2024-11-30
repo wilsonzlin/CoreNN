@@ -1,4 +1,6 @@
+use crate::common::to_calc;
 use crate::common::Dtype;
+use crate::common::DtypeCalc;
 use crate::common::Id;
 use crate::common::Metric;
 use crate::common::PointDist;
@@ -8,6 +10,7 @@ use crate::util::AsyncConcurrentStreamExt;
 use crate::util::CollectionExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
+use dashmap::mapref::one::Ref;
 use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::ArrayView1;
@@ -107,11 +110,14 @@ impl<'a, T: Dtype, F: Fn(Id) -> bool> GreedySearchParams<'a, T, F> {
     self
   }
 
-  pub async fn query_async(self, g: &impl GreedySearchableAsync<T>) -> Vec<PointDist> {
+  pub async fn query_async<C: DtypeCalc>(
+    self,
+    g: &impl GreedySearchableAsync<T, C>,
+  ) -> Vec<PointDist> {
     g.greedy_search_async(self).await
   }
 
-  pub fn query_sync(self, g: &impl GreedySearchableSync<T>) -> Vec<PointDist> {
+  pub fn query_sync<C: DtypeCalc>(self, g: &impl GreedySearchableSync<T, C>) -> Vec<PointDist> {
     g.greedy_search_sync(self)
   }
 }
@@ -159,16 +165,20 @@ pub struct SearchMetrics {
 //   - Allows implementing on most types without using a bunch of newtype wrappers. Downstream users will still need to wrap in a newtype, but we should impl for most common external/std library types.
 
 // Avoid naming IVec as it sounds too similar to Vec.
-pub trait IPoint<T: Dtype>: Sized {
+pub trait IPoint<T: Dtype, C: DtypeCalc>: Sized {
   // Avoid naming as `view` to avoid unintentional confusion with ArrayBase::view().
   fn point(&self) -> ArrayView1<T>;
 
   fn into_vec(self) -> Vec<T> {
     self.point().to_vec()
   }
+
+  fn into_calc(self) -> Array1<C> {
+    to_calc(&self.point())
+  }
 }
 
-impl<T: Dtype> IPoint<T> for Array1<T> {
+impl<T: Dtype, C: DtypeCalc> IPoint<T, C> for Array1<T> {
   fn point(&self) -> ArrayView1<T> {
     self.view()
   }
@@ -179,13 +189,13 @@ impl<T: Dtype> IPoint<T> for Array1<T> {
   }
 }
 
-impl<T: Dtype> IPoint<T> for &Array1<T> {
+impl<T: Dtype, C: DtypeCalc> IPoint<T, C> for &Array1<T> {
   fn point(&self) -> ArrayView1<T> {
     Array1::view(self)
   }
 }
 
-impl<T: Dtype> IPoint<T> for Cow<'_, [T]> {
+impl<T: Dtype, C: DtypeCalc> IPoint<T, C> for Cow<'_, [T]> {
   fn point(&self) -> ArrayView1<T> {
     ArrayView1::from(&*self)
   }
@@ -195,7 +205,7 @@ impl<T: Dtype> IPoint<T> for Cow<'_, [T]> {
   }
 }
 
-impl<T: Dtype> IPoint<T> for &'_ [T] {
+impl<T: Dtype, C: DtypeCalc> IPoint<T, C> for &'_ [T] {
   fn point(&self) -> ArrayView1<T> {
     ArrayView1::from(self)
   }
@@ -205,7 +215,7 @@ impl<T: Dtype> IPoint<T> for &'_ [T] {
   }
 }
 
-impl<T: Dtype> IPoint<T> for Vec<T> {
+impl<T: Dtype, C: DtypeCalc> IPoint<T, C> for Vec<T> {
   fn point(&self) -> ArrayView1<T> {
     ArrayView1::from(self.as_slice())
   }
@@ -215,9 +225,51 @@ impl<T: Dtype> IPoint<T> for Vec<T> {
   }
 }
 
-impl<'r, K: Eq + Hash, T: Dtype> IPoint<T> for dashmap::mapref::one::Ref<'r, K, Array1<T>> {
+impl<'r, K: Eq + Hash, T: Dtype, C: DtypeCalc> IPoint<T, C> for Ref<'r, K, Array1<T>> {
   fn point(&self) -> ArrayView1<T> {
     self.value().view()
+  }
+}
+
+pub trait Points<T: Dtype, C: DtypeCalc> {
+  type Point<'a>: IPoint<T, C>
+  where
+    Self: 'a;
+
+  fn metric(&self) -> Metric<C>;
+  fn precomputed_dists(&self) -> Option<&PrecomputedDists>;
+
+  /// NOTE: This isn't I/O; all get_point uses memory only (even LTI, which uses cached PQ vecs). Therefore, don't use ThreadPool when calling this multiple times.
+  fn get_point<'a>(&'a self, id: Id) -> Self::Point<'a>;
+
+  /// Calculate the distance between two points.
+  /// NOTE: This isn't I/O. Therefore, don't use ThreadPool when calling this multiple times.
+  fn dist(&self, a: Id, b: Id) -> f64 {
+    if let Some(pd) = self.precomputed_dists().map(|pd| pd.get(a, b)) {
+      return pd;
+    };
+    let a = self.get_point(a).into_calc();
+    let b = self.get_point(b).into_calc();
+    self.metric()(&a.view(), &b.view())
+  }
+
+  /// Calculate the distance between a point and a query.
+  /// NOTE: This isn't I/O. Therefore, don't use ThreadPool when calling this multiple times.
+  fn dist2(&self, a: Id, b: Query<T>) -> f64 {
+    match b {
+      Query::Id(b) => self.dist(a, b),
+      Query::Vec(b) => self.metric()(&self.get_point(a).into_calc().view(), &to_calc(b).view()),
+    }
+  }
+
+  /// Calculate the distance between a vector and a query.
+  /// NOTE: This isn't I/O. Therefore, don't use ThreadPool when calling this multiple times.
+  fn dist3(&self, a: &ArrayView1<T>, b: Query<T>) -> f64 {
+    let a = to_calc(a);
+    match b {
+      Query::Id(b) => self.metric()(&a.view(), &self.get_point(b).into_calc().view()),
+      Query::Vec(b) => self.metric()(&a.view(), &to_calc(b).view()),
+    }
   }
 }
 
@@ -264,7 +316,7 @@ impl INeighbors for Cow<'_, [Id]> {
   }
 }
 
-impl<'r, K: Eq + Hash> INeighbors for dashmap::mapref::one::Ref<'r, K, Vec<Id>> {
+impl<'r, K: Eq + Hash> INeighbors for Ref<'r, K, Vec<Id>> {
   fn neighbors(&self) -> impl Iterator<Item = Id> {
     self.value().neighbors()
   }
@@ -290,50 +342,13 @@ pub struct GreedySearchState {
 }
 
 // Don't use `GreedySearchable<'a>` instead of `type XXX<'a>: ...` as the former constrains the entire trait, which causes lifetime issues within async contexts.
-pub trait GreedySearchable<T: Dtype>: Send + Sync + Sized {
-  // These generics allow for owned and borrowed variants in various forms (e.g. DashMap::Ref, slice, ArrayView, &Array); the complexity allows for avoiding copying where possible, which gets really expensive for in-memory usages, while supporting copied owned data for reading from disk.
-  type Point<'a>: IPoint<T>
-  where
-    Self: 'a;
+pub trait GreedySearchable<T: Dtype, C: DtypeCalc>: Points<T, C> + Send + Sync + Sized {
   type Neighbors<'a>: INeighbors
   where
     Self: 'a;
-  type FullVec: IPoint<T>;
+  type FullVec: IPoint<T, C>;
 
   fn medoid(&self) -> Id;
-  fn metric(&self) -> Metric<T>;
-  /// NOTE: This isn't I/O; all get_point uses memory only (even LTI, which uses cached PQ vecs). Therefore, don't use ThreadPool when calling this multiple times.
-  fn get_point<'a>(&'a self, id: Id) -> Self::Point<'a>;
-  fn precomputed_dists(&self) -> Option<&PrecomputedDists>;
-
-  /// Calculate the distance between two points.
-  /// NOTE: This isn't I/O. Therefore, don't use ThreadPool when calling this multiple times.
-  fn dist(&self, a: Id, b: Id) -> f64 {
-    if let Some(pd) = self.precomputed_dists().map(|pd| pd.get(a, b)) {
-      return pd;
-    };
-    let a = self.get_point(a);
-    let b = self.get_point(b);
-    self.metric()(&a.point(), &b.point())
-  }
-
-  /// Calculate the distance between a point and a query.
-  /// NOTE: This isn't I/O. Therefore, don't use ThreadPool when calling this multiple times.
-  fn dist2(&self, a: Id, b: Query<T>) -> f64 {
-    match b {
-      Query::Id(b) => self.dist(a, b),
-      Query::Vec(b) => self.metric()(&self.get_point(a).point(), b),
-    }
-  }
-
-  /// Calculate the distance between a vector and a query.
-  /// NOTE: This isn't I/O. Therefore, don't use ThreadPool when calling this multiple times.
-  fn dist3(&self, a: &ArrayView1<T>, b: Query<T>) -> f64 {
-    match b {
-      Query::Id(b) => self.metric()(a, &self.get_point(b).point()),
-      Query::Vec(b) => self.metric()(a, b),
-    }
-  }
 
   // We decompose the greedy search algorithm into subroutines that can be shared across both greedy_search_{a,}sync instead of duplicating a whole bunch of code across both variants. These decompositions are the gs_* methods (which should be only used internally).
   fn gs_init<F>(&self, params: &GreedySearchParams<T, F>) -> GreedySearchState {
@@ -472,7 +487,7 @@ pub trait GreedySearchable<T: Dtype>: Send + Sync + Sized {
   }
 }
 
-pub trait GreedySearchableSync<T: Dtype>: GreedySearchable<T> {
+pub trait GreedySearchableSync<T: Dtype, C: DtypeCalc>: GreedySearchable<T, C> {
   /// If the graph supports it, and get_point doesn't already provide the full embedding, provide full embedding for reranking as second return value.
   fn get_out_neighbors_sync<'a>(&'a self, id: Id) -> (Self::Neighbors<'a>, Option<Self::FullVec>);
 
@@ -577,7 +592,7 @@ pub trait GreedySearchableSync<T: Dtype>: GreedySearchable<T> {
 }
 
 /// See corresponding method comments on GreedySearchableSync.
-pub trait GreedySearchableAsync<T: Dtype>: GreedySearchable<T> {
+pub trait GreedySearchableAsync<T: Dtype, C: DtypeCalc>: GreedySearchable<T, C> {
   async fn get_out_neighbors_async<'a>(
     &'a self,
     id: Id,

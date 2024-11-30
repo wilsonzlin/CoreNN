@@ -1,5 +1,3 @@
-#![feature(f16)]
-
 use ahash::HashMap;
 use ahash::HashSet;
 use bytemuck::cast_slice;

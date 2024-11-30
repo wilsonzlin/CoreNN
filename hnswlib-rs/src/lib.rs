@@ -73,7 +73,6 @@ fn get_external_label(
 #[derive(Debug)]
 pub struct HnswIndex {
   pub dim: usize,
-  pub metric: Metric,
 
   pub max_elements: usize,
   pub cur_element_count: usize,
@@ -104,7 +103,7 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
-  pub fn load(dim: usize, metric: Metric, mut rd: impl Read) -> Self {
+  pub fn load(dim: usize, mut rd: impl Read) -> Self {
     let offset_level_0 = rd.read_usize().unwrap();
     let max_elements = rd.read_usize().unwrap();
     let cur_element_count = rd.read_usize().unwrap();
@@ -155,7 +154,6 @@ impl HnswIndex {
 
     Self {
       dim,
-      metric,
       max_elements,
       cur_element_count,
       size_data_per_element,
@@ -283,6 +281,7 @@ impl HnswIndex {
     &self,
     ep_id: TableInt,
     query: &[f32],
+    metric: Metric,
     ef: usize,
     hop_count: &mut usize,
   ) -> MaxHeap {
@@ -292,7 +291,7 @@ impl HnswIndex {
     let mut candidate_set = MaxHeap::new();
 
     let ep_data = self.get_data_by_internal_id(ep_id);
-    let dist = (self.metric)(query, &ep_data);
+    let dist = metric(query, &ep_data);
     let mut lower_bound = dist;
     top_candidates.push(dist, ep_id);
     candidate_set.push(-dist, ep_id);
@@ -311,7 +310,7 @@ impl HnswIndex {
       for &candidate_id in data {
         if visited.insert(candidate_id) {
           let curr_obj_1 = self.get_data_by_internal_id(candidate_id);
-          let dist = (self.metric)(query, &curr_obj_1);
+          let dist = metric(query, &curr_obj_1);
           let flag_consider_candidate = top_candidates.len() < ef || lower_bound > dist;
           if flag_consider_candidate {
             candidate_set.push(-dist, candidate_id);
@@ -336,7 +335,7 @@ impl HnswIndex {
     &self,
     query: &[f32],
     k: usize,
-    metric: impl Fn(&[f32], &[f32]) -> f64,
+    metric: Metric,
     hop_count: &mut usize,
   ) -> Vec<(LabelType, f64)> {
     let mut curr_obj = self.enter_point_node;
@@ -362,7 +361,7 @@ impl HnswIndex {
     }
 
     let mut top_candidates =
-      self.search_base_layer_st_bare_bone(curr_obj, query, max(self.ef, k), hop_count);
+      self.search_base_layer_st_bare_bone(curr_obj, query, metric, max(self.ef, k), hop_count);
 
     while top_candidates.len() > k {
       top_candidates.pop();

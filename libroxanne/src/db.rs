@@ -1,22 +1,22 @@
 use crate::common::Dtype;
 use crate::common::Id;
+use bitcode::decode;
+use bitcode::encode;
 use bitcode::Decode;
 use bitcode::Encode;
+use bytemuck::cast_slice;
 use flume::r#async::RecvStream;
 use futures::Stream;
 use futures::StreamExt;
-use rmp_serde::to_vec_named;
 use rocksdb::BlockBasedOptions;
 use rocksdb::Direction;
 use rocksdb::IteratorMode;
 use rocksdb::WriteBatchWithTransaction;
-use serde::Deserialize;
-use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Encode, Decode)]
 pub enum DbIndexMode {
   BruteForce,
   InMemory,
@@ -112,16 +112,12 @@ impl DbTransaction {
     self.batch.put(k.bytes(), v);
   }
 
-  fn write(&mut self, k: impl DbKey, v: &impl Serialize) {
-    self.write_raw(k, to_vec_named(v).unwrap());
+  fn write(&mut self, k: impl DbKey, v: &impl Encode) {
+    self.write_raw(k, encode(v));
   }
 
-  pub fn write_additional_out_neighbors(&mut self, id: Id, neighbors: &[Id]) {
-    // Use bitcode to squeeze even more byte savings, important for the purpose of AdditionalOutNeighbors.
-    self.write_raw(
-      (DbKeyT::AdditionalOutNeighbors, id),
-      bitcode::encode(neighbors),
-    );
+  pub fn write_additional_out_neighbors(&mut self, id: Id, neighbors: &Vec<Id>) {
+    self.write((DbKeyT::AdditionalOutNeighbors, id), neighbors);
   }
 
   pub fn write_deleted(&mut self, id: Id) {
@@ -163,7 +159,6 @@ impl DbTransaction {
 // - It doesn't use space to store field names or types.
 // These are crucial as we want to pack this in under one disk page read, which DiskANN relies on.
 // We don't store as MessagePack like the other DB entries as that's less efficient for this specific use case.
-#[derive(Encode, Decode)]
 pub struct NodeData<T> {
   pub neighbors: Vec<Id>,
   pub vector: Vec<T>,
@@ -171,11 +166,16 @@ pub struct NodeData<T> {
 
 impl<T: Dtype> NodeData<T> {
   pub fn serialize(&self) -> Vec<u8> {
-    bitcode::encode(self)
+    // Bitcode doesn't support f16 at this time, so we must convert to raw [u8] first.
+    // WARNING: This decision is permanent, unless we want to break the disk format.
+    let vec_raw: Vec<u8> = cast_slice(&self.vector).to_vec();
+    encode(&(self.neighbors.clone(), vec_raw))
   }
 
   pub fn deserialize(raw: &[u8]) -> Self {
-    bitcode::decode(raw).unwrap()
+    let (neighbors, vec_raw): (Vec<Id>, Vec<u8>) = decode(raw).unwrap();
+    let vector: Vec<T> = cast_slice(&vec_raw).to_vec();
+    Self { neighbors, vector }
   }
 }
 
@@ -246,9 +246,7 @@ impl Db {
   }
 
   pub fn iter_additional_out_neighbors(&self) -> RecvStream<(Id, Vec<Id>)> {
-    self.iter(DbKeyT::AdditionalOutNeighbors, |v| {
-      bitcode::decode(&v).unwrap()
-    })
+    self.iter(DbKeyT::AdditionalOutNeighbors, |v| decode(&v).unwrap())
   }
 
   pub fn iter_deleted(&self) -> impl Stream<Item = Id> + '_ {
@@ -277,7 +275,7 @@ impl Db {
     self
       .maybe_read_raw((DbKeyT::AdditionalOutNeighbors, id))
       .await
-      .map(|raw| bitcode::decode(&raw).unwrap())
+      .map(|raw| decode(&raw).unwrap())
       .unwrap_or_default()
   }
 
@@ -285,7 +283,7 @@ impl Db {
     self
       .maybe_read_raw(DbKeyT::IndexMode)
       .await
-      .map(|raw| rmp_serde::from_slice(&raw).unwrap())
+      .map(|raw| decode(&raw).unwrap())
       .unwrap_or(DbIndexMode::BruteForce)
   }
 
@@ -294,8 +292,10 @@ impl Db {
   }
 
   pub async fn maybe_read_id(&self, key: &str) -> Option<Id> {
-    let raw = self.maybe_read_raw((DbKeyT::Id, key)).await?;
-    Some(rmp_serde::from_slice(&raw).unwrap())
+    self
+      .maybe_read_raw((DbKeyT::Id, key))
+      .await
+      .map(|raw| decode(&raw).unwrap())
   }
 
   pub async fn maybe_read_key(&self, id: Id) -> Option<String> {
@@ -313,7 +313,7 @@ impl Db {
     self
       .maybe_read_raw(DbKeyT::Medoid)
       .await
-      .map(|raw| rmp_serde::from_slice(&raw).unwrap())
+      .map(|raw| decode(&raw).unwrap())
   }
 
   pub async fn read_node<T: Dtype>(&self, id: Id) -> NodeData<T> {

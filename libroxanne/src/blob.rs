@@ -1,4 +1,5 @@
 use crate::common::Dtype;
+use crate::common::DtypeCalc;
 use crate::common::Id;
 use crate::common::Metric;
 use crate::in_memory::InMemoryIndex;
@@ -6,7 +7,6 @@ use crate::pq::ProductQuantizer;
 use crate::vamana::VamanaParams;
 use dashmap::DashMap;
 use data_encoding::BASE64URL_NOPAD;
-use linfa::Float;
 use ndarray::Array1;
 use rand::thread_rng;
 use rand::RngCore;
@@ -28,8 +28,8 @@ pub struct InMemoryIndexBlob<T> {
   pub medoid: Id,
 }
 
-impl<T: Dtype> From<&InMemoryIndex<T>> for InMemoryIndexBlob<T> {
-  fn from(value: &InMemoryIndex<T>) -> Self {
+impl<T: Dtype, C: DtypeCalc> From<&InMemoryIndex<T, C>> for InMemoryIndexBlob<T> {
+  fn from(value: &InMemoryIndex<T, C>) -> Self {
     Self {
       graph: value.graph.clone(),
       medoid: value.medoid,
@@ -39,7 +39,11 @@ impl<T: Dtype> From<&InMemoryIndex<T>> for InMemoryIndexBlob<T> {
 }
 
 impl<T: Dtype> InMemoryIndexBlob<T> {
-  pub fn to_index(&self, metric: Metric<T>, params: VamanaParams) -> InMemoryIndex<T> {
+  pub fn to_index<C: DtypeCalc>(
+    &self,
+    metric: Metric<C>,
+    params: VamanaParams,
+  ) -> InMemoryIndex<T, C> {
     InMemoryIndex {
       graph: self.graph.clone(),
       medoid: self.medoid,
@@ -75,12 +79,12 @@ impl BlobStore {
     tokio::fs::rename(&p_tmp, p).await.unwrap();
   }
 
-  pub async fn read_pq_model<T: Dtype + Float>(&self) -> ProductQuantizer<T> {
+  pub async fn read_pq_model<C: DtypeCalc>(&self) -> ProductQuantizer<C> {
     let raw = tokio::fs::read(self.dir.join("pq_model")).await.unwrap();
     from_slice(&raw).unwrap()
   }
 
-  pub async fn write_pq_model<T: Dtype + Float>(&self, pq_model: &ProductQuantizer<T>) {
+  pub async fn write_pq_model<C: DtypeCalc>(&self, pq_model: &ProductQuantizer<C>) {
     self.write("pq_model", pq_model).await;
   }
 }

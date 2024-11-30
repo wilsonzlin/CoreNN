@@ -1,4 +1,5 @@
 use crate::common::Dtype;
+use crate::common::DtypeCalc;
 use crate::common::Id;
 use crate::common::PointDist;
 use crate::search::GreedySearchParams;
@@ -37,7 +38,7 @@ pub struct OptimizeMetrics {
   pub updated_nodes: HashSet<Id>,
 }
 
-pub trait Vamana<T: Dtype>: GreedySearchable<T> {
+pub trait Vamana<T: Dtype, C: DtypeCalc>: GreedySearchable<T, C> {
   fn params(&self) -> &VamanaParams;
 
   /// WARNING: `candidate_ids` must not contain the point itself.
@@ -75,7 +76,7 @@ pub trait Vamana<T: Dtype>: GreedySearchable<T> {
   }
 }
 
-pub trait VamanaSync<T: Dtype>: GreedySearchableSync<T> + Vamana<T> {
+pub trait VamanaSync<T: Dtype, C: DtypeCalc>: GreedySearchableSync<T, C> + Vamana<T, C> {
   fn set_point(&self, id: Id, point: Array1<T>);
   fn set_out_neighbors(&self, id: Id, neighbors: Vec<Id>);
 

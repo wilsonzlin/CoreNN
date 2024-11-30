@@ -3,6 +3,7 @@ use crate::common::Metric;
 use crate::common::PrecomputedDists;
 use crate::search::GreedySearchable;
 use crate::search::GreedySearchableSync;
+use crate::search::Points;
 use ahash::HashMap;
 use hnswlib_rs::HnswIndex;
 use hnswlib_rs::LabelType;
@@ -61,20 +62,11 @@ impl<'h> HnswGraph<'h> {
   }
 }
 
-impl<'h> GreedySearchable<f32> for HnswGraph<'h> {
-  type FullVec = Vec<f32>;
-  type Neighbors<'a>
-    = &'a [LabelType]
-  where
-    Self: 'a;
+impl<'h> Points<f32, f32> for HnswGraph<'h> {
   type Point<'a>
     = &'a [f32]
   where
     Self: 'a;
-
-  fn medoid(&self) -> Id {
-    self.hnsw.entry_label()
-  }
 
   fn metric(&self) -> Metric<f32> {
     self.metric
@@ -89,7 +81,19 @@ impl<'h> GreedySearchable<f32> for HnswGraph<'h> {
   }
 }
 
-impl<'h> GreedySearchableSync<f32> for HnswGraph<'h> {
+impl<'h> GreedySearchable<f32, f32> for HnswGraph<'h> {
+  type FullVec = Vec<f32>;
+  type Neighbors<'a>
+    = &'a [LabelType]
+  where
+    Self: 'a;
+
+  fn medoid(&self) -> Id {
+    self.hnsw.entry_label()
+  }
+}
+
+impl<'h> GreedySearchableSync<f32, f32> for HnswGraph<'h> {
   fn get_out_neighbors_sync<'a>(&'a self, id: Id) -> (Self::Neighbors<'a>, Option<Self::FullVec>) {
     (self.graph.get(&id).unwrap(), None)
   }
