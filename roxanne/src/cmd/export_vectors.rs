@@ -41,13 +41,12 @@ impl ExportVectorsArgs {
     let out_vecs = File::create(self.out.join("vecs.bin")).await.unwrap();
     let mut out_vecs = BufWriter::new(out_vecs);
 
-    db.iter_nodes::<half::f16>()
-      .for_each(async |(id, node)| {
-        out_ids.write_u64_le(id.try_into().unwrap()).await.unwrap();
-        assert_eq!(node.vector.len(), dim);
-        out_vecs.write_all(cast_slice(&node.vector)).await.unwrap();
-      })
-      .await;
+    let mut stream = db.iter_nodes::<half::f16>();
+    while let Some((id, node)) = stream.next().await {
+      out_ids.write_u64_le(id.try_into().unwrap()).await.unwrap();
+      assert_eq!(node.vector.len(), dim);
+      out_vecs.write_all(cast_slice(&node.vector)).await.unwrap();
+    }
 
     out_ids.flush().await.unwrap();
     out_vecs.flush().await.unwrap();

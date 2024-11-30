@@ -98,7 +98,7 @@ impl MigrateHnswArgs {
         vector: vectors.remove(&id).unwrap(),
       });
     }
-    txn.commit(&db);
+    txn.commit(&db).await;
     db.flush().await;
     drop(db);
     tracing::info!("all done!");

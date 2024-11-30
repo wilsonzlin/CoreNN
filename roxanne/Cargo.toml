@@ -13,6 +13,9 @@ hnswlib-rs = { version = "0.2.0", path = "../hnswlib-rs" }
 indicatif = "0.17.9"
 itertools = "0.13.0"
 libroxanne = { version = "0.2.0", path = "../libroxanne" }
+ndarray = "0.15" # libroxanne uses 0.15.
+ndarray-linalg = "0.15.0" # libroxanne uses 0.15.
+serde_json = "1.0.133"
 tokio = { version = "1.41.1", features = ["full"] }
 toml = "0.8.19"
 tracing = "0.1.41"
