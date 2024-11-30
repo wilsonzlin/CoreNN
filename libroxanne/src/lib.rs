@@ -538,7 +538,7 @@ mod tests {
       .unwrap(),
     )
     .unwrap();
-    let rx = RoxanneDb::open(dir_raw).await;
+    let rx = RoxanneDb::<f32, f32>::open(dir_raw).await;
     tracing::info!("opened database");
 
     // First test: an empty DB should provide no results.
@@ -644,7 +644,7 @@ mod tests {
       .await
       .unwrap();
     tracing::info!("inserted 1313 so far");
-    let expected_medoid_i = calc_approx_medoid(
+    let expected_medoid_i = calc_approx_medoid::<f32, f32>(
       &(0..1313).map(|i| (i, vecs[i].clone())).collect(),
       metric_euclidean,
       10_000,
