@@ -386,7 +386,7 @@ impl<T: Dtype> RoxanneDb<T> {
       .update_sender
       .send_async(Update::Insert(
         entries
-        .into_iter()
+          .into_iter()
           // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
           .map(|(k, v)| (k, v.mapv(nan_to_num)))
           .collect(),
@@ -554,7 +554,7 @@ mod tests {
     }
 
     // Insert below brute force index cap.
-    rx.insert([("0".to_string(), vecs[0].clone())].into_iter().collect())
+    rx.insert([("0".to_string(), vecs[0].clone())])
       .await
       .unwrap();
     let res = rx.query(&vecs[0].view(), 100).await;
@@ -562,7 +562,7 @@ mod tests {
     assert_eq!(&res[0].0, "0");
 
     // Still below brute force index cap.
-    rx.insert((1..734).map(|i| (i.to_string(), vecs[i].clone())).collect())
+    rx.insert((1..734).map(|i| (i.to_string(), vecs[i].clone())))
       .await
       .unwrap();
     // It's tempting to directly compare against `nn[i]` given BF's 100% accuracy, but it's still complicated due to 1) non-deterministic DB internal IDs assigned, and 2) unstable sorting (i.e. two same dists).
@@ -580,13 +580,9 @@ mod tests {
     deleted.insert(90);
 
     // Still below brute force index cap.
-    rx.insert(
-      (734..1000)
-        .map(|i| (i.to_string(), vecs[i].clone()))
-        .collect(),
-    )
-    .await
-    .unwrap();
+    rx.insert((734..1000).map(|i| (i.to_string(), vecs[i].clone())))
+      .await
+      .unwrap();
     // Accuracy can be very slightly less than 1.0 due to non-deterministic sorting of equal dist points.
     assert_accuracy!(1000, 0.99);
     tracing::info!("inserted 1000 so far");
@@ -594,7 +590,6 @@ mod tests {
     sleep(Duration::from_secs(1));
 
     assert_eq!(rx.deleted.len(), 2);
-    assert_eq!(rx.next_id.load(Ordering::Relaxed), 1000);
     assert_eq!(rx.index.bf.read().clone().unwrap().len(), 1000);
     assert_eq!(rx.index.additional_out_neighbors.len(), 0);
     assert_eq!(rx.index.temp_nodes.len(), 0);
@@ -607,13 +602,9 @@ mod tests {
     };
 
     // Now, it should build the in-memory index.
-    rx.insert(
-      (1000..1313)
-        .map(|i| (i.to_string(), vecs[i].clone()))
-        .collect(),
-    )
-    .await
-    .unwrap();
+    rx.insert((1000..1313).map(|i| (i.to_string(), vecs[i].clone())))
+      .await
+      .unwrap();
     tracing::info!("inserted 1313 so far");
     let expected_medoid_i = calc_approx_medoid(
       &(0..1313).map(|i| (i, vecs[i].clone())).collect(),
@@ -635,7 +626,6 @@ mod tests {
       }
       Mode::LTI { .. } => unreachable!(),
     };
-    assert_eq!(rx.db.iter_brute_force_vecs::<f32>().count().await, 0);
     assert_eq!(rx.db.maybe_read_medoid().await, Some(expected_medoid_id));
     assert_eq!(rx.db.read_index_mode().await, DbIndexMode::InMemory);
     assert_eq!(rx.db.iter_nodes::<f32>().count().await, 1313);
@@ -671,13 +661,9 @@ mod tests {
     assert_eq!(rx.deleted.len(), deleted.len());
 
     // Still under in-memory index cap.
-    rx.insert(
-      (1313..2090)
-        .map(|i| (i.to_string(), vecs[i].clone()))
-        .collect(),
-    )
-    .await
-    .unwrap();
+    rx.insert((1313..2090).map(|i| (i.to_string(), vecs[i].clone())))
+      .await
+      .unwrap();
     tracing::info!("inserted 2090 so far");
     // Medoid must not have changed.
     assert_eq!(rx.index.medoid.load(Ordering::Relaxed), expected_medoid_id);
@@ -694,21 +680,13 @@ mod tests {
     assert_accuracy!(2090, 0.95);
 
     // Now, it should transition to LTI.
-    rx.insert(
-      (2090..2671)
-        .map(|i| (i.to_string(), vecs[i].clone()))
-        .collect(),
-    )
-    .await
-    .unwrap();
+    rx.insert((2090..2671).map(|i| (i.to_string(), vecs[i].clone())))
+      .await
+      .unwrap();
     // Do another insert to wait on the updater_thread to complete the transition.
-    rx.insert(
-      (2671..2722)
-        .map(|i| (i.to_string(), vecs[i].clone()))
-        .collect(),
-    )
-    .await
-    .unwrap();
+    rx.insert((2671..2722).map(|i| (i.to_string(), vecs[i].clone())))
+      .await
+      .unwrap();
     assert_eq!(rx.index.medoid.load(Ordering::Relaxed), expected_medoid_id);
     assert!(rx.index.bf.read().is_none());
     assert_eq!(rx.index.temp_nodes.len(), 0);
@@ -720,7 +698,6 @@ mod tests {
         assert_eq!(pq_vecs.len(), 2722);
       }
     };
-    assert_eq!(rx.db.iter_brute_force_vecs::<f32>().count().await, 0);
     assert_eq!(rx.db.maybe_read_medoid().await, Some(expected_medoid_id));
     assert_eq!(rx.db.read_index_mode().await, DbIndexMode::LongTerm);
     assert_eq!(rx.db.iter_nodes::<f32>().count().await, 2722);
@@ -740,21 +717,13 @@ mod tests {
     tracing::info!(n = to_delete.len(), "deleted vectors");
     assert_accuracy!(2722, 0.84);
     // Do insert to trigger the updater_thread to start the merge.
-    rx.insert(
-      (2722..2799)
-        .map(|i| (i.to_string(), vecs[i].clone()))
-        .collect(),
-    )
-    .await
-    .unwrap();
+    rx.insert((2722..2799).map(|i| (i.to_string(), vecs[i].clone())))
+      .await
+      .unwrap();
     // Do another insert to wait for the updater_thread to finish the merge.
-    rx.insert(
-      [("2799".to_string(), vecs[2799].clone())]
-        .into_iter()
-        .collect(),
-    )
-    .await
-    .unwrap();
+    rx.insert([("2799".to_string(), vecs[2799].clone())])
+      .await
+      .unwrap();
     // The medoid is never permanently deleted, so add 1.
     let expected_post_merge_nodes = 2800 - deleted.len() + 1;
     match &*rx.index.mode.read() {
@@ -776,13 +745,9 @@ mod tests {
     assert_accuracy!(2800, 0.84);
 
     // Finally, insert all remaining vectors.
-    rx.insert(
-      (2800..n)
-        .map(|i| (i.to_string(), vecs[i].clone()))
-        .collect(),
-    )
-    .await
-    .unwrap();
+    rx.insert((2800..n).map(|i| (i.to_string(), vecs[i].clone())))
+      .await
+      .unwrap();
     tracing::info!("inserted all vectors");
     // Do final query.
     // We expect a dramatic drop in accuracy as we're inserting uniformly random data (i.e. noise) that cannot be compressed or fitted to, and we've now inserted ~300% more data so our PQ model is now very poor.

@@ -482,6 +482,7 @@ pub async fn updater_thread<T: Dtype>(
 
     // We must use Tokio's lock as we need to hold across await later in graph_index_update (unsupported by parking_lot).
     let txn = Arc::new(tokio::sync::Mutex::new(DbTransaction::new()));
+    let actually_deleted = AtomicUsize::new(0);
     iter(&keys_to_delete_first)
       .for_each_concurrent(None, async |key| {
         if let Some(ex_id) = db.maybe_read_id(key).await {
@@ -490,7 +491,9 @@ pub async fn updater_thread<T: Dtype>(
           txn.delete_id(key);
           txn.delete_key(ex_id);
           // Insert into rx.deleted now so later vector insertion graph searches doesn't pick this as a neighbor.
-          rx.deleted.insert(ex_id);
+          if rx.deleted.insert(ex_id) {
+            actually_deleted.fetch_add(1, Ordering::Relaxed);
+          }
         };
       })
       .await;
@@ -516,7 +519,11 @@ pub async fn updater_thread<T: Dtype>(
     for c in signals {
       c.signal(());
     }
-    tracing::debug!(n = insert_n, "inserted vectors");
+    tracing::debug!(
+      inserted = insert_n,
+      deleted = actually_deleted.load(Ordering::Relaxed),
+      "committed updates"
+    );
 
     // Opportunity to transition from in-memory to long term index.
     // Clone (cheap Arc) so we can release lock and not have to hold it across .await.
