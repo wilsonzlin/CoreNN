@@ -9,7 +9,6 @@ edition = "2021"
 
 [dependencies]
 ahash = { version = "0.8.11", features = ["serde"] }
-arbitrary-lock = "0.1.1"
 bitcode = "0.6.3"
 bytemuck = { version = "1.19.0", features = ["nightly_float"] }
 byteorder = "1.5.0"

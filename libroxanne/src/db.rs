@@ -2,7 +2,6 @@ use crate::common::Dtype;
 use crate::common::Id;
 use bitcode::Decode;
 use bitcode::Encode;
-use bytemuck::cast_slice;
 use flume::r#async::RecvStream;
 use futures::Stream;
 use futures::StreamExt;
@@ -28,7 +27,6 @@ pub enum DbIndexMode {
 #[repr(u8)]
 pub enum DbKeyT {
   AdditionalOutNeighbors, // (Id)
-  BruteForceVec,          // (Id)
   Deleted,                // (Id)
   IndexMode,
   Id,  // (Vec<u8>)
@@ -90,10 +88,6 @@ impl DbTransaction {
     self.delete_raw((DbKeyT::AdditionalOutNeighbors, id));
   }
 
-  pub fn delete_brute_force_vec(&mut self, id: Id) {
-    self.delete_raw((DbKeyT::BruteForceVec, id));
-  }
-
   pub fn delete_deleted(&mut self, id: Id) {
     self.delete_raw((DbKeyT::Deleted, id));
   }
@@ -128,10 +122,6 @@ impl DbTransaction {
       (DbKeyT::AdditionalOutNeighbors, id),
       bitcode::encode(neighbors),
     );
-  }
-
-  pub fn write_brute_force_vec<T: Dtype>(&mut self, id: Id, vec: &[T]) {
-    self.write_raw((DbKeyT::BruteForceVec, id), cast_slice(vec));
   }
 
   pub fn write_deleted(&mut self, id: Id) {
@@ -261,10 +251,6 @@ impl Db {
     })
   }
 
-  pub fn iter_brute_force_vecs<T: Dtype>(&self) -> RecvStream<(Id, Vec<T>)> {
-    self.iter(DbKeyT::BruteForceVec, |v| cast_slice(&v).to_vec())
-  }
-
   pub fn iter_deleted(&self) -> impl Stream<Item = Id> + '_ {
     self.iter(DbKeyT::Deleted, |_| ()).map(|(id, _)| id)
   }
@@ -293,11 +279,6 @@ impl Db {
       .await
       .map(|raw| bitcode::decode(&raw).unwrap())
       .unwrap_or_default()
-  }
-
-  pub async fn read_brute_force_vec<T: Dtype>(&self, id: Id) -> Vec<T> {
-    let raw = self.read_raw((DbKeyT::BruteForceVec, id)).await;
-    cast_slice(&raw).to_vec()
   }
 
   pub async fn read_index_mode(&self) -> DbIndexMode {

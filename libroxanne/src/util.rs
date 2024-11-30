@@ -133,6 +133,31 @@ pub trait AsyncConcurrentIteratorExt<T>: Iterator<Item = T> + Sized {
     // No need for for_each_concurrent, FuturesOrdered "will race [futures] to completion in parallel": https://docs.rs/futures/latest/futures/stream/struct.FuturesOrdered.html.
     self.map(|t| f(t)).collect::<FuturesOrdered<_>>()
   }
+
+  fn filter_map_concurrent<R, Fut, F>(self, f: F) -> impl Stream<Item = R>
+  where
+    Fut: Future<Output = Option<R>>,
+    F: Fn(T) -> Fut,
+  {
+    self
+      .map(|t| f(t))
+      .collect::<FuturesOrdered<_>>()
+      .filter_map(async |x| x)
+  }
+
+  /// Convenience method for spawning async tasks to run in the background (for parallelism) and waiting for them to complete. Better than for_each_concurrent, since this is actually parallel.
+  /// Since this uses tokio::spawn, the async task must be 'static. Given this is an iterator method, a convenient pattern is to chain a .map *before* this method to collect all args into 'static (e.g. cloning Arcs, cloning into owned values).
+  async fn spawn_for_each<Fut, F>(self, f: F)
+  where
+    Fut: Future<Output = ()> + Send + 'static,
+    F: Fn(T) -> Fut,
+  {
+    self
+      .map(|t| tokio::spawn(f(t)))
+      .collect::<FuturesUnordered<_>>()
+      .for_each(async |e| e.unwrap())
+      .await;
+  }
 }
 
 impl<T, I: Iterator<Item = T>> AsyncConcurrentIteratorExt<T> for I {}

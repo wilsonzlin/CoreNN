@@ -8,7 +8,6 @@ use crate::util::AsyncConcurrentStreamExt;
 use crate::util::CollectionExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
-use core::slice::SlicePattern;
 use itertools::Itertools;
 use ndarray::Array1;
 use ndarray::ArrayView1;
@@ -247,7 +246,7 @@ impl INeighbors for &[Id] {
 
 impl INeighbors for Vec<Id> {
   fn neighbors(&self) -> impl Iterator<Item = Id> {
-    self.as_slice().neighbors()
+    self.iter().map(|id| *id)
   }
 
   fn into_vec(self) -> Vec<Id> {
@@ -257,7 +256,7 @@ impl INeighbors for Vec<Id> {
 
 impl INeighbors for Cow<'_, [Id]> {
   fn neighbors(&self) -> impl Iterator<Item = Id> {
-    self.as_slice().neighbors()
+    self.iter().map(|id| *id)
   }
 
   fn into_vec(self) -> Vec<Id> {
