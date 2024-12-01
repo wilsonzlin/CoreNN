@@ -27,7 +27,7 @@ fn main() {
 
   let graph = random_r_regular_graph(&(0..ds.info.n).collect_vec(), args.degree_bound);
 
-  let medoid = calc_approx_medoid(
+  let medoid = calc_approx_medoid::<f32, f32>(
     &(0..n).map(|id| (id, vecs.row(id).to_owned())).collect(),
     metric_euclidean,
     10_000,

@@ -9,13 +9,15 @@ use libroxanne::common::Id;
 use libroxanne::common::PointDist;
 use libroxanne::hnsw::HnswGraph;
 use libroxanne::in_memory::InMemoryIndex;
-use libroxanne::search::GreedySearchable;
+use libroxanne::search::GreedySearchableSync;
+use libroxanne::search::Points;
 use libroxanne::search::Query;
 use libroxanne::vamana::OptimizeMetrics;
-use libroxanne::vamana::Vamana;
 use libroxanne::vamana::VamanaParams;
+use libroxanne::vamana::VamanaSync;
 use ndarray::Array1;
 use ndarray::Array2;
+use ndarray::ArrayView1;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rayon::iter::IndexedParallelIterator;
@@ -60,7 +62,7 @@ struct Ctx {
 }
 
 impl Ctx {
-  pub fn eval(&self, index: &InMemoryIndex<f32>) -> Eval {
+  pub fn eval(&self, index: &InMemoryIndex<f32, f32>) -> Eval {
     eval(
       index,
       &self.queries.view(),
@@ -72,7 +74,7 @@ impl Ctx {
 }
 
 // This is somewhat of an ablation test: to see if other more-sophisticated strategies are actually doing anything better.
-fn baseline_build_from_scratch(args: &Args, ctx: &Ctx, index: InMemoryIndex<f32>) {
+fn baseline_build_from_scratch(args: &Args, ctx: &Ctx, index: InMemoryIndex<f32, f32>) {
   let mut ids = ctx.node_to_level.iter().map(|e| *e.key()).collect_vec();
   ids.shuffle(&mut thread_rng());
   index.graph.par_iter_mut().for_each(|mut e| {
@@ -104,7 +106,7 @@ fn baseline_build_from_scratch(args: &Args, ctx: &Ctx, index: InMemoryIndex<f32>
 }
 
 // This is somewhat of an ablation test: to see if other more-sophisticated strategies are actually doing anything better.
-fn strategy_reinsert_randomly(ctx: &Ctx, index: InMemoryIndex<f32>) {
+fn strategy_reinsert_randomly(ctx: &Ctx, index: InMemoryIndex<f32, f32>) {
   let mut ids = ctx.node_to_level.iter().map(|e| *e.key()).collect_vec();
   ids.shuffle(&mut thread_rng());
 
@@ -130,7 +132,7 @@ fn strategy_reinsert_randomly(ctx: &Ctx, index: InMemoryIndex<f32>) {
   }
 }
 
-fn strategy_reinsert_by_level(ctx: &Ctx, index: InMemoryIndex<f32>) {
+fn strategy_reinsert_by_level(ctx: &Ctx, index: InMemoryIndex<f32, f32>) {
   let mut cumulative_updated_nodes = HashSet::<Id>::new();
   for ent in ctx
     .level_to_shard_to_nodes
@@ -161,7 +163,7 @@ fn strategy_reinsert_by_level(ctx: &Ctx, index: InMemoryIndex<f32>) {
 }
 
 // Helper function used by strategy_stitch_cliques*.
-fn find_cliques_and_stitch_graphs(index: &InMemoryIndex<f32>, graphs: &[HnswGraph]) {
+fn find_cliques_and_stitch_graphs(index: &InMemoryIndex<f32, f32>, graphs: &[HnswGraph]) {
   // Idea for faster finding of closest neighbor in another shard:
   // - Find closest node A' in shard 2 to base shard's start node A.
   // - Assumption: A ~= A', so neighbors(A) ~= neighbors(A').
@@ -172,14 +174,14 @@ fn find_cliques_and_stitch_graphs(index: &InMemoryIndex<f32>, graphs: &[HnswGrap
   // Map from base node ID to map from shard number to shard node ID.
   let cliques = DashMap::<Id, DashMap<usize, Id>>::new();
   // We can't just pick the entry point as the start that may not exist on our level.
-  let base_path = graphs[0].find_shortest_spanning_tree(graphs[0].ids().next().unwrap());
+  let base_path = graphs[0].greedy_spanning_traversal(graphs[0].ids().next().unwrap());
 
   // In the base shard, the closest to `to` is from `from`.
   // Therefore, in every other shard, we query for the equivalent to `to` starting from the equivalent to the base `from` in the shard for faster convergence.
   graphs.par_iter().enumerate().skip(1).for_each(|(i, o)| {
     let mut available = o.ids().collect::<HashSet<_>>();
     for (from, to) in base_path.iter().cloned() {
-      let to_emb = graphs[0].get_point(to);
+      let to_emb = ArrayView1::from(graphs[0].get_point(to));
 
       // If None: we're at the start.
       cliques
@@ -190,9 +192,7 @@ fn find_cliques_and_stitch_graphs(index: &InMemoryIndex<f32>, graphs: &[HnswGrap
         // NOTE: We cannot just use the HNSW entry node as it isn't available on this level (unless we're at the top level).
         .or_else(|| available.iter().cloned().next())
         .and_then(|start| {
-          o.greedy_search_fast1(Query::Vec(&to_emb.view()), start, |n| {
-            available.contains(&n)
-          })
+          o.greedy_search_fast1(Query::Vec(&to_emb), start, |n| available.contains(&n))
         })
         .inspect(|&PointDist { id: other_node, .. }| {
           cliques.entry(to).or_default().insert(i, other_node);
@@ -223,7 +223,7 @@ fn find_cliques_and_stitch_graphs(index: &InMemoryIndex<f32>, graphs: &[HnswGrap
 
 // Ablation study for strategy_stitch_cliques_by_level, by not inserting by level. Preliminary results show that going level-by-level has no effect.
 // See strategy_stitch_cliques_by_level for more details.
-fn strategy_stitch_cliques(ctx: &Ctx, index: InMemoryIndex<f32>) -> InMemoryIndex<f32> {
+fn strategy_stitch_cliques(ctx: &Ctx, index: InMemoryIndex<f32, f32>) -> InMemoryIndex<f32, f32> {
   let graphs = ctx
     .shards
     .iter()
@@ -250,7 +250,10 @@ fn strategy_stitch_cliques(ctx: &Ctx, index: InMemoryIndex<f32>) -> InMemoryInde
 // - Find random pair/clique (not closest) across shards and merge edges.
 // - Stitch across all levels, not level-by-level.
 // - Stitch subset of neighbors.
-fn strategy_stitch_cliques_by_level(ctx: &Ctx, index: InMemoryIndex<f32>) -> InMemoryIndex<f32> {
+fn strategy_stitch_cliques_by_level(
+  ctx: &Ctx,
+  index: InMemoryIndex<f32, f32>,
+) -> InMemoryIndex<f32, f32> {
   // We want to go by level as nodes on different levels have different edge length and count distributions, which is probably ideal to preserve.
   for ent in ctx
     .level_to_shard_to_nodes
@@ -316,7 +319,7 @@ fn main() {
         .push(id);
       node_to_level.insert(id, level);
       adj_list.insert(id, hnsw.get_merged_neighbors(id, 0).into_iter().collect());
-      id_to_point.insert(id, Array1::from_vec(hnsw.get_data_by_label(id)));
+      id_to_point.insert(id, Array1::from_vec(hnsw.get_data_by_label(id).to_vec()));
     }
   });
   let entrypoints = hnsws.iter().map(|hnsw| hnsw.entry_label()).collect_vec();

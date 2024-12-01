@@ -3,11 +3,13 @@ use ahash::HashSet;
 use bytemuck::cast_slice;
 use bytemuck::Pod;
 use dashmap::DashMap;
+use half::f16;
 use itertools::Itertools;
 use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
 use libroxanne::common::StdMetric;
-use libroxanne::search::GreedySearchable;
+use libroxanne::search::GreedySearchParams;
+use libroxanne::search::GreedySearchableSync;
 use libroxanne::search::Query;
 use libroxanne::search::SearchMetrics;
 use ndarray::Array2;
@@ -125,7 +127,7 @@ impl Eval {
   }
 }
 
-pub fn eval<'a, 'g: 'a, G: GreedySearchable<'a, f32> + Send + Sync>(
+pub fn eval<'a, 'g: 'a, G: GreedySearchableSync<f32, f32> + Send + Sync>(
   index: &'g G,
   queries: &ArrayView2<f32>,
   ground_truth: &ArrayView2<u32>,
@@ -140,17 +142,17 @@ pub fn eval<'a, 'g: 'a, G: GreedySearchable<'a, f32> + Send + Sync>(
     .map(|i| {
       let knn_expected = HashSet::from_iter(ground_truth.row(i).mapv(|v| v as Id));
       let mut metrics = SearchMetrics::default();
-      let res = index.greedy_search(
-        Query::Vec(&queries.row(i)),
+      let res = index.greedy_search_sync(GreedySearchParams {
+        query: Query::Vec(&queries.row(i)),
         k,
         search_list_cap,
         beam_width,
-        index.medoid(),
-        |_| true,
-        None,
-        Some(&mut metrics),
-        Some(&knn_expected),
-      );
+        start: index.medoid(),
+        filter: |_| true,
+        out_visited: None,
+        out_metrics: Some(&mut metrics),
+        ground_truth: Some(&knn_expected),
+      });
       let knn_got = res.into_iter().map(|pd| pd.id).collect::<HashSet<_>>();
       correct.fetch_add(
         knn_expected.intersection(&knn_got).count(),

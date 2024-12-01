@@ -68,7 +68,7 @@ fn main() {
   };
 
   let pb = new_pb(n);
-  let index = InMemoryIndex::builder(
+  let index = InMemoryIndex::<f32, f32>::builder(
     (0..n).collect(),
     (0..n).map(|i| vecs.row(i).to_owned()).collect(),
   )

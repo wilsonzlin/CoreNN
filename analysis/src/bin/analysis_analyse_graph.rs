@@ -5,6 +5,8 @@ use libroxanne::common::Metric;
 use libroxanne::common::PrecomputedDists;
 use libroxanne::pq::ProductQuantizer;
 use libroxanne::search::GreedySearchable;
+use libroxanne::search::GreedySearchableSync;
+use libroxanne::search::Points;
 use ndarray::Array1;
 use ndarray::Array2;
 use roxanne_analysis::eval;
@@ -36,14 +38,8 @@ struct EvalGraph {
   medoid: Id,
 }
 
-impl<'a> GreedySearchable<'a, f32> for EvalGraph {
-  type FullVec = Array1<f32>;
-  type Neighbors = Vec<Id>;
-  type Point = Array1<f32>;
-
-  fn medoid(&self) -> Id {
-    self.medoid
-  }
+impl Points<f32, f32> for EvalGraph {
+  type Point<'a> = Array1<f32>;
 
   fn metric(&self) -> Metric<f32> {
     self.metric
@@ -59,8 +55,19 @@ impl<'a> GreedySearchable<'a, f32> for EvalGraph {
       None => self.vectors.row(id).to_owned(),
     }
   }
+}
 
-  fn get_out_neighbors(&self, id: Id) -> (Vec<Id>, Option<Array1<f32>>) {
+impl GreedySearchable<f32, f32> for EvalGraph {
+  type FullVec = Array1<f32>;
+  type Neighbors<'a> = Vec<Id>;
+
+  fn medoid(&self) -> Id {
+    self.medoid
+  }
+}
+
+impl<'a> GreedySearchableSync<f32, f32> for EvalGraph {
+  fn get_out_neighbors_sync(&self, id: Id) -> (Vec<Id>, Option<Array1<f32>>) {
     let neighbors = self.adj_list.get(&id).unwrap().clone();
     let full_vec = self.pq.as_ref().map(|_| self.vectors.row(id).to_owned());
     (neighbors, full_vec)

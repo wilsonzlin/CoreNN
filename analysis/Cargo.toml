@@ -9,6 +9,7 @@ bytemuck = { version = "1.19.0", features = ["nightly_float"] }
 byteorder = "1.5.0"
 clap = { version = "4.5.19", features = ["derive"] }
 dashmap = { version = "6.1.0", features = ["serde"] }
+half = { version = "2.4.1", features = ["bytemuck", "num-traits", "serde"] }
 hnswlib-rs = { path = "../hnswlib-rs" }
 indicatif = "0.17.9"
 itertools = "0.13.0"

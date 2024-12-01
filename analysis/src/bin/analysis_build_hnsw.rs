@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use hnswlib_rs::HnswIndex;
 use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
-use ndarray::Array1;
+use ndarray::ArrayView1;
 use roxanne_analysis::export_index;
 use roxanne_analysis::Dataset;
 use std::fs;
@@ -60,8 +60,8 @@ fn main() {
             (
               neighbor,
               metric_euclidean(
-                &Array1::from_vec(hnsw.get_data_by_label(id)).view(),
-                &Array1::from_vec(hnsw.get_data_by_label(neighbor)).view(),
+                &ArrayView1::from(hnsw.get_data_by_label(id)),
+                &ArrayView1::from(hnsw.get_data_by_label(neighbor)),
               ),
             )
           })

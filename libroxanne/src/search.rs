@@ -45,15 +45,15 @@ fn no_filter(_id: Id) -> bool {
 }
 
 pub struct GreedySearchParams<'a, T: Dtype, F> {
-  pub(crate) query: Query<'a, 'a, T>,
-  pub(crate) k: usize,
-  pub(crate) search_list_cap: usize,
-  pub(crate) beam_width: usize,
-  pub(crate) start: Id,
-  pub(crate) filter: F,
-  pub(crate) out_visited: Option<&'a mut HashSet<Id>>,
-  pub(crate) out_metrics: Option<&'a mut SearchMetrics>,
-  pub(crate) ground_truth: Option<&'a HashSet<Id>>,
+  pub query: Query<'a, 'a, T>,
+  pub k: usize,
+  pub search_list_cap: usize,
+  pub beam_width: usize,
+  pub start: Id,
+  pub filter: F,
+  pub out_visited: Option<&'a mut HashSet<Id>>,
+  pub out_metrics: Option<&'a mut SearchMetrics>,
+  pub ground_truth: Option<&'a HashSet<Id>>,
 }
 
 impl<'a, T: Dtype, F: Fn(Id) -> bool> GreedySearchParams<'a, T, F> {

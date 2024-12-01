@@ -51,10 +51,10 @@ pub struct MigrateShardedHnswArgs {
 
 impl MigrateShardedHnswArgs {
   // We don't perform PQ here, as it's expensive and not specifically related to this task; use the general `pqify` tool afterwards.
-  pub async fn exec(args: Self) {
-    let metric = args.metric.get_fn::<f32>();
+  pub async fn exec(self) {
+    let metric = self.metric.get_fn::<f32>();
 
-    let dir = RoxanneDbDir::new(args.out);
+    let dir = RoxanneDbDir::new(self.out);
 
     // Make sure database can be created before we do long expensive work.
     let db = Db::open(dir.db()).await;
@@ -63,7 +63,7 @@ impl MigrateShardedHnswArgs {
     // First phase: load each shard to ensure integrity and compute some things.
     // - Ensure all shard files exist and are intact before we start doing long intensive work.
     // - Ensure all IDs are unique across all shards.
-    let paths_raw = std::fs::read_to_string(&args.paths).unwrap();
+    let paths_raw = std::fs::read_to_string(&self.paths).unwrap();
     let paths = paths_raw.lines().collect::<Vec<_>>();
     let total_n = AtomicUsize::new(0);
     let seen_ids = DashMap::<Id, String>::new();
@@ -71,7 +71,7 @@ impl MigrateShardedHnswArgs {
     let shard_node_counts = paths
       .par_iter()
       .map(|path| {
-        let index = load_hnsw(args.dim, path);
+        let index = load_hnsw(self.dim, path);
         total_n.fetch_add(index.cur_element_count, Ordering::Relaxed);
         for id in index.labels() {
           if let Some(other) = seen_ids.insert(id, path.to_string()) {
@@ -101,7 +101,7 @@ impl MigrateShardedHnswArgs {
       .collect_vec();
 
     let base_file = shards[0];
-    let base = load_hnsw(args.dim, base_file);
+    let base = load_hnsw(self.dim, base_file);
     let medoid = base.entry_label();
     let base_graph = HnswGraph::new(&base, metric, None);
     let base_path = base_graph.greedy_spanning_traversal(medoid);
@@ -113,9 +113,9 @@ impl MigrateShardedHnswArgs {
     }
     pb.inc(base.cur_element_count as u64);
 
-    for batch in (&shards[1..]).chunks(args.parallel - 1) {
+    for batch in (&shards[1..]).chunks(self.parallel - 1) {
       batch.into_par_iter().for_each(|&path| {
-        let other = load_hnsw(args.dim, path);
+        let other = load_hnsw(self.dim, path);
         let other_graph = HnswGraph::new(&other, metric, None);
         let mut available = other_graph.ids().collect::<HashSet<_>>();
 
@@ -166,9 +166,9 @@ impl MigrateShardedHnswArgs {
     let txn = Mutex::new(txn);
 
     let pb = new_pb(total_n);
-    for path_batch in paths.chunks(args.parallel) {
+    for path_batch in paths.chunks(self.parallel) {
       path_batch.into_par_iter().for_each(|&path| {
-        let index = load_hnsw(args.dim, path);
+        let index = load_hnsw(self.dim, path);
         // Collect to Vec so we can use into_par_iter, which is much faster than par_bridge.
         index.labels().collect_vec().into_par_iter().for_each(|id| {
           let neighbors = match node_to_clique.get(&id) {
