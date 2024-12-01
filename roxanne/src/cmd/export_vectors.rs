@@ -3,7 +3,6 @@ use clap::Args;
 use futures::StreamExt;
 use libroxanne::cfg::RoxanneDbCfg;
 use libroxanne::db::Db;
-use libroxanne::util::AsyncConcurrentStreamExt;
 use libroxanne::RoxanneDbDir;
 use std::path::PathBuf;
 use tokio::fs::create_dir_all;

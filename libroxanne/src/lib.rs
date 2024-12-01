@@ -8,7 +8,6 @@ use crate::util::AsyncConcurrentIteratorExt;
 use bf::BruteForceIndex;
 use blob::BlobStore;
 use cfg::RoxanneDbCfg;
-use common::nan_to_num;
 use common::to_calc;
 use common::Dtype;
 use common::DtypeCalc;
@@ -424,7 +423,7 @@ impl<T: Dtype, C: DtypeCalc> RoxanneDb<T, C> {
         entries
           .into_iter()
           // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
-          .map(|(k, v)| (k, v.mapv(nan_to_num)))
+          .map(|(k, v)| (k, v.mapv(|e| e.nan_to_num())))
           .collect(),
         ctl,
       ))

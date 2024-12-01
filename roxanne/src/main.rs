@@ -3,6 +3,7 @@ use clap::Subcommand;
 use roxanne::cmd::eval::EvalArgs;
 use roxanne::cmd::export_vectors::ExportVectorsArgs;
 use roxanne::cmd::migrate_hnsw::MigrateHnswArgs;
+use roxanne::cmd::migrate_sharded_hnsw::MigrateShardedHnswArgs;
 
 #[derive(Subcommand)]
 enum Commands {
@@ -12,6 +13,8 @@ enum Commands {
   ExportVectors(ExportVectorsArgs),
   /// Create a new Roxanne database from an existing HNSW index.
   MigrateHnsw(MigrateHnswArgs),
+  /// Create a new Roxanne database from a set of existing HNSW uniform-shard indices.
+  MigrateShardedHnsw(MigrateShardedHnswArgs),
 }
 
 #[derive(Parser)]
@@ -29,5 +32,6 @@ async fn main() {
     Commands::Eval(args) => args.exec().await,
     Commands::ExportVectors(args) => args.exec().await,
     Commands::MigrateHnsw(args) => args.exec().await,
+    Commands::MigrateShardedHnsw(args) => args.exec().await,
   };
 }

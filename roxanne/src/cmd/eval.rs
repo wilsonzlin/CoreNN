@@ -1,4 +1,4 @@
-use crate::new_pb;
+use crate::new_pb_with_msg;
 use ahash::HashSet;
 use bytemuck::cast_slice;
 use clap::Args;
@@ -65,7 +65,7 @@ impl EvalArgs {
     };
     tracing::info!("loaded k-NN");
 
-    let pb = new_pb(queries.len());
+    let pb = new_pb_with_msg(queries.len());
     let correct = Arc::new(AtomicUsize::new(0));
     let total = Arc::new(AtomicUsize::new(0));
     zip(queries, knn_ids)

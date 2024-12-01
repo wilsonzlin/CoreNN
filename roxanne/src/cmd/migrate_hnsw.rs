@@ -1,8 +1,7 @@
+use crate::load_hnsw;
 use ahash::HashMap;
 use clap::Args;
-use hnswlib_rs::HnswIndex;
 use itertools::Itertools;
-use libroxanne::blob::BlobStore;
 use libroxanne::cfg::RoxanneDbCfg;
 use libroxanne::common::StdMetric;
 use libroxanne::db::Db;
@@ -10,7 +9,6 @@ use libroxanne::db::DbIndexMode;
 use libroxanne::db::DbTransaction;
 use libroxanne::db::NodeData;
 use libroxanne::RoxanneDbDir;
-use std::io::BufReader;
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -40,9 +38,7 @@ impl MigrateHnswArgs {
     let db = Db::open(dir.db()).await;
     tracing::info!("created database");
 
-    let raw = std::fs::File::open(&self.path).unwrap();
-    let mut rd = BufReader::new(raw);
-    let index = HnswIndex::load(self.dim, &mut rd);
+    let index = load_hnsw(self.dim, &self.path);
 
     let cfg = RoxanneDbCfg {
       degree_bound: index.m,

@@ -557,7 +557,7 @@ pub trait GreedySearchableSync<T: Dtype, C: DtypeCalc>: GreedySearchable<T, C> {
     optima
   }
 
-  fn find_shortest_spanning_tree(&self, start: Id) -> Vec<(Id, Id)> {
+  fn greedy_spanning_traversal(&self, start: Id) -> Vec<(Id, Id)> {
     let mut visited = HashSet::<Id>::new();
     let mut path = Vec::<(Id, Id)>::new();
     // Why use Dijkstra instead of simply calculating min(dist_of_in_neighbors_edges) for each node? After all, we traverse and expand every node in both, but the latter can be a bit more parallel. The reason is that the latter will create lots of symmetric edges, because if A is closest to B then so is B to A, but this is bad for forming a dependency path to iterate through the graph as we'll frequently stop due to A already being visited once we get to B. Basically, we use Dijkstra because it has a `visited` set that forces a non-cyclic continuous path.
@@ -571,7 +571,6 @@ pub trait GreedySearchableSync<T: Dtype, C: DtypeCalc>: GreedySearchable<T, C> {
 
       path.push((from, to));
 
-      // Move on to neighbors of `to` in the base shard.
       let new = self
         .get_out_neighbors_sync(to)
         .0
