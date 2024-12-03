@@ -52,6 +52,9 @@ fn main() {
       if variant.starts_with("_") {
         return None;
       };
+      if std::env::var("VARIANT_PREFIX").is_ok_and(|v| !variant.starts_with(&v)) {
+        return None;
+      }
       let d = base_dir.join(&variant);
 
       let graph: HashMap<usize, Vec<usize>> = read_msgpack(d.join("graph.msgpack"));
@@ -81,12 +84,13 @@ fn main() {
         query_metrics_means.insert(metric_name.clone(), mean);
       }
 
+      let histogram_granularity = 512;
       Some(Variant {
         name: variant,
         query_metrics_means,
-        edge_dist_hist: histogram(&edge_dists, 150),
-        medoid_dist_hist: histogram(&medoid_dists, 150),
-        out_neighbor_count_hist: histogram(&out_neighbor_counts, 150),
+        edge_dist_hist: histogram(&edge_dists, histogram_granularity),
+        medoid_dist_hist: histogram(&medoid_dists, histogram_granularity),
+        out_neighbor_count_hist: histogram(&out_neighbor_counts, histogram_granularity),
       })
     })
     .collect::<Vec<_>>();
