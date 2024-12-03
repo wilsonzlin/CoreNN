@@ -265,3 +265,33 @@ def plot_time_series(
     # Save as WebP with high quality
     plt.savefig(output_path, format="webp", dpi=dpi, bbox_inches="tight")
     plt.close()
+
+def plot_data_series_as_lines(datasets, labels, title, xlabel, ylabel, output_path):
+    """
+    Plot multiple data series with different x values and save as WebP.
+
+    Args:
+        series_list: List of List[(float, int)] where each inner list contains (x,y) pairs
+        labels: Optional list of labels for each series
+        title: Plot title
+        xlabel: X-axis label
+        ylabel: Y-axis label
+        output_path: Output file path (must end in .webp)
+    """
+    plt.figure(figsize=(10, 6))
+
+    # Plot each series
+    for series, label in zip(datasets, labels):
+        # Unzip the (x,y) pairs into separate lists
+        x_values, y_values = zip(*series)
+        plt.plot(x_values, y_values, label=label, linewidth=2)
+
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+
+    # Save as WebP with high quality
+    plt.savefig(output_path, format='webp', dpi=300, bbox_inches='tight')
+    plt.close()
