@@ -1,5 +1,5 @@
 __pycache__/
-.venv/
+.venv*/
 Cargo.lock
 dist/
 node_modules/

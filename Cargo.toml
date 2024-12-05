@@ -5,6 +5,7 @@ members = [
   "hnswlib-rs",
   "libroxanne",
   "roxanne",
+  "roxanne-py",
 ]
 
 [profile.release]

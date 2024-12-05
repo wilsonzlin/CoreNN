@@ -23,9 +23,9 @@ use std::collections::VecDeque;
 use std::hash::Hash;
 
 #[derive(Clone, Copy)]
-pub enum Query<'a, 'b, T: Dtype> {
+pub enum Query<'ref_, 'array, T: Dtype> {
   Id(Id),
-  Vec(&'a ArrayView1<'b, T>),
+  Vec(&'ref_ ArrayView1<'array, T>),
 }
 
 impl<'a, 'b, T: Dtype> From<Id> for Query<'a, 'b, T> {
@@ -44,24 +44,24 @@ fn no_filter(_id: Id) -> bool {
   true
 }
 
-pub struct GreedySearchParams<'a, T: Dtype, F> {
-  pub query: Query<'a, 'a, T>,
+pub struct GreedySearchParams<'ref_, 'array, T: Dtype, F> {
+  pub query: Query<'ref_, 'array, T>,
   pub k: usize,
   pub search_list_cap: usize,
   pub beam_width: usize,
   pub start: Id,
   pub filter: F,
-  pub out_visited: Option<&'a mut HashSet<Id>>,
-  pub out_metrics: Option<&'a mut SearchMetrics>,
-  pub ground_truth: Option<&'a HashSet<Id>>,
+  pub out_visited: Option<&'ref_ mut HashSet<Id>>,
+  pub out_metrics: Option<&'ref_ mut SearchMetrics>,
+  pub ground_truth: Option<&'ref_ HashSet<Id>>,
 }
 
-impl<'a, T: Dtype, F: Fn(Id) -> bool> GreedySearchParams<'a, T, F> {
+impl<'ref_, 'array, T: Dtype, F: Fn(Id) -> bool> GreedySearchParams<'ref_, 'array, T, F> {
   pub fn new(
-    query: impl Into<Query<'a, 'a, T>>,
+    query: impl Into<Query<'ref_, 'array, T>>,
     k: usize,
     start: Id,
-  ) -> GreedySearchParams<'a, T, fn(Id) -> bool> {
+  ) -> GreedySearchParams<'ref_, 'array, T, fn(Id) -> bool> {
     GreedySearchParams {
       query: query.into(),
       k,
@@ -85,17 +85,17 @@ impl<'a, T: Dtype, F: Fn(Id) -> bool> GreedySearchParams<'a, T, F> {
     self
   }
 
-  pub fn ground_truth(mut self, ground_truth: &'a HashSet<Id>) -> Self {
+  pub fn ground_truth(mut self, ground_truth: &'ref_ HashSet<Id>) -> Self {
     self.ground_truth = Some(ground_truth);
     self
   }
 
-  pub fn out_metrics(mut self, out_metrics: &'a mut SearchMetrics) -> Self {
+  pub fn out_metrics(mut self, out_metrics: &'ref_ mut SearchMetrics) -> Self {
     self.out_metrics = Some(out_metrics);
     self
   }
 
-  pub fn out_visited(mut self, out_visited: &'a mut HashSet<Id>) -> Self {
+  pub fn out_visited(mut self, out_visited: &'ref_ mut HashSet<Id>) -> Self {
     self.out_visited = Some(out_visited);
     self
   }
@@ -597,9 +597,9 @@ pub trait GreedySearchableAsync<T: Dtype, C: DtypeCalc>: GreedySearchable<T, C> 
     id: Id,
   ) -> (Self::Neighbors<'a>, Option<Self::FullVec>);
 
-  async fn greedy_search_async<F: Fn(Id) -> bool>(
+  async fn greedy_search_async<'ref_, 'array, F: Fn(Id) -> bool>(
     &self,
-    mut params: GreedySearchParams<'_, T, F>,
+    mut params: GreedySearchParams<'ref_, 'array, T, F>,
   ) -> Vec<PointDist> {
     let mut state = self.gs_init(&params);
     while let Some(nodes_to_expand) = self.gs_loop_itertion_nodes_to_expand(&mut state, &params) {

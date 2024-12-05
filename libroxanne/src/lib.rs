@@ -372,7 +372,11 @@ impl<T: Dtype, C: DtypeCalc> RoxanneDb<T, C> {
     roxanne
   }
 
-  pub async fn query<'a>(&'a self, query: &'a ArrayView1<'a, T>, k: usize) -> Vec<(String, f64)> {
+  pub async fn query<'ref_, 'array>(
+    &self,
+    query: &'ref_ ArrayView1<'array, T>,
+    k: usize,
+  ) -> Vec<(String, f64)> {
     // We must (cheaply) clone to avoid holding lock across await.
     let bf = self.index.bf.read().clone();
     let res = if let Some(bf) = bf {

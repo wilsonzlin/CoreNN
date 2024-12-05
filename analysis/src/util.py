@@ -10,13 +10,7 @@ def generate_colors(n: int):
     Generate n distinct colors by evenly spacing them around the HSV color wheel.
     Returns RGB colors with full saturation and value.
     """
-    colors = []
-    for i in range(n):
-        hue = i / n  # Evenly space hues between 0 and 1
-        # Convert HSV to RGB (using full saturation and value)
-        rgb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-        colors.append(rgb)
-    return colors
+    return [colorsys.hsv_to_rgb(i / n, 1.0, 1.0) for i in range(n)]
 
 
 def plot_distribution(
