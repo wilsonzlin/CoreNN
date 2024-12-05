@@ -158,7 +158,6 @@ impl DbTransaction {
 // - It compactly stores integers using reduced bits.
 // - It doesn't use space to store field names or types.
 // These are crucial as we want to pack this in under one disk page read, which DiskANN relies on.
-// We don't store as MessagePack like the other DB entries as that's less efficient for this specific use case.
 pub struct NodeData<T> {
   pub neighbors: Vec<Id>,
   pub vector: Vec<T>,

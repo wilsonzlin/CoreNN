@@ -108,7 +108,7 @@ pub fn nan_to_num<T: num::Float>(v: T) -> T {
     if v.is_sign_positive() {
       T::max_value()
     } else {
-      // WARNING: This is not the same as f32::MIN_VALUE.
+      // WARNING: This is not the same as f32::MIN_VALUE, which is 0.000...
       -T::max_value()
     }
   } else {

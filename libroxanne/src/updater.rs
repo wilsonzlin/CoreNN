@@ -493,7 +493,7 @@ pub async fn updater_thread<T: Dtype, C: DtypeCalc>(
           txn.write_deleted(ex_id);
           txn.delete_id(key);
           txn.delete_key(ex_id);
-          // Insert into rx.deleted now so later vector insertion graph searches doesn't pick this as a neighbor.
+          // Insert into rx.deleted now so later vector insertion graph searches don't pick this as a neighbor.
           if rx.deleted.insert(ex_id) {
             actually_deleted.fetch_add(1, Ordering::Relaxed);
           }

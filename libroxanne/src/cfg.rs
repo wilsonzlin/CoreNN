@@ -45,11 +45,11 @@ fn default_query_search_list_cap() -> usize {
   160
 }
 
-fn update_batch_size() -> usize {
+fn default_update_batch_size() -> usize {
   64
 }
 
-fn update_search_list_cap() -> usize {
+fn default_update_search_list_cap() -> usize {
   // Double the query's.
   320
 }
@@ -79,9 +79,9 @@ pub struct RoxanneDbCfg {
   pub pq_subspaces: usize,
   #[serde(default = "default_query_search_list_cap")]
   pub query_search_list_cap: usize,
-  #[serde(default = "update_batch_size")]
+  #[serde(default = "default_update_batch_size")]
   pub update_batch_size: usize,
-  #[serde(default = "update_search_list_cap")]
+  #[serde(default = "default_update_search_list_cap")]
   pub update_search_list_cap: usize,
 }
 
@@ -102,8 +102,8 @@ impl Default for RoxanneDbCfg {
       pq_sample_size: default_pq_sample_size(),
       pq_subspaces: 0,
       query_search_list_cap: default_query_search_list_cap(),
-      update_batch_size: update_batch_size(),
-      update_search_list_cap: update_search_list_cap(),
+      update_batch_size: default_update_batch_size(),
+      update_search_list_cap: default_update_search_list_cap(),
     }
   }
 }

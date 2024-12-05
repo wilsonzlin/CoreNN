@@ -114,9 +114,9 @@ impl<T, R> std::ops::Deref for ArcMap<T, R> {
   }
 }
 
-/// Concurrency != parallelism; use AsyncParIteratorExt for parallelism. Use this if primarily I/O bound and not CPU; note that AsyncPar* is unsafe right now.
 pub trait AsyncConcurrentIteratorExt<T>: Iterator<Item = T> + Sized {
   /// Faster than map_concurrent if strict FIFO ordering is unnecessary.
+  /// Concurrency != parallelism; use this if primarily I/O bound and not CPU.
   fn map_concurrent_unordered<R, Fut, F>(self, f: F) -> impl Stream<Item = R>
   where
     Fut: Future<Output = R>,
@@ -125,6 +125,7 @@ pub trait AsyncConcurrentIteratorExt<T>: Iterator<Item = T> + Sized {
     self.map(|t| f(t)).collect::<FuturesUnordered<_>>()
   }
 
+  /// Concurrency != parallelism; use this if primarily I/O bound and not CPU.
   fn map_concurrent<R, Fut, F>(self, f: F) -> impl Stream<Item = R>
   where
     Fut: Future<Output = R>,
@@ -134,6 +135,7 @@ pub trait AsyncConcurrentIteratorExt<T>: Iterator<Item = T> + Sized {
     self.map(|t| f(t)).collect::<FuturesOrdered<_>>()
   }
 
+  /// Concurrency != parallelism; use this if primarily I/O bound and not CPU.
   fn filter_map_concurrent<R, Fut, F>(self, f: F) -> impl Stream<Item = R>
   where
     Fut: Future<Output = Option<R>>,
