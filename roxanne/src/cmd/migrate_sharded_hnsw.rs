@@ -83,10 +83,10 @@ impl MigrateShardedHnswArgs {
       })
       .collect::<Vec<_>>();
     let total_n = total_n.load(Ordering::Relaxed);
+    drop(seen_ids); // Free memory.
     pb.finish();
     tracing::info!("verified shards");
 
-    let pb = new_pb(total_n);
     // Map from base node ID to map from shard path to other shard node ID.
     let cliques = DashMap::<Id, DashMap<String, Id>>::new();
     // Map from base node ID to combined out-neighbors.
@@ -102,15 +102,19 @@ impl MigrateShardedHnswArgs {
 
     let base_file = shards[0];
     let base = load_hnsw(self.dim, base_file);
+    tracing::info!("loaded base shard");
     let medoid = base.entry_label();
     let base_graph = HnswGraph::new(&base, metric, None);
     let base_path = base_graph.greedy_spanning_traversal(medoid);
+    tracing::info!("calculated base graph greedy spanning traversal");
 
     for id in base_graph.ids() {
       cliques.insert(id, DashMap::new());
       clique_neighbors.insert(id, base_graph.get_out_neighbors_sync(id).0.to_vec());
       node_to_clique.insert(id, id);
     }
+    tracing::info!("initialized base shard cliques");
+    let pb = new_pb(total_n);
     pb.inc(base.cur_element_count as u64);
 
     for batch in (&shards[1..]).chunks(self.parallel - 1) {
@@ -153,6 +157,7 @@ impl MigrateShardedHnswArgs {
       });
     }
     let nodes_touched = pb.position();
+    drop(base); // Free memory.
     pb.finish();
     tracing::info!(
       nodes_updated = nodes_touched,
