@@ -1,12 +1,10 @@
 from dataclasses import dataclass
-from tqdm import tqdm
-from typing import Dict, Tuple
+from typing import Dict
 from typing import List
-from util import plot_data_series_as_lines, plot_distributions_as_lines
+from typing import Tuple
+from util import plot_data_series_as_lines
 from util import plot_time_series
 import msgpack
-import numpy as np
-import numpy.typing as npt
 import os
 
 ds = os.environ["DS"]
@@ -22,7 +20,12 @@ class Variant:
     query_metrics_means: Dict[str, List[float]]
 
 
-variants: List[Variant] = [Variant(**v) for v in msgpack.unpackb(open(f"{base_dir}/_agg.msgpack", "rb").read(), strict_map_key=False)]
+variants: List[Variant] = [
+    Variant(**v)
+    for v in msgpack.unpackb(
+        open(f"{base_dir}/_agg.msgpack", "rb").read(), strict_map_key=False
+    )
+]
 print("Loaded data")
 
 d = f"{base_dir}/_graphs"

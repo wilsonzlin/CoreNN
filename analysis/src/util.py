@@ -266,6 +266,7 @@ def plot_time_series(
     plt.savefig(output_path, format="webp", dpi=dpi, bbox_inches="tight")
     plt.close()
 
+
 def plot_data_series_as_lines(datasets, labels, title, xlabel, ylabel, output_path):
     """
     Plot multiple data series with different x values and save as WebP.
@@ -293,5 +294,5 @@ def plot_data_series_as_lines(datasets, labels, title, xlabel, ylabel, output_pa
     plt.legend()
 
     # Save as WebP with high quality
-    plt.savefig(output_path, format='webp', dpi=300, bbox_inches='tight')
+    plt.savefig(output_path, format="webp", dpi=300, bbox_inches="tight")
     plt.close()

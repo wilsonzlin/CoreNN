@@ -1,13 +1,16 @@
-use std::{fs, path::{Path, PathBuf}};
-
-use std::collections::{HashMap};
 use bytemuck::cast_slice;
-use byteorder::{ByteOrder, LittleEndian};
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
-use rayon::iter::{ParallelBridge, ParallelIterator};
+use rayon::iter::ParallelBridge;
+use rayon::iter::ParallelIterator;
 use rmp_serde::to_vec_named;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
 
 fn histogram(vals: &[f64], bins: usize) -> Vec<(f64, usize)> {
   let min = vals.iter().min_by_key(|&&v| OrderedFloat(v)).unwrap();
@@ -18,7 +21,11 @@ fn histogram(vals: &[f64], bins: usize) -> Vec<(f64, usize)> {
     let bin = (((v - min) / bin_size) as usize).min(bins - 1);
     hist[bin] += 1;
   }
-  hist.into_iter().enumerate().map(|(i, c)| (min + i as f64 * bin_size, c)).collect_vec()
+  hist
+    .into_iter()
+    .enumerate()
+    .map(|(i, c)| (min + i as f64 * bin_size, c))
+    .collect_vec()
 }
 
 #[derive(Serialize)]
@@ -60,17 +67,25 @@ fn main() {
       let graph: HashMap<usize, Vec<usize>> = read_msgpack(d.join("graph.msgpack"));
       let out_neighbor_counts = graph.values().map(|v| v.len() as f64).collect_vec();
 
-      let medoid_dists: Vec<f32> = cast_slice(&fs::read(d.join("medoid_dists.mat")).unwrap()).to_vec();
+      let medoid_dists: Vec<f32> =
+        cast_slice(&fs::read(d.join("medoid_dists.mat")).unwrap()).to_vec();
       let medoid_dists = medoid_dists.iter().map(|&d| d as f64).collect_vec();
 
-      let edge_dists_raw: HashMap<usize, HashMap<usize, f64>> = read_msgpack(d.join("edge_dists.msgpack"));
-      let edge_dists = edge_dists_raw.values().flat_map(|d| d.values().cloned()).collect_vec();
+      let edge_dists_raw: HashMap<usize, HashMap<usize, f64>> =
+        read_msgpack(d.join("edge_dists.msgpack"));
+      let edge_dists = edge_dists_raw
+        .values()
+        .flat_map(|d| d.values().cloned())
+        .collect_vec();
 
       // query_metrics: an array of { iterations: Array<{ [metric_name: string]: number }> }, one for each query.
       let query_metrics: Vec<QueryMetrics> = read_msgpack(d.join("query_metrics.msgpack"));
       let mut query_metrics_means = HashMap::new();
       for metric_name in query_metrics[0].iterations[0].keys() {
-        let arrays = query_metrics.iter().map(|q| q.iterations.iter().map(|it| it[metric_name]).collect_vec()).collect_vec();
+        let arrays = query_metrics
+          .iter()
+          .map(|q| q.iterations.iter().map(|it| it[metric_name]).collect_vec())
+          .collect_vec();
         let max_len = arrays.iter().map(|a| a.len()).max().unwrap();
         let mut mean = vec![0.0f64; max_len];
         for i in 0..max_len {
@@ -98,5 +113,6 @@ fn main() {
   fs::write(
     base_dir.join("_agg.msgpack"),
     to_vec_named(&variants).unwrap(),
-  ).unwrap();
+  )
+  .unwrap();
 }
