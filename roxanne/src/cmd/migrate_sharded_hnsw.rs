@@ -207,6 +207,7 @@ impl MigrateShardedHnswArgs {
             vector: index.get_data_by_label(id).to_vec(),
           };
 
+          // TODO Don't collect all nodes in memory.
           txn.lock().write_node(id, &node_data);
           pb.inc(1);
         });
@@ -218,7 +219,7 @@ impl MigrateShardedHnswArgs {
     txn.into_inner().commit(&db).await;
     db.flush().await;
     drop(db);
-    // TODO Delete temp_id.
+    // TODO Delete temp_db.
     tracing::info!("all done!");
   }
 }

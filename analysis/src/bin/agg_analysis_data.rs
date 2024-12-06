@@ -1,9 +1,9 @@
 use bytemuck::cast_slice;
 use itertools::Itertools;
-use ordered_float::OrderedFloat;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use rmp_serde::to_vec_named;
+use roxanne_analysis::histogram;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
@@ -11,22 +11,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-
-fn histogram(vals: &[f64], bins: usize) -> Vec<(f64, usize)> {
-  let min = vals.iter().min_by_key(|&&v| OrderedFloat(v)).unwrap();
-  let max = vals.iter().max_by_key(|&&v| OrderedFloat(v)).unwrap();
-  let bin_size = (max - min) / bins as f64;
-  let mut hist = vec![0usize; bins];
-  for v in vals {
-    let bin = (((v - min) / bin_size) as usize).min(bins - 1);
-    hist[bin] += 1;
-  }
-  hist
-    .into_iter()
-    .enumerate()
-    .map(|(i, c)| (min + i as f64 * bin_size, c))
-    .collect_vec()
-}
 
 #[derive(Serialize)]
 struct Variant {

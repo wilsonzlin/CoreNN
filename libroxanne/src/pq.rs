@@ -39,7 +39,7 @@ impl<T: Float> ProductQuantizer<T> {
         // Mini-Batch K-means: https://docs.rs/linfa-clustering/latest/linfa_clustering/struct.KMeans.html#tutorial.
         // (It's much faster than standard K-means, while being similarly accurate.)
         // Shuffling is important to Mini-Batch K-means (see documentation above).
-        let obs = DatasetBase::from(submat.to_owned()).shuffle(&mut thread_rng());
+        let obs = DatasetBase::from(submat).shuffle(&mut thread_rng());
         // Use KMeansPara as it's faster for larger datasets. (See its comment.)
         // TODO Allow tuning `tolerance` and `n_runs`. `max_n_iterations` is not applicable to Mini-Batch K-means.
         let clf = KMeans::params(256).init_method(KMeansInit::KMeansPara);
@@ -78,7 +78,7 @@ impl<T: Float> ProductQuantizer<T> {
     let mut codes = Array2::zeros((n, subspaces));
     for (i, codebook) in self.subspace_codebooks.iter().enumerate() {
       let submat = mat.slice(s![.., i * subdims..(i + 1) * subdims]);
-      let obs = DatasetBase::new(submat.to_owned(), ());
+      let obs = DatasetBase::new(submat, ());
       let labels = codebook.predict(&obs);
       assert_eq!(labels.shape(), &[n]);
       codes
@@ -95,7 +95,7 @@ impl<T: Float> ProductQuantizer<T> {
     let mut code = Array1::zeros(subspaces);
     for (i, codebook) in self.subspace_codebooks.iter().enumerate() {
       let subvec = vec.slice(s![i * subdims..(i + 1) * subdims]);
-      let obs = DatasetBase::new(subvec.to_owned(), ());
+      let obs = DatasetBase::new(subvec, ());
       let label = codebook.predict(&obs);
       code[i] = u8::try_from(label).unwrap();
     }

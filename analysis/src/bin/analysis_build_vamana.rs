@@ -1,9 +1,8 @@
 use clap::Parser;
-use indicatif::ProgressBar;
-use indicatif::ProgressStyle;
 use libroxanne::common::PrecomputedDists;
 use libroxanne::in_memory::InMemoryIndex;
 use roxanne_analysis::export_index;
+use roxanne_analysis::new_pb;
 use roxanne_analysis::Dataset;
 use std::fs;
 use std::sync::Arc;
@@ -28,18 +27,6 @@ struct Args {
 
   #[arg(long)]
   load_precomputed_dists: bool,
-}
-
-fn new_pb(len: usize) -> ProgressBar {
-  let pb = ProgressBar::new(len.try_into().unwrap());
-  pb.set_style(
-    ProgressStyle::with_template(
-      "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
-    )
-    .unwrap()
-    .progress_chars("#>-"),
-  );
-  pb
 }
 
 fn main() {

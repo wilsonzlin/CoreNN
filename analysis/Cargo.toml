@@ -14,7 +14,11 @@ hnswlib-rs = { path = "../hnswlib-rs" }
 indicatif = "0.17.9"
 itertools = "0.13.0"
 libroxanne = { path = "../libroxanne" }
+linfa = "0.7.0"
+linfa-clustering = "0.7.0"
+linfa-nn = "0.7.0"
 ndarray = "0.15"
+num = "0.4.3"
 num_cpus = "1.16.0"
 ordered-float = "4.4.0"
 rand = "0.8.5"

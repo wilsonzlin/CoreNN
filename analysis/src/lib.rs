@@ -4,6 +4,8 @@ use bytemuck::cast_slice;
 use bytemuck::Pod;
 use dashmap::DashMap;
 use half::f16;
+use indicatif::ProgressBar;
+use indicatif::ProgressStyle;
 use itertools::Itertools;
 use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
@@ -14,6 +16,8 @@ use libroxanne::search::Query;
 use libroxanne::search::SearchMetrics;
 use ndarray::Array2;
 use ndarray::ArrayView2;
+use num::ToPrimitive;
+use ordered_float::OrderedFloat;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
@@ -221,4 +225,47 @@ pub fn export_index(ds: &Dataset, out_dir: &str, graph: &DashMap<Id, Vec<Id>>, m
       .collect_vec(),
   )
   .unwrap();
+}
+
+pub fn new_pb_with_template(len: impl ToPrimitive, template: &'static str) -> ProgressBar {
+  let pb = ProgressBar::new(len.to_u64().unwrap());
+  pb.set_style(
+    ProgressStyle::with_template(template)
+      .unwrap()
+      .progress_chars("#>-"),
+  );
+  pb
+}
+
+/// Create a new progress bar that will show a custom message instead of the progress ratio.
+/// This custom message can be set using `.set_message(...)`.
+pub fn new_pb_with_msg(len: impl ToPrimitive) -> ProgressBar {
+  new_pb_with_template(
+    len,
+    "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {msg} ({eta})",
+  )
+}
+
+/// Create a new progress bar.
+pub fn new_pb(len: impl ToPrimitive) -> ProgressBar {
+  new_pb_with_template(
+    len,
+    "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
+  )
+}
+
+pub fn histogram(vals: &[f64], bins: usize) -> Vec<(f64, usize)> {
+  let min = vals.iter().min_by_key(|&&v| OrderedFloat(v)).unwrap();
+  let max = vals.iter().max_by_key(|&&v| OrderedFloat(v)).unwrap();
+  let bin_size = (max - min) / bins as f64;
+  let mut hist = vec![0usize; bins];
+  for v in vals {
+    let bin = (((v - min) / bin_size) as usize).min(bins - 1);
+    hist[bin] += 1;
+  }
+  hist
+    .into_iter()
+    .enumerate()
+    .map(|(i, c)| (min + i as f64 * bin_size, c))
+    .collect_vec()
 }

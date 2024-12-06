@@ -81,6 +81,10 @@ impl DbTransaction {
     }
   }
 
+  pub fn into_inner(self) -> WriteBatchWithTransaction<false> {
+    self.batch
+  }
+
   fn delete_raw(&mut self, k: impl DbKey) {
     self.batch.delete(k.bytes());
   }

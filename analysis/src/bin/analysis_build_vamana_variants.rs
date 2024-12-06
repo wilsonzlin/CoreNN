@@ -1,26 +1,13 @@
-use indicatif::ProgressBar;
-use indicatif::ProgressStyle;
 use libroxanne::common::PrecomputedDists;
 use libroxanne::in_memory::InMemoryIndex;
 use rmp_serde::to_vec_named;
 use roxanne_analysis::eval;
 use roxanne_analysis::export_index;
+use roxanne_analysis::new_pb;
 use roxanne_analysis::Dataset;
 use std::cmp::max;
 use std::fs;
 use std::sync::Arc;
-
-fn new_pb(len: usize) -> ProgressBar {
-  let pb = ProgressBar::new(len.try_into().unwrap());
-  pb.set_style(
-    ProgressStyle::with_template(
-      "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
-    )
-    .unwrap()
-    .progress_chars("#>-"),
-  );
-  pb
-}
 
 fn main() {
   let ds = Dataset::init();
