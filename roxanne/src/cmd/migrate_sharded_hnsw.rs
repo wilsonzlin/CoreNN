@@ -7,12 +7,14 @@ use itertools::Itertools;
 use libroxanne::common::Id;
 use libroxanne::common::PointDist;
 use libroxanne::common::StdMetric;
+use libroxanne::db::rocksdb_options;
 use libroxanne::db::Db;
 use libroxanne::db::DbIndexMode;
 use libroxanne::db::DbTransaction;
 use libroxanne::db::NodeData;
 use libroxanne::hnsw::HnswGraph;
 use libroxanne::search::GreedySearchableSync;
+use libroxanne::search::INeighbors;
 use libroxanne::search::Points;
 use libroxanne::search::Query;
 use libroxanne::RoxanneDbDir;
@@ -21,6 +23,8 @@ use parking_lot::Mutex;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
+use rocksdb::Direction;
+use rocksdb::IteratorMode;
 use std::cmp::Reverse;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
@@ -53,6 +57,9 @@ impl MigrateShardedHnswArgs {
   // We don't perform PQ here, as it's expensive and not specifically related to this task; use the general `pqify` tool afterwards.
   pub async fn exec(self) {
     let metric = self.metric.get_fn::<f32>();
+
+    // Used to store combined out-neighbors for a clique. This can get large, so we use a DB instead of storing in memory.
+    let temp_db = rocksdb::DB::open(&rocksdb_options(), self.out.join("temp_db")).unwrap();
 
     let dir = RoxanneDbDir::new(self.out);
 
@@ -88,10 +95,7 @@ impl MigrateShardedHnswArgs {
     tracing::info!("verified shards");
 
     // Map from base node ID to map from shard path to other shard node ID.
-    let cliques = DashMap::<Id, DashMap<String, Id>>::new();
-    // Map from base node ID to combined out-neighbors.
-    // We don't need a set, as a node cannot have an out-neighbor that also exists in another shard.
-    let clique_neighbors = DashMap::<Id, Vec<Id>>::new();
+    let cliques = DashMap::<Id, DashMap<&str, Id>>::new();
     let node_to_clique = DashMap::<Id, Id>::new();
 
     // Use the shard with the most nodes as the base, as otherwise there may be some leftover nodes in other shards and the code/algorithm gets messy if we want to ensure they get used too. (Shards may not be perfectly balanced.)
@@ -110,7 +114,12 @@ impl MigrateShardedHnswArgs {
 
     for id in base_graph.ids() {
       cliques.insert(id, DashMap::new());
-      clique_neighbors.insert(id, base_graph.get_out_neighbors_sync(id).0.to_vec());
+      temp_db
+        .put(
+          format!("{id}/{id}"),
+          bitcode::encode(&base_graph.get_out_neighbors_sync(id).0.into_vec()),
+        )
+        .unwrap();
       node_to_clique.insert(id, id);
     }
     tracing::info!("initialized base shard cliques");
@@ -130,7 +139,7 @@ impl MigrateShardedHnswArgs {
             // If None: we're at the start.
             .get(&base_id_from)
             // If None: no eqivalent to `from` in this shard was found previously.
-            .and_then(|c| c.get(path).map(|e| *e))
+            .and_then(|c| c.get(&path).map(|e| *e))
             // We'll just use any point still available as the start. If there's not even a point available, we'll have to skip this shard.
             // NOTE: We cannot just use the HNSW entry node as it isn't available on this level (unless we're at the top level).
             .or_else(|| available.iter().cloned().next())
@@ -143,14 +152,13 @@ impl MigrateShardedHnswArgs {
           };
 
           assert!(available.remove(&other_node));
-          cliques
-            .get_mut(&base_id)
-            .unwrap()
-            .insert(path.to_string(), other_node);
-          clique_neighbors
-            .get_mut(&base_id)
-            .unwrap()
-            .extend(other_graph.get_out_neighbors_sync(other_node).0);
+          cliques.get_mut(&base_id).unwrap().insert(path, other_node);
+          temp_db
+            .put(
+              format!("{base_id}/{other_node}"),
+              bitcode::encode(&other_graph.get_out_neighbors_sync(other_node).0.into_vec()),
+            )
+            .unwrap();
           assert!(node_to_clique.insert(other_node, base_id).is_none());
           pb.inc(1);
         }
@@ -177,7 +185,19 @@ impl MigrateShardedHnswArgs {
         // Collect to Vec so we can use into_par_iter, which is much faster than par_bridge.
         index.labels().collect_vec().into_par_iter().for_each(|id| {
           let neighbors = match node_to_clique.get(&id) {
-            Some(clique_id) => clique_neighbors.get(&clique_id).unwrap().clone(),
+            Some(clique_id) => {
+              let mut res = Vec::new();
+              let pfx = format!("{}/", *clique_id).into_bytes();
+              for e in temp_db.iterator(IteratorMode::From(&pfx, Direction::Forward)) {
+                let (k, v) = e.unwrap();
+                if !k.starts_with(&pfx) {
+                  break;
+                }
+                let ids: Vec<Id> = bitcode::decode(&v).unwrap();
+                res.extend(ids);
+              }
+              res
+            }
             // This node was not matched to any clique, so just use existing neighbors.
             None => index.get_merged_neighbors(id, 0).into_iter().collect_vec(),
           };
@@ -198,6 +218,7 @@ impl MigrateShardedHnswArgs {
     txn.into_inner().commit(&db).await;
     db.flush().await;
     drop(db);
+    // TODO Delete temp_id.
     tracing::info!("all done!");
   }
 }

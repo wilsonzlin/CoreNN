@@ -11,6 +11,7 @@ use futures::StreamExt;
 use rocksdb::BlockBasedOptions;
 use rocksdb::Direction;
 use rocksdb::IteratorMode;
+use rocksdb::ReadOptions;
 use rocksdb::WriteBatchWithTransaction;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -178,7 +179,7 @@ impl<T: Dtype> NodeData<T> {
   }
 }
 
-fn rocksdb_options() -> rocksdb::Options {
+pub fn rocksdb_options() -> rocksdb::Options {
   // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning#other-general-options.
   let mut opt = rocksdb::Options::default();
   opt.create_if_missing(true);
@@ -229,7 +230,16 @@ impl Db {
     let db = self.db.clone();
     let (send, recv) = flume::bounded(16);
     spawn_blocking(move || {
-      for e in db.full_iterator(IteratorMode::From(&[kt as u8], Direction::Forward)) {
+      // Optimize iterator for one-off table scan.
+      let mut readopts = ReadOptions::default();
+      readopts.set_pin_data(false);
+      readopts.fill_cache(false);
+      readopts.set_async_io(true);
+      readopts.set_auto_readahead_size(true);
+      for e in db.iterator_opt(
+        IteratorMode::From(&[kt as u8], Direction::Forward),
+        readopts,
+      ) {
         let (k, v) = e.unwrap();
         if k[0] != (kt as u8) {
           break;
