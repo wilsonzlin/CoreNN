@@ -6,7 +6,7 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument("input", type=str, help="Path to corpus-texmex.irisa.fr vectors")
 parser.add_argument(
-    "--dtype", type=str, help="One of {f{16,32,64},{u,}int{8,16,32,64}}"
+    "--dtype", type=str, help="One of {float{16,32,64},{u,}int{8,16,32,64}}"
 )
 parser.add_argument("--out", type=str, help="Path to output")
 args = parser.parse_args()
