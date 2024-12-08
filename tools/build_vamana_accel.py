@@ -5,12 +5,12 @@ from jax.numpy.linalg import norm
 from jaxtyping import Array
 from jaxtyping import Float16
 from jaxtyping import UInt32
-from tqdm import tqdm
 from typing import Optional
 import jax.numpy as np
 import jax.random as rand
 
-NULL_ID = np.uint32(np.iinfo(np.uint32).max)
+# Use int32 as some functions use/return int32, which if we provide the uint32 max value, will overflow to -1, which is a legal index.
+NULL_ID = np.uint32(np.iinfo(np.int32).max)
 
 
 # By default, np.arange returns int32 which causes a lot of issues with JAX.
@@ -51,58 +51,58 @@ def pair_matrix_vector(M, V):
     return np.column_stack((M.ravel(), np.repeat(V, M.shape[1])))
 
 
-# This cannot be JITted.
-def group_by_x(P: UInt32[Array, "x y"]):
-    """
-    Group a sorted-by-x array of distinct (x, y) pairs by x into a non-jagged 2D matrix filled with uint32.max.
+@jit
+def insert_values_into_filler_positions(
+    A: UInt32[Array, "n m"],
+    rows: UInt32[Array, "k"],
+    unique_rows: UInt32[Array, "n"],  # Padded with NULL_ID up to n.
+    values: UInt32[Array, "k"],
+):
+    n, m = A.shape
 
-    Parameters
-    ----------
-    P : np.ndarray
-        A (N, 2) NumPy array of distinct (x, y) pairs, sorted by the first column (x).
+    # Extract subset; since we pad with NULL_ID, make sure to drop out-of-bounds rows
+    A_subset = A.at[unique_rows].get(mode="drop")  # shape (r, m)
 
-    Returns
-    -------
-    x_values : np.ndarray
-        A 1D array of the distinct x-values.
-    result : np.ndarray
-        A 2D array of shape (len(x_values), max_count) where max_count is the maximum
-        number of pairs per distinct x. Missing positions are filled with uint32.max.
-    """
-    # Extract unique x-values, and the counts per x.
-    x_values, counts = np.unique(P[:, 0], return_counts=True)
+    # Find filler positions only in the relevant subset
+    # nonzero returns int32, not unsigned, so make sure NULL_ID is int32.max, not uint32.max which overflows to -1 which is a legal index.
+    sub_fill_rows, sub_fill_cols = np.nonzero(
+        A_subset == NULL_ID, size=n * m, fill_value=NULL_ID
+    )
+    global_fill_rows = unique_rows.at[sub_fill_rows].get(mode="drop")
 
-    max_count = np.max(counts)
+    # Sort insertions by row
+    insert_sort_idx = np.argsort(rows)
+    sorted_rows = rows[insert_sort_idx]
+    sorted_vals = values[insert_sort_idx]
 
-    # Prepare the result matrix.
-    result = np.full((len(x_values), max_count), NULL_ID, dtype=np.uint32)
+    # Sort filler positions by row
+    fill_sort_idx = np.lexsort((sub_fill_cols, global_fill_rows))
+    fr = global_fill_rows[fill_sort_idx]
+    fc = sub_fill_cols[fill_sort_idx]
 
-    # We have all y-values in order since P is sorted by x
-    y_values = P[:, 1]
+    insertion_counts = np.zeros((n,), dtype=np.uint32).at[sorted_rows].add(1)
+    filler_counts = np.zeros((n,), dtype=np.uint32).at[fr].add(1)
 
-    # Determine the row index for each element in P.
-    # We know the rows are aligned with unique x-values in ascending order,
-    # and that P is sorted by x. The repetition pattern of row indices matches the counts.
-    row_idx = np.repeat(arange(len(x_values)), counts)
+    insertion_starts = np.cumsum(
+        np.concatenate([np.array([0], dtype=np.uint32), insertion_counts[:-1]])
+    )
+    filler_starts = np.cumsum(
+        np.concatenate([np.array([0], dtype=np.uint32), filler_counts[:-1]])
+    )
 
-    # Determine the column indices.
-    # For each group i, we need columns [0, 1, 2, ..., counts[i]-1].
-    # Construct column indices by creating a continuous range and then offsetting by group starts.
+    insertion_row_starts = insertion_starts[sorted_rows]
+    insertion_pos_in_row = arange(sorted_rows.size) - insertion_row_starts
+    fill_row_starts_for_insertions = filler_starts[sorted_rows]
+    filler_idx_for_insertions = fill_row_starts_for_insertions + insertion_pos_in_row
 
-    # The starting position for each block of y-values is given by cumulative sums of counts.
-    block_starts = np.concatenate([np.array([0]), np.cumsum(counts)[:-1]])
-    # Global sequence of indices for all y-values
-    global_indices = np.arange(np.sum(counts))
-    # Subtract the per-group start index to get within-group indices
-    col_idx = global_indices - np.repeat(block_starts, counts)
+    final_rows = fr[filler_idx_for_insertions]
+    final_cols = fc[filler_idx_for_insertions]
 
-    # Place y_values into result matrix using fancy indexing
-    result = result.at[row_idx, col_idx].set(y_values)
-
-    return x_values, result
+    return A.at[final_rows, final_cols].set(sorted_vals)
 
 
 # Handles NULL_ID indices.
+@jit
 def select_vecs(
     vecs: Float16[Array, "n d"],
     indices: np.ndarray,
@@ -274,11 +274,15 @@ def compute_robust_pruned(
     return res  # (b, m_max)
 
 
+@partial(
+    jit,
+    static_argnames=["m", "m_max", "ef", "dist_thresh", "update_batch_size", "seed"],
+)
 def optimize_graph(
     *,
     graph: UInt32[Array, "n m_max"],
     vecs: Float16[Array, "n d"],
-    id_medoid: int,
+    id_medoid: UInt32[Array, ""],
     m: int,
     m_max: int,
     ef: int,
@@ -289,7 +293,6 @@ def optimize_graph(
     n, _ = graph.shape
     rk = rand.key(seed)
     nodes = rand.permutation(rk, n).astype(np.uint32)
-    pb = tqdm(total=n)
     for start, end, b in batches(n, update_batch_size):
         batch_nodes = nodes[start:end]  # (b,)
         visited = greedy_search(
@@ -315,24 +318,36 @@ def optimize_graph(
         # `new_neighbors` is a matrix (b, m) where we add an edge b->m[j] (i.e. `m` is the out-neighbors for `b`).
         # Build "list" of backedge (m[j], b) pairs.
         backedges = pair_matrix_vector(new_neighbors, batch_nodes)  # (b * ef, 2)
-        # Sort by `m[j]` as group_by_x depends on it.
-        backedges = backedges[backedges[:, 0].argsort()]
-        back_nodes, back_add_neighbors = group_by_x(backedges)  # (*,), (*, * <= b)
+        rows = backedges[:, 0]
+        unique_rows, row_freq = np.unique(
+            rows, return_counts=True, size=n, fill_value=NULL_ID
+        )
+        # These rows have no more capacity for their pending-backedges, so we need to prune them.
+        rows_to_prune = np.where(
+            (graph[unique_rows] == NULL_ID).sum(axis=1) < row_freq, NULL_ID, unique_rows
+        )
         # compute_robust_pruned will handle duplicates.
-        # TODO Only compute_robust_prune nodes that have m_max or more out-neighbors.
-        graph = graph.at[back_nodes].set(
+        graph = graph.at[rows_to_prune].set(
             compute_robust_pruned(
-                cand_ids=np.hstack([back_add_neighbors, graph[back_nodes, :]]),
+                cand_ids=graph.at[rows_to_prune, :].get(
+                    mode="fill", fill_value=NULL_ID
+                ),
                 dist_thresh=dist_thresh,
                 m=m,
                 m_max=m_max,
-                node_ids=back_nodes,
+                node_ids=rows_to_prune,
                 vecs=vecs,
             )
         )
+        # TODO This requires batch_size to be less than m_max - m. The ideal operation is: group backedges by row (max batch_size columns), select those graph rows, hstack concat (as we possibly exceed m_max), then 1) for prune rows, prune then update graph 2) for non-prune rows, sort (so we can truncate to m_max and remove NULL_ID) then update graph.
+        graph = insert_values_into_filler_positions(
+            A=graph,
+            rows=rows,
+            unique_rows=unique_rows,
+            values=backedges[:, 1],
+        )
 
-        pb.update(b)
-    pb.close()
+    return graph
 
 
 def main():
