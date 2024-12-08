@@ -9,6 +9,7 @@ from typing import Optional
 import jax.numpy as np
 import jax.random as rand
 import time
+from tqdm import tqdm
 
 # Use int32 as some functions use/return int32, which if we provide the uint32 max value, will overflow to -1, which is a legal index.
 NULL_ID = np.uint32(np.iinfo(np.int32).max)
@@ -164,9 +165,7 @@ def greedy_search(
     k: Optional[int],  # If None, return all visited node IDs instead of top k.
     ef: int,
     iterations: int,
-    id_start: UInt32[
-        Array, ""
-    ],  # This is a JAX scalar, not a Python int; we must declare it as such, as it cannot be part of static_argnames (it's still considered a JAX tensor).
+    id_start: UInt32[Array, ""]
 ):
     n, _ = vecs.shape
     (b,) = id_targets.shape
@@ -229,7 +228,7 @@ def greedy_search(
 
 
 # Returns (b, m_max) but will only ever fill (b, m); the rest are conveniently filled with NULL_ID.
-@partial(jit, static_argnames=["m", "m_max", "dist_thresh"])
+@partial(jit, static_argnames=["m", "m_max"])
 def compute_robust_pruned(
     *,
     vecs: Float16[Array, "n d"],
@@ -239,7 +238,7 @@ def compute_robust_pruned(
     ],  # It's safe to have interspersed NULL_IDs and duplicates in here.
     m: int,
     m_max: int,
-    dist_thresh: float,
+    dist_thresh: Float16[Array, ""],
 ):
     b, _ = cand_ids.shape
 
@@ -277,8 +276,75 @@ def compute_robust_pruned(
 
 @partial(
     jit,
-    static_argnames=["m", "m_max", "ef", "dist_thresh", "update_batch_size", "seed"],
+    static_argnames=["m", "m_max", "ef"],
 )
+def optimize_graph_batch(
+    *,
+    graph: UInt32[Array, "n m_max"],
+    vecs: Float16[Array, "n d"],
+    batch_nodes: UInt32[Array, "b"],
+    id_medoid: UInt32[Array, ""],
+    m: int,
+    m_max: int,
+    ef: int,
+    dist_thresh: Float16[Array, ""],
+):
+    n, _ = vecs.shape
+    visited = greedy_search(
+        graph=graph,
+        vecs=vecs,
+        id_targets=batch_nodes,
+        k=None,
+        ef=ef,
+        iterations=ef,
+        id_start=id_medoid,
+    )  # (b, ef)
+    new_neighbors = compute_robust_pruned(
+        cand_ids=np.hstack([visited, graph[batch_nodes, :]]),
+        dist_thresh=dist_thresh,
+        m=m,
+        m_max=m_max,
+        node_ids=batch_nodes,
+        vecs=vecs,
+    )  # (b, m_max)
+    # No need to clear m:m_max as compute_robust_pruned already returns m_max with NULL_ID filled after m.
+    graph = graph.at[batch_nodes].set(new_neighbors)
+
+    # `new_neighbors` is a matrix (b, m) where we add an edge b->m[j] (i.e. `m` is the out-neighbors for `b`).
+    # Build "list" of backedge (m[j], b) pairs.
+    backedges = pair_matrix_vector(new_neighbors, batch_nodes)  # (b * ef, 2)
+    rows = backedges[:, 0]
+    unique_rows, row_freq = np.unique(
+        rows, return_counts=True, size=n, fill_value=NULL_ID
+    )
+    # These rows have no more capacity for their pending-backedges, so we need to prune them.
+    rows_to_prune = np.where(
+        (graph[unique_rows] == NULL_ID).sum(axis=1) < row_freq, NULL_ID, unique_rows
+    )
+    # compute_robust_pruned will handle duplicates.
+    graph = graph.at[rows_to_prune].set(
+        compute_robust_pruned(
+            cand_ids=graph.at[rows_to_prune, :].get(
+                mode="fill", fill_value=NULL_ID
+            ),
+            dist_thresh=dist_thresh,
+            m=m,
+            m_max=m_max,
+            node_ids=rows_to_prune,
+            vecs=vecs,
+        )
+    )
+    # TODO This requires batch_size to be less than m_max - m. The ideal operation is: group backedges by row (max batch_size columns), select those graph rows, hstack concat (as we possibly exceed m_max), then 1) for prune rows, prune then update graph 2) for non-prune rows, sort (so we can truncate to m_max and remove NULL_ID) then update graph.
+    graph = insert_values_into_filler_positions(
+        A=graph,
+        rows=rows,
+        unique_rows=unique_rows,
+        values=backedges[:, 1],
+    )
+
+    return graph
+
+# WARNING: Do not JIT this function, as otherwise it will unwrap the loop and create a giant function that takes forever to compile.
 def optimize_graph(
     *,
     graph: UInt32[Array, "n m_max"],
@@ -287,67 +353,28 @@ def optimize_graph(
     m: int,
     m_max: int,
     ef: int,
-    dist_thresh: float,
+    dist_thresh: Float16[Array, ""],
     update_batch_size: int,
     seed: int,
 ):
     n, _ = graph.shape
     rk = rand.key(seed)
     nodes = rand.permutation(rk, n).astype(np.uint32)
+    pb = tqdm(total=n, desc="Optimizing graph", unit="nodes")
     for start, end, b in batches(n, update_batch_size):
         batch_nodes = nodes[start:end]  # (b,)
-        visited = greedy_search(
+        graph = optimize_graph_batch(
             graph=graph,
             vecs=vecs,
-            id_targets=batch_nodes,
-            k=None,
-            ef=ef,
-            iterations=ef,
-            id_start=id_medoid,
-        )  # (b, ef)
-        new_neighbors = compute_robust_pruned(
-            cand_ids=np.hstack([visited, graph[batch_nodes, :]]),
-            dist_thresh=dist_thresh,
+            batch_nodes=batch_nodes,
+            id_medoid=id_medoid,
             m=m,
             m_max=m_max,
-            node_ids=batch_nodes,
-            vecs=vecs,
-        )  # (b, m_max)
-        # No need to clear m:m_max as compute_robust_pruned already returns m_max with NULL_ID filled after m.
-        graph = graph.at[batch_nodes].set(new_neighbors)
-
-        # `new_neighbors` is a matrix (b, m) where we add an edge b->m[j] (i.e. `m` is the out-neighbors for `b`).
-        # Build "list" of backedge (m[j], b) pairs.
-        backedges = pair_matrix_vector(new_neighbors, batch_nodes)  # (b * ef, 2)
-        rows = backedges[:, 0]
-        unique_rows, row_freq = np.unique(
-            rows, return_counts=True, size=n, fill_value=NULL_ID
+            ef=ef,
+            dist_thresh=dist_thresh,
         )
-        # These rows have no more capacity for their pending-backedges, so we need to prune them.
-        rows_to_prune = np.where(
-            (graph[unique_rows] == NULL_ID).sum(axis=1) < row_freq, NULL_ID, unique_rows
-        )
-        # compute_robust_pruned will handle duplicates.
-        graph = graph.at[rows_to_prune].set(
-            compute_robust_pruned(
-                cand_ids=graph.at[rows_to_prune, :].get(
-                    mode="fill", fill_value=NULL_ID
-                ),
-                dist_thresh=dist_thresh,
-                m=m,
-                m_max=m_max,
-                node_ids=rows_to_prune,
-                vecs=vecs,
-            )
-        )
-        # TODO This requires batch_size to be less than m_max - m. The ideal operation is: group backedges by row (max batch_size columns), select those graph rows, hstack concat (as we possibly exceed m_max), then 1) for prune rows, prune then update graph 2) for non-prune rows, sort (so we can truncate to m_max and remove NULL_ID) then update graph.
-        graph = insert_values_into_filler_positions(
-            A=graph,
-            rows=rows,
-            unique_rows=unique_rows,
-            values=backedges[:, 1],
-        )
-
+        pb.update(b)
+    pb.close()
     return graph
 
 
@@ -375,7 +402,7 @@ def main():
     m_max = m * 2
     ef = args.ef
     update_batch_size = 64
-    dist_thresh = args.alpha
+    dist_thresh = np.float16(args.alpha)
     seed = 0
     medoid_sample_size = 10_000
 
