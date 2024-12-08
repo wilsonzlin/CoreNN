@@ -1,11 +1,12 @@
+import sys
 import matplotlib.pyplot as plt
 import msgpack
-import os
 
-dataset = os.environ["DS"]
+# Path to dir containing output data e.g. dataset/sift/out/vamana.
+d = sys.argv[1]
 
 edge_dists_by_level = msgpack.unpack(
-    open(f"dataset/{dataset}/out/hnsw/edge_dists_by_level.msgpack", "rb"),
+    open(f"{d}/edge_dists_by_level.msgpack", "rb"),
     strict_map_key=False,
 )
 print("Loaded edge dists by level")
@@ -27,7 +28,7 @@ for level, edge_dists in edge_dists_by_level.items():
 
 plt.tight_layout()
 plt.savefig(
-    f"dataset/{dataset}/out/hnsw/edge_dists_by_level.webp",
+    f"{d}/edge_dists_by_level.webp",
     format="webp",
     bbox_inches="tight",
     dpi=150,

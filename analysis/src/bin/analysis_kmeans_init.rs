@@ -1,4 +1,5 @@
 use ahash::HashMap;
+use ahash::HashSet;
 use bytemuck::cast_slice;
 use clap::Parser;
 use dashmap::DashMap;
@@ -15,7 +16,7 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
-use roxanne_analysis::eval;
+use roxanne_analysis::export_index;
 use roxanne_analysis::new_pb;
 use roxanne_analysis::Dataset;
 use std::fs;
@@ -70,7 +71,7 @@ fn main() {
   println!("Effective clusters: {}", cluster_members.len());
 
   println!("Assigning edges");
-  let graph = Arc::new(DashMap::<Id, Vec<Id>>::new());
+  let graph = DashMap::<Id, HashSet<Id>>::new();
   let pb = new_pb(n);
   ids.par_iter().for_each(|&id| {
     let centroid_dists = dists_to_centroids.row(id);
@@ -84,10 +85,8 @@ fn main() {
       let chosen_out_neighbor = *cluster_members[&chosen_cluster]
         .choose(&mut thread_rng())
         .unwrap();
-      let mut adj_list = graph.entry(id).or_default();
-      if !adj_list.contains(&chosen_out_neighbor) {
-        adj_list.push(chosen_out_neighbor);
-      }
+      graph.entry(id).or_default().insert(chosen_out_neighbor);
+      graph.entry(chosen_out_neighbor).or_default().insert(id);
     }
     pb.inc(1);
   });
@@ -97,14 +96,14 @@ fn main() {
     degree_bound,
     distance_threshold: 1.1,
     update_batch_size: 64,
-    update_search_list_cap: 80,
+    update_search_list_cap: degree_bound * 2,
   };
 
   println!("Calculating approx. medoid of {n} vectors");
   let medoid = calc_approx_medoid(&id_to_vec, metric, 10_000, None);
 
   let idx = InMemoryIndex {
-    graph,
+    graph: graph.into_iter().map(|(k, v)| (k, v.into_iter().collect_vec())).collect::<DashMap<_, _>>().into(),
     medoid,
     metric,
     params,
@@ -112,18 +111,7 @@ fn main() {
     vectors: id_to_vec,
   };
 
-  println!("Evaluating");
-  let e = eval(
-    &idx,
-    &ds.read_queries().view(),
-    &ds.read_results().view(),
-    100,
-    1,
-  );
-  println!(
-    "Correct: {}/{} ({:.2}%)",
-    e.correct,
-    e.total,
-    e.ratio() * 100.0
-  );
+  let out_dir = format!("kmeansinit-{}M-k{}-{}decay", degree_bound, k, decay);
+  fs::create_dir_all(format!("dataset/{}/out/{out_dir}", ds.name)).unwrap();
+  export_index(&ds, &out_dir, &idx.graph, idx.medoid);
 }
