@@ -67,8 +67,18 @@ fn main() {
           continue;
         };
         let n = Id::try_from(n).unwrap();
-        level_graphs.entry(0).or_default().entry(id).or_default().push(n);
-        level_graphs.entry(0).or_default().entry(n).or_default().push(id);
+        level_graphs
+          .entry(0)
+          .or_default()
+          .entry(id)
+          .or_default()
+          .push(n);
+        level_graphs
+          .entry(0)
+          .or_default()
+          .entry(n)
+          .or_default()
+          .push(id);
         graph.entry(id).or_default().insert(n);
         graph.entry(n).or_default().insert(id);
       }
@@ -86,8 +96,18 @@ fn main() {
           continue;
         }
         let n = Id::try_from(n).unwrap();
-        level_graphs.entry(l.level).or_default().entry(id).or_default().push(n);
-        level_graphs.entry(l.level).or_default().entry(n).or_default().push(id);
+        level_graphs
+          .entry(l.level)
+          .or_default()
+          .entry(id)
+          .or_default()
+          .push(n);
+        level_graphs
+          .entry(l.level)
+          .or_default()
+          .entry(n)
+          .or_default()
+          .push(id);
         graph.entry(id).or_default().insert(n);
         graph.entry(n).or_default().insert(id);
       }
@@ -99,10 +119,10 @@ fn main() {
   for (&level, level_nodes) in level_graphs.iter() {
     let level_dists = graph_dists_by_level.entry(level).or_default();
     for (&id, neighbors) in level_nodes {
-      let neighbor_dists = neighbors.iter().map(|&neighbor| (
-        neighbor,
-        metric(&vecs.row(id), &vecs.row(neighbor)),
-      )).collect();
+      let neighbor_dists = neighbors
+        .iter()
+        .map(|&neighbor| (neighbor, metric(&vecs.row(id), &vecs.row(neighbor))))
+        .collect();
       level_dists.insert(id, neighbor_dists);
     }
   }
@@ -120,7 +140,10 @@ fn main() {
   export_index(
     &ds,
     &out_dir,
-    &graph.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect(),
+    &graph
+      .into_iter()
+      .map(|(k, v)| (k, v.into_iter().collect()))
+      .collect(),
     idx.entry_node,
   );
 }

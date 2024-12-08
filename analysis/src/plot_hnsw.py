@@ -1,6 +1,6 @@
-import sys
 import matplotlib.pyplot as plt
 import msgpack
+import sys
 
 # Path to dir containing output data e.g. dataset/sift/out/vamana.
 d = sys.argv[1]

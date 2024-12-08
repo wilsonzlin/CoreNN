@@ -103,7 +103,11 @@ fn main() {
   let medoid = calc_approx_medoid(&id_to_vec, metric, 10_000, None);
 
   let idx = InMemoryIndex {
-    graph: graph.into_iter().map(|(k, v)| (k, v.into_iter().collect_vec())).collect::<DashMap<_, _>>().into(),
+    graph: graph
+      .into_iter()
+      .map(|(k, v)| (k, v.into_iter().collect_vec()))
+      .collect::<DashMap<_, _>>()
+      .into(),
     medoid,
     metric,
     params,
