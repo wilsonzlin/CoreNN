@@ -58,10 +58,11 @@ def pair_matrix_vector(M, V):
 def insert_values_into_filler_positions(
     A: UInt32[Array, "n m"],
     rows: UInt32[Array, "k"],
-    unique_rows: UInt32[Array, "n"],  # Padded with NULL_ID up to n.
+    unique_rows: UInt32[Array, "r_max"],  # Padded with NULL_ID up to r_max, which should be <= k.
     values: UInt32[Array, "k"],
 ):
     n, m = A.shape
+    r_max, = unique_rows.shape
 
     # Extract subset; since we pad with NULL_ID, make sure to drop out-of-bounds rows
     A_subset = A.at[unique_rows].get(mode="drop")  # shape (r, m)
@@ -69,7 +70,7 @@ def insert_values_into_filler_positions(
     # Find filler positions only in the relevant subset
     # nonzero returns int32, not unsigned, so make sure NULL_ID is int32.max, not uint32.max which overflows to -1 which is a legal index.
     sub_fill_rows, sub_fill_cols = np.nonzero(
-        A_subset == NULL_ID, size=n * m, fill_value=NULL_ID
+        A_subset == NULL_ID, size=r_max * m, fill_value=NULL_ID
     )
     global_fill_rows = unique_rows.at[sub_fill_rows].get(mode="drop")
 
@@ -291,6 +292,7 @@ def optimize_graph_batch(
     dist_thresh: Float16[Array, ""],
 ):
     n, _ = vecs.shape
+    b, = batch_nodes.shape
     visited = greedy_search(
         graph=graph,
         vecs=vecs,
@@ -315,8 +317,9 @@ def optimize_graph_batch(
     # Build "list" of backedge (m[j], b) pairs.
     backedges = pair_matrix_vector(new_neighbors, batch_nodes)  # (b * ef, 2)
     rows = backedges[:, 0]
+    # The maximum possible distinct backedge nodes is b * ef, where every batch node has all distinct neighbors not shared by any other batch node.
     unique_rows, row_freq = np.unique(
-        rows, return_counts=True, size=n, fill_value=NULL_ID
+        rows, return_counts=True, size=b * ef, fill_value=NULL_ID
     )
     # These rows have no more capacity for their pending-backedges, so we need to prune them.
     rows_to_prune = np.where(
@@ -393,6 +396,7 @@ def main():
     parser.add_argument("--alpha", type=float, help="Distance threshold")
     args = parser.parse_args()
 
+    print("Loading vectors")
     dtype = np.dtype(args.dtype)
     with open(args.vectors, "rb") as f:
         # Cast to float16 for faster calculations.
@@ -410,6 +414,7 @@ def main():
     dist_thresh = np.float16(args.alpha)
     seed = 0
     medoid_sample_size = 10_000
+    print(f"{n=} {m=} {ef=} {dist_thresh=}")
 
     print("Calculating approx. medoid")
     medoid = calc_approx_medoid(
