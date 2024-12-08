@@ -8,6 +8,7 @@ from jaxtyping import UInt32
 from typing import Optional
 import jax.numpy as np
 import jax.random as rand
+import time
 
 # Use int32 as some functions use/return int32, which if we provide the uint32 max value, will overflow to -1, which is a legal index.
 NULL_ID = np.uint32(np.iinfo(np.int32).max)
@@ -391,18 +392,23 @@ def main():
         m_max=m_max,
         seed=seed,
     )
+    print("Compiling optimizer")
+    args = {
+      "graph": graph,
+      "vecs": vecs,
+      "id_medoid": medoid,
+      "m": m,
+      "m_max": m_max,
+      "ef": ef,
+      "dist_thresh": dist_thresh,
+      "update_batch_size": update_batch_size,
+      "seed": seed,
+    }
+    started = time.time()
+    optimize_graph.lower(**args).compile()
+    print("Compiled optimizer in", time.time() - started, "seconds")
     print("Optimizing")
-    graph = optimize_graph(
-        graph=graph,
-        vecs=vecs,
-        id_medoid=medoid,
-        m=m,
-        m_max=m_max,
-        ef=ef,
-        dist_thresh=dist_thresh,
-        update_batch_size=update_batch_size,
-        seed=seed,
-    )
+    graph = optimize_graph(**args)
     print("All done!")
 
 
