@@ -7,6 +7,7 @@ from jaxtyping import Float16
 from jaxtyping import UInt32
 from tqdm import tqdm
 from typing import Optional
+from typing import Tuple
 import jax
 import jax.numpy as np
 import jax.random as rand
@@ -42,7 +43,9 @@ def count_non_nan_prefix_columns(arr: Float16[Array, "x y"]):
 
 
 @jit
-def pair_matrix_vector(M, V):
+def pair_matrix_vector(
+    M: UInt32[Array, "b m"], V: UInt32[Array, "b"]
+) -> UInt32[Array, "b*m 2"]:
     """
     Creates a 2D matrix of pairs from matrix M and vector V.
     Args:
@@ -58,11 +61,12 @@ def pair_matrix_vector(M, V):
 def insert_values_into_filler_positions(
     A: UInt32[Array, "n m"],
     rows: UInt32[Array, "k"],
-    unique_rows: UInt32[Array, "r_max"],  # Padded with NULL_ID up to r_max, which should be <= k.
+    # Padded with NULL_ID up to r_max, which should be <= k.
+    unique_rows: UInt32[Array, "r_max"],
     values: UInt32[Array, "k"],
 ):
     n, m = A.shape
-    r_max, = unique_rows.shape
+    (r_max,) = unique_rows.shape
 
     # Extract subset; since we pad with NULL_ID, make sure to drop out-of-bounds rows
     A_subset = A.at[unique_rows].get(mode="drop")  # shape (r, m)
@@ -105,6 +109,64 @@ def insert_values_into_filler_positions(
     return A.at[final_rows, final_cols].set(sorted_vals)
 
 
+@jit
+def group_by_y_id(
+    M_id: UInt32[Array, "x"],
+    M: UInt32[Array, "x y"],
+) -> Tuple[UInt32[Array, "k"], UInt32[Array, "k x"]]:
+    """
+    Group rows by the distinct IDs appearing in M's columns.
+
+    Given:
+      - M: a matrix of shape (x, y) containing opaque uint32 IDs. Duplicate IDs within a row are ignored.
+      - M_id: a vector of shape (x,) containing one "ID" per row in M.
+
+    Returns:
+      - N_id: shape (k_max,), the sorted k unique IDs appearing in M, padded to k_max with NULL_ID.
+      - N: shape (k_max, x), where N[i] contains the M_id values of all rows in M where N_id[i] appears.
+        Rows where N_id[i] does not appear are filled with NULL_ID.
+        NOTE: The NULL_ID values in N can be in any position, not just at the end.
+        Padding rows (rows after the kth) contain junk and must not be used.
+
+    Example:
+      M:
+        [13 18 23]
+        [22 18 25]
+        [40 13 18]
+        [77 11 18]
+        [22 18 13]
+      Input M_id:
+        [5 7 6 2 8]
+      Unique IDs (N_id):
+        [11 13 18 22 23 25 40 77]
+      Resulting N:
+        [2147483647 2147483647 2147483647          2 2147483647]
+        [         5 2147483647          6 2147483647          8]
+        [         5          7          6          2          8]
+        [2147483647          7 2147483647 2147483647          8]
+        [         5 2147483647 2147483647 2147483647 2147483647]
+        [2147483647          7 2147483647 2147483647 2147483647]
+        [2147483647 2147483647          6 2147483647 2147483647]
+        [2147483647 2147483647 2147483647          2 2147483647]
+    """
+    # The worst case scenario is that every element in M (x, y) is unique, so there are x * y groups of 1.
+    k_max = M.shape[0] * M.shape[1]
+    N_id = np.unique(M, size=k_max, fill_value=NULL_ID)
+    mask = M[None, :, :] == N_id[:, None, None]
+    row_mask = np.any(mask, axis=2)
+    N = np.where(row_mask, M_id[None, :], NULL_ID)
+    return N_id, N
+
+
+# Handles NULL_ID indices.
+@jit
+def select_nodes(
+    graph: UInt32[Array, "n d"],
+    indices: np.ndarray,
+):
+    return graph.at[indices].get(mode="fill", fill_value=NULL_ID)
+
+
 # Handles NULL_ID indices.
 @jit
 def select_vecs(
@@ -134,12 +196,11 @@ def calc_approx_medoid(
     return indices[np.argmin(dists.sum(axis=0))]
 
 
-@partial(jit, static_argnames=["n", "m", "m_max", "seed"])
+@partial(jit, static_argnames=["n", "m", "seed"])
 def init_random_graph(
     *,
     n: int,
     m: int,
-    m_max: int,
     seed: int,
 ):
     rk = rand.key(seed)
@@ -148,20 +209,13 @@ def init_random_graph(
     # Remove self-edges.
     row_indices = arange(n)[:, None]
     graph = np.where(graph == row_indices, NULL_ID, graph)
-    # Allow node to have up to m_max edges so we don't have to compute_robust_pruned after adding every single backedge.
-    graph = np.pad(
-        graph,
-        pad_width=((0, 0), (0, m_max - m)),
-        mode="constant",
-        constant_values=NULL_ID,
-    )
     return graph
 
 
 @partial(jit, static_argnames=["k", "ef", "iterations"])
 def greedy_search(
     *,
-    graph: UInt32[Array, "n m_max"],
+    graph: UInt32[Array, "n m"],
     vecs: Float16[Array, "n d"],
     id_targets: UInt32[Array, "b"],  # Batched.
     k: Optional[int],  # If None, return all visited node IDs instead of top k.
@@ -192,25 +246,21 @@ def greedy_search(
         visited_ids = visited_ids.at[:, i].set(cand_ids[:, 0])
         visited_dists = visited_dists.at[:, i].set(cand_dists[:, 0])
         # Get neighbors of expanded nodes and calculate distance.
-        new_cand_ids = graph[
-            to_expand
-        ]  # (b, m_max); m_max new candidates for each query node in b.
-        # NULL_ID will get bounded to `n`. (See comment on `cand_seen`.)
-        new_cand_seen = cand_seen[b_row_indices, new_cand_ids]  # (b, m_max)
+        # m ew candidates for each query node in b.
+        new_cand_ids = graph[to_expand]  # (b, m);
+        new_cand_seen = cand_seen[b_row_indices, new_cand_ids]  # (b, m)
         # Filter out seen. Removing is not possible as rows have different seen counts and then it's no longer a matrix. This also ensures we'll never have an empty `cand_ids`. The vector at this special ID should be all NaNs to ensure its distance is always last.
-        new_cand_ids = np.where(new_cand_seen, NULL_ID, new_cand_ids)  # (b, m_max)
+        new_cand_ids = np.where(new_cand_seen, NULL_ID, new_cand_ids)  # (b, m)
         # Mark resulting new candidates as seen. JAX doesn't support using boolean masks, but we don't need to, for simplicity we can just set all as True.
         # NULL_IDs will be out-of-bounds and not assign to anything.
         cand_seen = cand_seen.at[b_row_indices, new_cand_ids].set(True)
 
         # Calculate distance to new candidates.
-        new_cand_vecs = select_vecs(vecs, new_cand_ids)  # (b, m_max, d)
-        new_cand_dists = norm(b_id_target_vecs - new_cand_vecs, axis=2)  # (b, m_max)
+        new_cand_vecs = select_vecs(vecs, new_cand_ids)  # (b, m, d)
+        new_cand_dists = norm(b_id_target_vecs - new_cand_vecs, axis=2)  # (b, m)
         # Remove expanded nodes and append new candidates to search list.
-        cand_ids = np.hstack([cand_ids[:, 1:], new_cand_ids])  # (b, * - 1 + m_max)
-        cand_dists = np.hstack(
-            [cand_dists[:, 1:], new_cand_dists]
-        )  # (b, * - 1 + m_max)
+        cand_ids = np.hstack([cand_ids[:, 1:], new_cand_ids])  # (b, * - 1 + m)
+        cand_dists = np.hstack([cand_dists[:, 1:], new_cand_dists])  # (b, * - 1 + m)
         # We cannot remove duplicates as different rows have different duplicate counts, breaking matrix. We shouldn't need to anyway, because we don't insert seen and new candidates come from neighbors of a single node which should not have duplicates.
 
         # Sort candidates.
@@ -229,30 +279,27 @@ def greedy_search(
     ]  # (b, k)
 
 
-# Returns (b, m_max) but will only ever fill (b, m); the rest are conveniently filled with NULL_ID.
-@partial(jit, static_argnames=["m", "m_max"])
+@partial(jit, static_argnames=["m"])
 def compute_robust_pruned(
     *,
     vecs: Float16[Array, "n d"],
-    node_ids: UInt32[Array, "b"],  # Batched.
-    cand_ids: UInt32[
-        Array, "b c"
-    ],  # It's safe to have interspersed NULL_IDs and duplicates in here.
+    # Batched. May contain NULL_IDs; corresponding output row contains junk and should be ignored.
+    node_ids: UInt32[Array, "b"],
+    # It's safe to have interspersed NULL_IDs and duplicates in here.
+    cand_ids: UInt32[Array, "b c"],
     m: int,
-    m_max: int,
     dist_thresh: Float16[Array, ""],
 ):
     b, _ = cand_ids.shape
 
-    b_node_vecs = vecs[node_ids, None, :]  # (b, 1, d)
+    b_node_vecs = select_vecs(vecs, node_ids)[:, None, :]  # (b, 1, d)
 
-    res = np.full((b, m_max), NULL_ID, np.uint32)  # (b, m_max)
+    res = np.full((b, m), NULL_ID, np.uint32)  # (b, m)
 
     # Calculate distance from node to each candidate.
     cand_vecs = select_vecs(vecs, cand_ids)  # (b, c, d)
-    cand_dists = norm(
-        b_node_vecs - cand_vecs, axis=2
-    )  # (b, c); NULL_IDs will be NaNs which will be sorted to the end.
+    # NULL_IDs will be NaNs which will be sorted to the end.
+    cand_dists = norm(b_node_vecs - cand_vecs, axis=2)  # (b, c)
     # Sort candidates by distance to node.
     cand_i = np.argsort(cand_dists, axis=1)
     cand_dists = np.take_along_axis(cand_dists, cand_i, axis=1)
@@ -273,26 +320,23 @@ def compute_robust_pruned(
         to_prune = p_star_dists <= cand_dists  # (b, c)
         cand_ids = np.where(to_prune, NULL_ID, cand_ids)
 
-    return res  # (b, m_max)
+    return res  # (b, m)
 
 
 @partial(
     jit,
-    static_argnames=["m", "m_max", "ef"],
+    static_argnames=["m", "ef"],
 )
 def optimize_graph_batch(
     *,
-    graph: UInt32[Array, "n m_max"],
+    graph: UInt32[Array, "n m"],
     vecs: Float16[Array, "n d"],
     batch_nodes: UInt32[Array, "b"],
     id_medoid: UInt32[Array, ""],
     m: int,
-    m_max: int,
     ef: int,
     dist_thresh: Float16[Array, ""],
 ):
-    n, _ = vecs.shape
-    b, = batch_nodes.shape
     visited = greedy_search(
         graph=graph,
         vecs=vecs,
@@ -306,42 +350,28 @@ def optimize_graph_batch(
         cand_ids=np.hstack([visited, graph[batch_nodes, :]]),
         dist_thresh=dist_thresh,
         m=m,
-        m_max=m_max,
         node_ids=batch_nodes,
         vecs=vecs,
-    )  # (b, m_max)
-    # No need to clear m:m_max as compute_robust_pruned already returns m_max with NULL_ID filled after m.
+    )  # (b, m)
     graph = graph.at[batch_nodes].set(new_neighbors)
 
-    # `new_neighbors` is a matrix (b, m) where we add an edge b->m[j] (i.e. `m` is the out-neighbors for `b`).
-    # Build "list" of backedge (m[j], b) pairs.
-    backedges = pair_matrix_vector(new_neighbors, batch_nodes)  # (b * ef, 2)
-    rows = backedges[:, 0]
-    # The maximum possible distinct backedge nodes is b * ef, where every batch node has all distinct neighbors not shared by any other batch node.
-    unique_rows, row_freq = np.unique(
-        rows, return_counts=True, size=b * ef, fill_value=NULL_ID
-    )
-    # These rows have no more capacity for their pending-backedges, so we need to prune them.
-    rows_to_prune = np.where(
-        (graph[unique_rows] == NULL_ID).sum(axis=1) < row_freq, NULL_ID, unique_rows
-    )
+    # The maximum possible distinct backedge target nodes is b * ef, where every batch node has all distinct neighbors not shared by any other batch node.
+    back_nodes, back_add_neighbors = group_by_y_id(
+        M_id=batch_nodes, M=new_neighbors
+    )  # (b * ef, b)
+    back_new_neighbors = np.hstack(
+        [select_nodes(graph, back_nodes), back_add_neighbors]
+    )  # (b * ef, m + b)
+    # While we could have a mechanism where we only prune upon reaching m_max, that would mean dynamic computation: selective compute_robust_pruned. This isn't possible under JIT; even if we mask rows not needing prune with NULL_ID, compute_robust_pruned will still do the fixed amount of calculations anyway. Therefore, we always compute_robust_pruned all rows every batch.
     # compute_robust_pruned will handle duplicates.
-    graph = graph.at[rows_to_prune].set(
+    graph = graph.at[back_nodes].set(
         compute_robust_pruned(
-            cand_ids=graph.at[rows_to_prune, :].get(mode="fill", fill_value=NULL_ID),
+            cand_ids=back_new_neighbors,
             dist_thresh=dist_thresh,
             m=m,
-            m_max=m_max,
-            node_ids=rows_to_prune,
+            node_ids=back_nodes,
             vecs=vecs,
         )
-    )
-    # TODO This requires batch_size to be less than m_max - m. The ideal operation is: group backedges by row (max batch_size columns), select those graph rows, hstack concat (as we possibly exceed m_max), then 1) for prune rows, prune then update graph 2) for non-prune rows, sort (so we can truncate to m_max and remove NULL_ID) then update graph.
-    graph = insert_values_into_filler_positions(
-        A=graph,
-        rows=rows,
-        unique_rows=unique_rows,
-        values=backedges[:, 1],
     )
 
     return graph
@@ -350,11 +380,10 @@ def optimize_graph_batch(
 # WARNING: Do not JIT this function, as otherwise it will unwrap the loop and create a giant function that takes forever to compile.
 def optimize_graph(
     *,
-    graph: UInt32[Array, "n m_max"],
+    graph: UInt32[Array, "n m"],
     vecs: Float16[Array, "n d"],
     id_medoid: UInt32[Array, ""],
     m: int,
-    m_max: int,
     ef: int,
     dist_thresh: Float16[Array, ""],
     update_batch_size: int,
@@ -372,7 +401,6 @@ def optimize_graph(
             batch_nodes=batch_nodes,
             id_medoid=id_medoid,
             m=m,
-            m_max=m_max,
             ef=ef,
             dist_thresh=dist_thresh,
         )
@@ -408,7 +436,6 @@ def main():
     n, _ = vecs.shape
     assert n < NULL_ID
     m = args.m
-    m_max = m * 2
     ef = args.ef
     update_batch_size = 64
     dist_thresh = np.float16(args.alpha)
@@ -426,7 +453,6 @@ def main():
     graph = init_random_graph(
         n=n,
         m=m,
-        m_max=m_max,
         seed=seed,
     )
     if args.profile:
@@ -438,7 +464,6 @@ def main():
                 batch_nodes=arange(update_batch_size),
                 id_medoid=medoid,
                 m=m,
-                m_max=m_max,
                 ef=ef,
                 dist_thresh=dist_thresh,
             ).block_until_ready()
@@ -449,7 +474,6 @@ def main():
             vecs=vecs,
             id_medoid=medoid,
             m=m,
-            m_max=m_max,
             ef=ef,
             dist_thresh=dist_thresh,
             update_batch_size=update_batch_size,
