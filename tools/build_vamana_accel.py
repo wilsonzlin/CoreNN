@@ -5,11 +5,12 @@ from jax.numpy.linalg import norm
 from jaxtyping import Array
 from jaxtyping import Float16
 from jaxtyping import UInt32
+from tqdm import tqdm
 from typing import Optional
+import jax
 import jax.numpy as np
 import jax.random as rand
-import time
-from tqdm import tqdm
+import msgpack
 
 # Use int32 as some functions use/return int32, which if we provide the uint32 max value, will overflow to -1, which is a legal index.
 NULL_ID = np.uint32(np.iinfo(np.int32).max)
@@ -165,7 +166,7 @@ def greedy_search(
     k: Optional[int],  # If None, return all visited node IDs instead of top k.
     ef: int,
     iterations: int,
-    id_start: UInt32[Array, ""]
+    id_start: UInt32[Array, ""],
 ):
     n, _ = vecs.shape
     (b,) = id_targets.shape
@@ -324,9 +325,7 @@ def optimize_graph_batch(
     # compute_robust_pruned will handle duplicates.
     graph = graph.at[rows_to_prune].set(
         compute_robust_pruned(
-            cand_ids=graph.at[rows_to_prune, :].get(
-                mode="fill", fill_value=NULL_ID
-            ),
+            cand_ids=graph.at[rows_to_prune, :].get(mode="fill", fill_value=NULL_ID),
             dist_thresh=dist_thresh,
             m=m,
             m_max=m_max,
@@ -343,6 +342,7 @@ def optimize_graph_batch(
     )
 
     return graph
+
 
 # WARNING: Do not JIT this function, as otherwise it will unwrap the loop and create a giant function that takes forever to compile.
 def optimize_graph(
@@ -381,6 +381,11 @@ def optimize_graph(
 def main():
     parser = ArgumentParser(description="Build a Vamana graph using the GPU.")
     parser.add_argument("vectors", type=str, help="Path to a packed matrix of vectors")
+    parser.add_argument("--out", type=str, help="Graph output path")
+    parser.add_argument("--out-medoid", type=str, help="Medoid output path")
+    parser.add_argument(
+        "--profile", type=str, help="Profile a batch optimization to this directory"
+    )
     parser.add_argument("--dtype", type=str, help="Data type name e.g. float32")
     parser.add_argument("--dim", type=int, help="Vector dimensions")
     parser.add_argument("--m", type=int, help="Degree bound")
@@ -419,18 +424,44 @@ def main():
         m_max=m_max,
         seed=seed,
     )
-    graph = optimize_graph(
-      graph=graph,
-      vecs=vecs,
-      id_medoid=medoid,
-      m=m,
-      m_max=m_max,
-      ef=ef,
-      dist_thresh=dist_thresh,
-      update_batch_size=update_batch_size,
-      seed=seed,
-    )
-    print("All done!")
+    if args.profile:
+        with jax.profiler.trace(args.profile, create_perfetto_link=True):
+            print("Profiling")
+            optimize_graph_batch(
+                graph=graph,
+                vecs=vecs,
+                batch_nodes=arange(update_batch_size),
+                id_medoid=medoid,
+                m=m,
+                m_max=m_max,
+                ef=ef,
+                dist_thresh=dist_thresh,
+            ).block_until_ready()
+            print("Computation complete")
+    else:
+        graph = optimize_graph(
+            graph=graph,
+            vecs=vecs,
+            id_medoid=medoid,
+            m=m,
+            m_max=m_max,
+            ef=ef,
+            dist_thresh=dist_thresh,
+            update_batch_size=update_batch_size,
+            seed=seed,
+        ).block_until_ready()
+        print("Saving")
+        with open(args.out, "wb") as f:
+            msgpack.dump(
+                {
+                    i: [n for n in nodes if n != NULL_ID]
+                    for i, nodes in enumerate(graph.tolist())
+                },
+                f,
+            )
+        with open(args.out_medoid, "w") as f:
+            f.write(str(medoid.item()))
+        print("All done!")
 
 
 if __name__ == "__main__":
