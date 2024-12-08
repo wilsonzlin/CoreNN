@@ -1,4 +1,6 @@
 hnswlib
+jax
+jaxtyping
 matplotlib
 msgpack
 numpy
