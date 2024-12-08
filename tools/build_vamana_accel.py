@@ -419,23 +419,17 @@ def main():
         m_max=m_max,
         seed=seed,
     )
-    print("Compiling optimizer")
-    args = {
-      "graph": graph,
-      "vecs": vecs,
-      "id_medoid": medoid,
-      "m": m,
-      "m_max": m_max,
-      "ef": ef,
-      "dist_thresh": dist_thresh,
-      "update_batch_size": update_batch_size,
-      "seed": seed,
-    }
-    started = time.time()
-    optimize_graph.lower(**args).compile()
-    print("Compiled optimizer in", time.time() - started, "seconds")
-    print("Optimizing")
-    graph = optimize_graph(**args)
+    graph = optimize_graph(
+      graph=graph,
+      vecs=vecs,
+      id_medoid=medoid,
+      m=m,
+      m_max=m_max,
+      ef=ef,
+      dist_thresh=dist_thresh,
+      update_batch_size=update_batch_size,
+      seed=seed,
+    )
     print("All done!")
 
 
