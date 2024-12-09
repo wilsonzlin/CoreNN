@@ -264,9 +264,8 @@ def greedy_search(
         # We cannot remove duplicates as different rows have different duplicate counts, breaking matrix. We shouldn't need to anyway, because we don't insert seen and new candidates come from neighbors of a single node which should not have duplicates.
 
         # Sort candidates.
-        sort_indices = np.argsort(
-            cand_dists, axis=1
-        )  # NULL_IDs use NaNs which will be sorted to the end.
+        # NULL_IDs use NaNs which will be sorted to the end.
+        sort_indices = np.argsort(cand_dists, axis=1)
         cand_ids = cand_ids[b_row_indices, sort_indices]
         cand_dists = cand_dists[b_row_indices, sort_indices]
         cand_ids = cand_ids[:, :ef]
@@ -293,6 +292,7 @@ def compute_robust_pruned(
     b, _ = cand_ids.shape
 
     b_node_vecs = select_vecs(vecs, node_ids)[:, None, :]  # (b, 1, d)
+    b_row_indices = arange(b)[:, None] # (b, 1)
 
     res = np.full((b, m), NULL_ID, np.uint32)  # (b, m)
 
@@ -302,9 +302,9 @@ def compute_robust_pruned(
     cand_dists = norm(b_node_vecs - cand_vecs, axis=2)  # (b, c)
     # Sort candidates by distance to node.
     cand_i = np.argsort(cand_dists, axis=1)
-    cand_dists = np.take_along_axis(cand_dists, cand_i, axis=1)
+    cand_dists = cand_dists[b_row_indices, cand_i]
     # IDs will be set to NULL_ID as they are picked or pruned.
-    cand_ids = np.take_along_axis(cand_ids, cand_i, axis=1)  # (b, c)
+    cand_ids = cand_ids[b_row_indices, cand_i]  # (b, c)
     for i in range(m):
         # If we've run out of candidates for a node, this will just pick the first (closest) candidate again as argmax returns the smallest index on conflicts, which is now NULL_ID (as we've previously picked it and masked it with NULL_ID). This is correct as we want to append NULL_ID to `res`. It won't prune anything since the NaNs will propagate when calculating dists and not be `<=` to anything.
         p_star_indices = (cand_ids != NULL_ID).argmax(axis=1)  # (b,)
@@ -325,7 +325,7 @@ def compute_robust_pruned(
 
 @partial(
     jit,
-    static_argnames=["m", "ef"],
+    static_argnames=["m", "ef", "search_iter"],
 )
 def optimize_graph_batch(
     *,
@@ -335,6 +335,7 @@ def optimize_graph_batch(
     id_medoid: UInt32[Array, ""],
     m: int,
     ef: int,
+    search_iter: int,
     dist_thresh: Float16[Array, ""],
 ):
     visited = greedy_search(
@@ -343,7 +344,7 @@ def optimize_graph_batch(
         id_targets=batch_nodes,
         k=None,
         ef=ef,
-        iterations=ef,
+        iterations=search_iter,
         id_start=id_medoid,
     )  # (b, ef)
     new_neighbors = compute_robust_pruned(
@@ -385,6 +386,7 @@ def optimize_graph(
     id_medoid: UInt32[Array, ""],
     m: int,
     ef: int,
+    search_iter: int,
     dist_thresh: Float16[Array, ""],
     update_batch_size: int,
     seed: int,
@@ -402,6 +404,7 @@ def optimize_graph(
             id_medoid=id_medoid,
             m=m,
             ef=ef,
+            search_iter=search_iter,
             dist_thresh=dist_thresh,
         )
         pb.update(b)
@@ -414,14 +417,14 @@ def main():
     parser.add_argument("vectors", type=str, help="Path to a packed matrix of vectors")
     parser.add_argument("--out", type=str, help="Graph output path")
     parser.add_argument("--out-medoid", type=str, help="Medoid output path")
-    parser.add_argument(
-        "--profile", type=str, help="Profile a batch optimization to this directory"
-    )
     parser.add_argument("--dtype", type=str, help="Data type name e.g. float32")
     parser.add_argument("--dim", type=int, help="Vector dimensions")
     parser.add_argument("--m", type=int, help="Degree bound")
     parser.add_argument("--ef", type=int, help="Search list cap")
+    parser.add_argument("--iter", type=int, help="Search iterations")
     parser.add_argument("--alpha", type=float, help="Distance threshold")
+    parser.add_argument("--batch", type=int, help="Update batch size", default=64)
+    parser.add_argument("--profile", type=str, help="Profile a batch optimization to this directory")
     args = parser.parse_args()
 
     print("Loading vectors")
@@ -437,7 +440,8 @@ def main():
     assert n < NULL_ID
     m = args.m
     ef = args.ef
-    update_batch_size = 64
+    search_iter = args.iter or args.ef
+    update_batch_size = args.batch
     dist_thresh = np.float16(args.alpha)
     seed = 0
     medoid_sample_size = 10_000
@@ -475,6 +479,7 @@ def main():
             id_medoid=medoid,
             m=m,
             ef=ef,
+            search_iter=search_iter,
             dist_thresh=dist_thresh,
             update_batch_size=update_batch_size,
             seed=seed,
