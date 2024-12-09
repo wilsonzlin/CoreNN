@@ -7,7 +7,6 @@ from util import arange
 from util import NULL_ID
 import jax
 import jax.numpy as np
-import msgpack
 
 parser = ArgumentParser(description="Build a Vamana graph using the GPU.")
 parser.add_argument("vectors", type=str, help="Path to a packed matrix of vectors")
@@ -83,15 +82,8 @@ else:
     ).block_until_ready()
     print("Saving")
     with open(args.out, "wb") as f:
-        # WARNING: Do not .dump to f as that is unbuffered and extremely slow for large graphs and/or high-latency storage (e.g. NFS).
-        f.write(
-            msgpack.dumps(
-                {
-                    i: [n for n in nodes if n != NULL_ID]
-                    for i, nodes in enumerate(graph.tolist())
-                },
-            )  # type: ignore
-        )
+        # WARNING: Do not convert to Python type and serialize as MessagePack/JSON/etc. as that conversion + serialization process will be extremely slow in Python.
+        f.write(graph.tobytes())
     with open(args.out_medoid, "w") as f:
         f.write(str(medoid.item()))
     print("All done!")
