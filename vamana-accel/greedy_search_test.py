@@ -12,10 +12,38 @@ import jax.numpy as np
 import jax.random as rand
 
 
-# Reference* implementation of GreedySearch, according to the paper. Intentionally unoptimized to keep as close to correct reference code as possible.
-# * Slight differences, to match our implementation:
-#   - Visited nodes are never dropped.
-#   - Iterations bounded to `search_iter`.
+# Reference implementation of GreedySearch, according to the paper. Intentionally unoptimized to keep as close to correct reference code as possible.
+# We compare this to our variation to see any differences in results.
+def ref_golden_greedy_search(
+    *,
+    vecs: Float16[Array, "n d"],
+    start: int,
+    g: UInt32[Array, "n m"],
+    q: int,
+    k: int,
+    search_list_cap: int,
+) -> Tuple[List[int], List[int]]:
+    search_list = [(start, norm(vecs[q] - vecs[start]))]
+    seen: Set[int] = set([start])
+    visited: List[int] = []
+    while True:
+        p_star = next(filter(lambda x: x[0] not in visited, search_list), None)
+        if p_star is None:
+            break
+        p_star_id, _ = p_star
+        for n in g[p_star_id].tolist():
+            if n not in seen:
+                search_list.append((n, norm(vecs[q] - vecs[n])))
+                seen.add(n)
+        visited.append(p_star_id)
+        search_list.sort(key=lambda o: o[1])
+        del search_list[search_list_cap:]
+    return (
+        [x for x, _ in search_list[:k]],
+        visited,
+    )
+
+
 def ref_greedy_search(
     *,
     vecs: Float16[Array, "n d"],
@@ -113,6 +141,14 @@ def test_greedy_search_visited():
         search_list_cap=search_list_cap,
         search_iter=search_iter,
     )[1]
+    ideal = ref_golden_greedy_search(
+        vecs=vecs,
+        start=start,
+        g=g,
+        q=query,
+        k=0,
+        search_list_cap=search_list_cap,
+    )[1]
     got = [
         v
         for v in greedy_search(
@@ -129,3 +165,5 @@ def test_greedy_search_visited():
         if v != NULL_ID
     ]
     assert exp == got
+    # With enough search iterations, the visited nodes of ours should be a superset.
+    assert set(ideal) == set(got)

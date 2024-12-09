@@ -67,6 +67,7 @@ def optimize_graph_batch(
     search_iter: int,
     dist_thresh: Float16[Array, ""],
 ):
+    # NOTE: While the original greedy_search doesn't have a fixed search_iter and can drop visited from the search list, so it seems like we could get very early distant nodes that would otherwise be pruned, we only want the set of visited nodes (as per the official insert/optimize algorithm), not the nearest ef/search_iter visited nodes. For example, even in the original implementation, the medoid is always returned.
     visited = greedy_search(
         graph=graph,
         vecs=vecs,
@@ -76,6 +77,7 @@ def optimize_graph_batch(
         iterations=search_iter,
         id_start=id_medoid,
     )  # (b, search_iter)
+    # Always prune as we have more than m candidates, unless search_iter is set to a tiny value less than m which should never be done.
     new_neighbors = compute_robust_pruned(
         cand_ids=np.hstack([visited, graph[batch_nodes]]),
         dist_thresh=dist_thresh,
@@ -92,17 +94,28 @@ def optimize_graph_batch(
     back_new_neighbors = np.hstack(
         [select_nodes(graph, back_nodes), back_add_neighbors]
     )  # (b * search_iter, m + b)
-    # While we could have a mechanism where we only prune upon reaching m_max, that would mean dynamic computation: selective compute_robust_pruned. This isn't possible under JIT; even if we mask rows not needing prune with NULL_ID, compute_robust_pruned will still do the fixed amount of calculations anyway. Therefore, we always compute_robust_pruned all rows every batch.
-    # compute_robust_pruned will handle duplicates.
-    graph = graph.at[back_nodes].set(
-        compute_robust_pruned(
-            cand_ids=back_new_neighbors,
-            dist_thresh=dist_thresh,
-            m=m,
-            node_ids=back_nodes,
-            vecs=vecs,
-        )
+    # Move NULL_IDs to end so we can truncate to m if we're not pruning.
+    sort_i = np.argsort(back_new_neighbors, axis=1)
+    back_new_neighbors = back_new_neighbors[
+        arange(back_new_neighbors.shape[0])[:, None], sort_i
+    ]
+    # Figure out which nodes need pruning.
+    # This is not a speed optimization: conditionally pruning would mean dynamic computation, not possible under JIT. We always do the same amount of computation here.
+    # Instead, this is for accuracy: we don't want to prune a node too early (i.e. before it has m out-neighbors), as that may remove vital edges.
+    back_needs_prune = (back_new_neighbors != NULL_ID).sum(
+        axis=1
+    ) >= m  # (b * search_iter,)
+    back_new_neighbors_pruned = compute_robust_pruned(
+        cand_ids=np.where(back_needs_prune[:, None], back_new_neighbors, NULL_ID),
+        dist_thresh=dist_thresh,
+        m=m,
+        node_ids=np.where(back_needs_prune, back_nodes, NULL_ID),
+        vecs=vecs,
     )
+    back_new_neighbors = np.where(
+        back_needs_prune[:, None], back_new_neighbors_pruned, back_new_neighbors[:, :m]
+    )
+    graph = graph.at[back_nodes].set(back_new_neighbors)
 
     return graph
 

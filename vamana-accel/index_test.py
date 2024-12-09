@@ -25,7 +25,7 @@ def ref_optimize_graph_batch(
     dist_thresh: Float16[Array, ""],
     degree_bound: int,
 ):
-    ref_g = g.tolist()
+    ref_g: List[List[int]] = g.tolist()
     ref_add_edges: Dict[int, List[int]] = defaultdict(list)
     for n in batch_nodes:
         visited = ref_greedy_search(
@@ -48,13 +48,15 @@ def ref_optimize_graph_batch(
         for j in new_neighbors:
             ref_add_edges[j].append(n)
     for n, add in ref_add_edges.items():
-        ref_g[n] = ref_compute_robust_pruned(
-            vecs=vecs,
-            p=n,
-            candidates=ref_g[n] + add,
-            distance_threshold=dist_thresh,
-            degree_bound=degree_bound,
-        )
+        ref_g[n] = sorted(ref_g[n] + add)
+        if len(ref_g[n]) > degree_bound:
+            ref_g[n] = ref_compute_robust_pruned(
+                vecs=vecs,
+                p=n,
+                candidates=ref_g[n],
+                distance_threshold=dist_thresh,
+                degree_bound=degree_bound,
+            )
 
     # Convert ref_g to matrix.
     for r in ref_g:
