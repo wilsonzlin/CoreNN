@@ -82,12 +82,14 @@ else:
     ).block_until_ready()
     print("Saving")
     with open(args.out, "wb") as f:
-        msgpack.dump(
-            {
-                i: [n for n in nodes if n != NULL_ID]
-                for i, nodes in enumerate(graph.tolist())
-            },
-            f,
+        # WARNING: Do not .dump to f as that is unbuffered and extremely slow for large graphs and/or high-latency storage (e.g. NFS).
+        f.write(
+            msgpack.dumps(
+                {
+                    i: [n for n in nodes if n != NULL_ID]
+                    for i, nodes in enumerate(graph.tolist())
+                },
+            )  # type: ignore
         )
     with open(args.out_medoid, "w") as f:
         f.write(str(medoid.item()))

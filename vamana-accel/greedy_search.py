@@ -51,7 +51,7 @@ def greedy_search(
         visited_dists = visited_dists.at[:, i].set(cand_dists[:, 0])
         # Get neighbors of expanded nodes and calculate distance.
         # m new candidates for each query node in b.
-        new_cand_ids = select_nodes(graph, to_expand)  # (b, m);
+        new_cand_ids = select_nodes(graph, to_expand)  # (b, m)
         new_cand_seen = cand_seen[b_row_indices, new_cand_ids]  # (b, m)
         # Filter out seen. Removing is not possible as rows have different seen counts and then it's no longer a matrix. This also ensures we'll never have an empty `cand_ids`. The vector at this special ID should be all NaNs to ensure its distance is always last.
         new_cand_ids = np.where(new_cand_seen, NULL_ID, new_cand_ids)  # (b, m)

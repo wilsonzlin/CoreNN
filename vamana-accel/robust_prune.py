@@ -35,6 +35,8 @@ def compute_robust_pruned(
     # Sort candidates by distance to node.
     cand_i = np.argsort(cand_dists, axis=1)
     cand_dists = cand_dists[b_row_indices, cand_i]
+    # This must be sorted too as we'll later use it to compare to `p_star_dists`.
+    cand_vecs = cand_vecs[b_row_indices, cand_i]
     # IDs will be set to NULL_ID as they are picked or pruned.
     cand_ids = cand_ids[b_row_indices, cand_i]  # (b, c)
     for i in range(m):
@@ -44,7 +46,7 @@ def compute_robust_pruned(
         res = res.at[:, i].set(p_star)
         cand_ids = cand_ids.at[arange(b), p_star_indices].set(NULL_ID)
 
-        p_star_vecs = vecs[p_star, None, :]  # (b, 1, d)
+        p_star_vecs = select_vecs(vecs, p_star)[:, None, :]  # (b, 1, d)
         # p_star_dists[p_star][candidate] is distance from p_star to candidate with distance threshold multiplier.
         # If there are duplicates, this will handle it as their distance will be 0.
         p_star_dists = dist_thresh * norm(p_star_vecs - cand_vecs, axis=2)  # (b, c)
