@@ -5,13 +5,17 @@ from jaxtyping import Array
 from jaxtyping import Float16
 from jaxtyping import UInt32
 from typing import List
+from typing import Set
 from typing import Tuple
+from util import NULL_ID
 import jax.numpy as np
 import jax.random as rand
 
 
-# Reference implementation of GreedySearch, according to the paper. Intentionally unoptimized to keep as close to correct reference code as possible.
-# NOTE: It's expected that our greedy_search is close to this, but not 100%, as our implementation has slight differences.
+# Reference* implementation of GreedySearch, according to the paper. Intentionally unoptimized to keep as close to correct reference code as possible.
+# * Slight differences, to match our implementation:
+#   - Visited nodes are never dropped.
+#   - Iterations bounded to `search_iter`.
 def ref_greedy_search(
     *,
     vecs: Float16[Array, "n d"],
@@ -20,22 +24,28 @@ def ref_greedy_search(
     q: int,
     k: int,
     search_list_cap: int,
-):
+    search_iter: int,
+) -> Tuple[List[int], List[int]]:
     search_list: List[Tuple[int, float]] = []
     search_list.append((start, norm(vecs[q] - vecs[start])))
-    visited: List[int] = []
-    while True:
-        p_star = next(filter(lambda n: n[0] not in visited, search_list), None)
+    seen: Set[int] = set([start])
+    visited: List[Tuple[int, float]] = []
+    for _ in range(search_iter):
+        p_star = search_list.pop(0) if search_list else None
         if p_star is None:
             break
         p_star_id, _ = p_star
         for n in g[p_star_id].tolist():
-            if not any(o == n for o, _ in search_list):
+            if n not in seen:
                 search_list.append((n, norm(vecs[q] - vecs[n])))
-        visited.append(p_star_id)
+                seen.add(n)
+        visited.append(p_star)
         search_list.sort(key=lambda o: o[1])
         del search_list[search_list_cap:]
-    return search_list[:k], visited
+    return (
+        [x for x, _ in sorted(visited, key=lambda x: x[1])[:k]],
+        [x for x, _ in visited],
+    )
 
 
 def test_greedy_search_top_k():
@@ -43,6 +53,7 @@ def test_greedy_search_top_k():
     degree_bound = 12
     d = 128
     search_list_cap = 100
+    search_iter = 150
     k = 10
     start = 0
     query = 7777
@@ -52,12 +63,18 @@ def test_greedy_search_top_k():
     )
     g = init_random_graph(n=n, m=degree_bound, seed=seed)
 
-    exp = ref_greedy_search(
-        vecs=vecs, start=start, g=g, q=query, k=k, search_list_cap=search_list_cap
+    exp = set(
+        ref_greedy_search(
+            vecs=vecs,
+            start=start,
+            g=g,
+            q=query,
+            k=k,
+            search_list_cap=search_list_cap,
+            search_iter=search_iter,
+        )[0]
     )
-    exp_ids = {o for o, _ in exp[0]}
-    assert len(exp_ids) == k
-    got_ids = set(
+    got = set(
         greedy_search(
             vecs=vecs,
             id_start=start,
@@ -65,14 +82,12 @@ def test_greedy_search_top_k():
             id_targets=np.array([query]),
             k=k,
             ef=search_list_cap,
-            iterations=search_list_cap,
+            iterations=search_iter,
         )
         .squeeze()
         .tolist()
     )
-    assert len(got_ids) == k
-    accuracy = len(exp_ids.intersection(got_ids)) / k
-    print(f"Top-k accuracy: {accuracy:.2%}")
+    assert exp == got
 
 
 def test_greedy_search_visited():
@@ -80,6 +95,7 @@ def test_greedy_search_visited():
     degree_bound = 12
     d = 128
     search_list_cap = 100
+    search_iter = 150
     start = 0
     query = 7777
     seed = 0
@@ -89,20 +105,27 @@ def test_greedy_search_visited():
     g = init_random_graph(n=n, m=degree_bound, seed=seed)
 
     exp = ref_greedy_search(
-        vecs=vecs, start=start, g=g, q=query, k=0, search_list_cap=search_list_cap
+        vecs=vecs,
+        start=start,
+        g=g,
+        q=query,
+        k=0,
+        search_list_cap=search_list_cap,
+        search_iter=search_iter,
     )[1]
-    got = (
-        greedy_search(
+    got = [
+        v
+        for v in greedy_search(
             vecs=vecs,
             id_start=start,
             graph=g,
             id_targets=np.array([query]),
             k=None,
             ef=search_list_cap,
-            iterations=search_list_cap,
+            iterations=search_iter,
         )
         .squeeze()
         .tolist()
-    )
-    assert got == exp[: len(got)]
-    print(len(exp) - len(got), "extra nodes visited by reference implementation")
+        if v != NULL_ID
+    ]
+    assert exp == got

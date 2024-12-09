@@ -75,9 +75,9 @@ def optimize_graph_batch(
         ef=ef,
         iterations=search_iter,
         id_start=id_medoid,
-    )  # (b, ef)
+    )  # (b, search_iter)
     new_neighbors = compute_robust_pruned(
-        cand_ids=np.hstack([visited, graph[batch_nodes, :]]),
+        cand_ids=np.hstack([visited, graph[batch_nodes]]),
         dist_thresh=dist_thresh,
         m=m,
         node_ids=batch_nodes,
@@ -85,13 +85,13 @@ def optimize_graph_batch(
     )  # (b, m)
     graph = graph.at[batch_nodes].set(new_neighbors)
 
-    # The maximum possible distinct backedge target nodes is b * ef, where every batch node has all distinct neighbors not shared by any other batch node.
+    # The maximum possible distinct backedge target nodes is b * search_iter, where every batch node has all distinct neighbors not shared by any other batch node.
     back_nodes, back_add_neighbors = group_by_y_id(
         M_id=batch_nodes, M=new_neighbors
-    )  # (b * ef, b)
+    )  # (b * search_iter, b)
     back_new_neighbors = np.hstack(
         [select_nodes(graph, back_nodes), back_add_neighbors]
-    )  # (b * ef, m + b)
+    )  # (b * search_iter, m + b)
     # While we could have a mechanism where we only prune upon reaching m_max, that would mean dynamic computation: selective compute_robust_pruned. This isn't possible under JIT; even if we mask rows not needing prune with NULL_ID, compute_robust_pruned will still do the fixed amount of calculations anyway. Therefore, we always compute_robust_pruned all rows every batch.
     # compute_robust_pruned will handle duplicates.
     graph = graph.at[back_nodes].set(
