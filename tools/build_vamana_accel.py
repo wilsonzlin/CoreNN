@@ -223,7 +223,7 @@ def greedy_search(
     iterations: int,
     id_start: UInt32[Array, ""],
 ):
-    n, _ = vecs.shape
+    n, m = graph.shape
     (b,) = id_targets.shape
 
     # Cache outside loop.
@@ -232,22 +232,26 @@ def greedy_search(
 
     visited_ids = np.full((b, iterations), NULL_ID, dtype=np.uint32)  # (b, iterations)
     visited_dists = np.full(
-        (b, iterations), float("inf"), dtype=np.float16
+        (b, iterations), np.nan, dtype=np.float16
     )  # (b, iterations)
 
-    cand_ids = np.full((b, 1), id_start, dtype=np.uint32)  # (b, *)
-    cand_dists = norm(
-        vecs[id_targets] - vecs[id_start], axis=1, keepdims=True
-    )  # (b, *)
-    cand_seen = np.full((b, n), False, dtype=bool)  # (b, n + 1)
+    cand_ids = np.full((b, ef + m), NULL_ID, dtype=np.uint32)  # (b, ef + m)
+    cand_dists = np.full((b, ef + m), np.nan, dtype=np.float16)  # (b, ef + m)
+
+    cand_ids = cand_ids.at[:, 0].set(id_start)
+    cand_dists = cand_dists.at[:, 0].set(
+        norm(vecs[id_targets] - vecs[id_start], axis=1)
+    )
+
+    cand_seen = np.full((b, n), False, dtype=bool)  # (b, n)
     for i in range(iterations):
         # Get nodes to expand and copy to visited list.
         to_expand = cand_ids[:, 0]  # (b,)
         visited_ids = visited_ids.at[:, i].set(cand_ids[:, 0])
         visited_dists = visited_dists.at[:, i].set(cand_dists[:, 0])
         # Get neighbors of expanded nodes and calculate distance.
-        # m ew candidates for each query node in b.
-        new_cand_ids = graph[to_expand]  # (b, m);
+        # m new candidates for each query node in b.
+        new_cand_ids = select_nodes(graph, to_expand)  # (b, m);
         new_cand_seen = cand_seen[b_row_indices, new_cand_ids]  # (b, m)
         # Filter out seen. Removing is not possible as rows have different seen counts and then it's no longer a matrix. This also ensures we'll never have an empty `cand_ids`. The vector at this special ID should be all NaNs to ensure its distance is always last.
         new_cand_ids = np.where(new_cand_seen, NULL_ID, new_cand_ids)  # (b, m)
@@ -258,9 +262,13 @@ def greedy_search(
         # Calculate distance to new candidates.
         new_cand_vecs = select_vecs(vecs, new_cand_ids)  # (b, m, d)
         new_cand_dists = norm(b_id_target_vecs - new_cand_vecs, axis=2)  # (b, m)
-        # Remove expanded nodes and append new candidates to search list.
-        cand_ids = np.hstack([cand_ids[:, 1:], new_cand_ids])  # (b, * - 1 + m)
-        cand_dists = np.hstack([cand_dists[:, 1:], new_cand_dists])  # (b, * - 1 + m)
+        # Remove expanded nodes.
+        cand_ids = cand_ids.at[:, 0].set(NULL_ID)
+        cand_dists = cand_dists.at[:, 0].set(np.nan)
+        # Append new candidates to search list.
+        # Avoid using hstack to avoid repeated memory allocation. (We do this each iteration, which gets unrolled by JIT.)
+        cand_ids = cand_ids.at[:, ef:].set(new_cand_ids)
+        cand_dists = cand_dists.at[:, ef:].set(new_cand_dists)
         # We cannot remove duplicates as different rows have different duplicate counts, breaking matrix. We shouldn't need to anyway, because we don't insert seen and new candidates come from neighbors of a single node which should not have duplicates.
 
         # Sort candidates.
@@ -268,8 +276,6 @@ def greedy_search(
         sort_indices = np.argsort(cand_dists, axis=1)
         cand_ids = cand_ids[b_row_indices, sort_indices]
         cand_dists = cand_dists[b_row_indices, sort_indices]
-        cand_ids = cand_ids[:, :ef]
-        cand_dists = cand_dists[:, :ef]
 
     if k is None:
         return visited_ids  # (b, iterations)
@@ -292,7 +298,7 @@ def compute_robust_pruned(
     b, _ = cand_ids.shape
 
     b_node_vecs = select_vecs(vecs, node_ids)[:, None, :]  # (b, 1, d)
-    b_row_indices = arange(b)[:, None] # (b, 1)
+    b_row_indices = arange(b)[:, None]  # (b, 1)
 
     res = np.full((b, m), NULL_ID, np.uint32)  # (b, m)
 
@@ -424,7 +430,9 @@ def main():
     parser.add_argument("--iter", type=int, help="Search iterations")
     parser.add_argument("--alpha", type=float, help="Distance threshold")
     parser.add_argument("--batch", type=int, help="Update batch size", default=64)
-    parser.add_argument("--profile", type=str, help="Profile a batch optimization to this directory")
+    parser.add_argument(
+        "--profile", type=str, help="Profile a batch optimization to this directory"
+    )
     args = parser.parse_args()
 
     print("Loading vectors")
@@ -445,7 +453,7 @@ def main():
     dist_thresh = np.float16(args.alpha)
     seed = 0
     medoid_sample_size = 10_000
-    print(f"{n=} {m=} {ef=} {dist_thresh=}")
+    print(f"{n=} {m=} {ef=} {search_iter=} {update_batch_size=} {dist_thresh=}")
 
     print("Calculating approx. medoid")
     medoid = calc_approx_medoid(
