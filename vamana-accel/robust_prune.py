@@ -2,7 +2,7 @@ from functools import partial
 from jax import jit
 from jax.numpy.linalg import norm
 from jaxtyping import Array
-from jaxtyping import Float16
+from jaxtyping import BFloat16
 from jaxtyping import UInt32
 from util import arange
 from util import NULL_ID
@@ -13,13 +13,13 @@ import jax.numpy as np
 @partial(jit, static_argnames=["m"])
 def compute_robust_pruned(
     *,
-    vecs: Float16[Array, "n d"],
+    vecs: BFloat16[Array, "n d"],
     # Batched. May contain NULL_IDs; corresponding output row contains junk and should be ignored.
     node_ids: UInt32[Array, "b"],
     # It's safe to have interspersed NULL_IDs and duplicates in here.
     cand_ids: UInt32[Array, "b c"],
     m: int,
-    dist_thresh: Float16[Array, ""],
+    dist_thresh: BFloat16[Array, ""],
 ):
     b, _ = cand_ids.shape
 

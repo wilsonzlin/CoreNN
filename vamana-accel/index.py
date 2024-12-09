@@ -3,7 +3,7 @@ from greedy_search import greedy_search
 from jax import jit
 from jax.numpy.linalg import norm
 from jaxtyping import Array
-from jaxtyping import Float16
+from jaxtyping import BFloat16
 from jaxtyping import UInt32
 from robust_prune import compute_robust_pruned
 from tqdm import tqdm
@@ -19,7 +19,7 @@ import jax.random as rand
 @partial(jit, static_argnames=["sample_size", "seed"])
 def calc_approx_medoid(
     *,
-    vecs: Float16[Array, "n d"],
+    vecs: BFloat16[Array, "n d"],
     sample_size: int,
     seed: int,
 ):
@@ -59,13 +59,13 @@ def init_random_graph(
 def optimize_graph_batch(
     *,
     graph: UInt32[Array, "n m"],
-    vecs: Float16[Array, "n d"],
+    vecs: BFloat16[Array, "n d"],
     batch_nodes: UInt32[Array, "b"],
     id_medoid: UInt32[Array, ""],
     m: int,
     ef: int,
     search_iter: int,
-    dist_thresh: Float16[Array, ""],
+    dist_thresh: BFloat16[Array, ""],
 ):
     # NOTE: While the original greedy_search doesn't have a fixed search_iter and can drop visited from the search list, so it seems like we could get very early distant nodes that would otherwise be pruned, we only want the set of visited nodes (as per the official insert/optimize algorithm), not the nearest ef/search_iter visited nodes. For example, even in the original implementation, the medoid is always returned.
     visited = greedy_search(
@@ -124,12 +124,12 @@ def optimize_graph_batch(
 def optimize_graph(
     *,
     graph: UInt32[Array, "n m"],
-    vecs: Float16[Array, "n d"],
+    vecs: BFloat16[Array, "n d"],
     id_medoid: UInt32[Array, ""],
     m: int,
     ef: int,
     search_iter: int,
-    dist_thresh: Float16[Array, ""],
+    dist_thresh: BFloat16[Array, ""],
     update_batch_size: int,
     seed: int,
 ):

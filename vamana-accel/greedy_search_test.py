@@ -2,7 +2,7 @@ from greedy_search import greedy_search
 from index import init_random_graph
 from jax.numpy.linalg import norm
 from jaxtyping import Array
-from jaxtyping import Float16
+from jaxtyping import BFloat16
 from jaxtyping import UInt32
 from typing import List
 from typing import Set
@@ -16,7 +16,7 @@ import jax.random as rand
 # We compare this to our variation to see any differences in results.
 def ref_golden_greedy_search(
     *,
-    vecs: Float16[Array, "n d"],
+    vecs: BFloat16[Array, "n d"],
     start: int,
     g: UInt32[Array, "n m"],
     q: int,
@@ -46,7 +46,7 @@ def ref_golden_greedy_search(
 
 def ref_greedy_search(
     *,
-    vecs: Float16[Array, "n d"],
+    vecs: BFloat16[Array, "n d"],
     start: int,
     g: UInt32[Array, "n m"],
     q: int,
@@ -87,7 +87,7 @@ def test_greedy_search_top_k():
     query = 7777
     seed = 0
     vecs = rand.uniform(
-        rand.PRNGKey(seed), (n, d), dtype=np.float16, minval=-1, maxval=1
+        rand.PRNGKey(seed), (n, d), dtype=np.bfloat16, minval=-1, maxval=1
     )
     g = init_random_graph(n=n, m=degree_bound, seed=seed)
 
@@ -128,7 +128,7 @@ def test_greedy_search_visited():
     query = 7777
     seed = 0
     vecs = rand.uniform(
-        rand.PRNGKey(seed), (n, d), dtype=np.float16, minval=-1, maxval=1
+        rand.PRNGKey(seed), (n, d), dtype=np.bfloat16, minval=-1, maxval=1
     )
     g = init_random_graph(n=n, m=degree_bound, seed=seed)
 

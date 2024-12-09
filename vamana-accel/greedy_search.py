@@ -2,7 +2,7 @@ from functools import partial
 from jax import jit
 from jax.numpy.linalg import norm
 from jaxtyping import Array
-from jaxtyping import Float16
+from jaxtyping import BFloat16
 from jaxtyping import UInt32
 from typing import Optional
 from util import arange
@@ -16,7 +16,7 @@ import jax.numpy as np
 def greedy_search(
     *,
     graph: UInt32[Array, "n m"],
-    vecs: Float16[Array, "n d"],
+    vecs: BFloat16[Array, "n d"],
     id_targets: UInt32[Array, "b"],  # Batched.
     k: Optional[int],  # If None, return all visited node IDs instead of top k.
     ef: int,
@@ -32,11 +32,11 @@ def greedy_search(
 
     visited_ids = np.full((b, iterations), NULL_ID, dtype=np.uint32)  # (b, iterations)
     visited_dists = np.full(
-        (b, iterations), np.nan, dtype=np.float16
+        (b, iterations), np.nan, dtype=np.bfloat16
     )  # (b, iterations)
 
     cand_ids = np.full((b, ef + m), NULL_ID, dtype=np.uint32)  # (b, ef + m)
-    cand_dists = np.full((b, ef + m), np.nan, dtype=np.float16)  # (b, ef + m)
+    cand_dists = np.full((b, ef + m), np.nan, dtype=np.bfloat16)  # (b, ef + m)
 
     cand_ids = cand_ids.at[:, 0].set(id_start)
     cand_dists = cand_dists.at[:, 0].set(

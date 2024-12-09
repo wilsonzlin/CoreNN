@@ -3,7 +3,7 @@ from index import calc_approx_medoid
 from index import init_random_graph
 from index import optimize_graph
 from jaxtyping import Array
-from jaxtyping import Float16
+from jaxtyping import BFloat16
 from jaxtyping import UInt32
 from util import NULL_ID
 import jax.numpy as np
@@ -23,12 +23,12 @@ args = parser.parse_args()
 n = args.n
 assert n < NULL_ID
 seed = args.seed
-vecs = rand.uniform(rand.PRNGKey(seed), (n, 2), dtype=np.float16, minval=-1, maxval=1)
+vecs = rand.uniform(rand.PRNGKey(seed), (n, 2), dtype=np.bfloat16, minval=-1, maxval=1)
 m = args.m
 ef = args.ef
 search_iter = args.iter
 update_batch_size = args.batch
-dist_thresh = np.float16(args.alpha)
+dist_thresh = np.bfloat16(args.alpha)
 
 medoid = calc_approx_medoid(
     vecs=vecs,
@@ -54,7 +54,7 @@ graph = optimize_graph(
 
 
 def plot_graph(
-    points: Float16[Array, "n 2"], edges: UInt32[Array, "n m"], filename: str
+    points: BFloat16[Array, "n 2"], edges: UInt32[Array, "n m"], filename: str
 ):
     plt.figure(figsize=(10, 10))
     plt.scatter(points[:, 0], points[:, 1], s=1, c="black")

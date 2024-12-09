@@ -3,7 +3,7 @@ from greedy_search_test import ref_greedy_search
 from index import init_random_graph
 from index import optimize_graph_batch
 from jaxtyping import Array
-from jaxtyping import Float16
+from jaxtyping import BFloat16
 from jaxtyping import UInt32
 from robust_prune_test import ref_compute_robust_pruned
 from typing import Dict
@@ -17,12 +17,12 @@ import jax.random as rand
 def ref_optimize_graph_batch(
     *,
     g: UInt32[Array, "n m"],
-    vecs: Float16[Array, "n d"],
+    vecs: BFloat16[Array, "n d"],
     batch_nodes: List[int],
     start: int,
     ef: int,
     search_iter: int,
-    dist_thresh: Float16[Array, ""],
+    dist_thresh: BFloat16[Array, ""],
     degree_bound: int,
 ):
     ref_g: List[List[int]] = g.tolist()
@@ -72,14 +72,14 @@ def test_optimize_graph_batch():
     degree_bound = 20
     d = 128
     seed = 0
-    dist_thresh = np.float16(1.1)
+    dist_thresh = np.bfloat16(1.1)
     ef = 80
     search_iter = 100
     batch_size = 10
     start = 0
     g = init_random_graph(n=n, m=degree_bound, seed=seed)
     vecs = rand.uniform(
-        rand.PRNGKey(seed), (n, d), dtype=np.float16, minval=-1, maxval=1
+        rand.PRNGKey(seed), (n, d), dtype=np.bfloat16, minval=-1, maxval=1
     )
     batch_nodes = arange(batch_size)
 

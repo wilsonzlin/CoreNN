@@ -1,7 +1,7 @@
 from functools import partial
 from jax import jit
 from jaxtyping import Array
-from jaxtyping import Float16
+from jaxtyping import BFloat16
 from jaxtyping import UInt32
 from typing import Tuple
 import jax.numpy as np
@@ -84,7 +84,7 @@ def select_nodes(
 # Handles NULL_ID indices.
 @jit
 def select_vecs(
-    vecs: Float16[Array, "n d"],
+    vecs: BFloat16[Array, "n d"],
     indices: np.ndarray,
 ):
     return vecs.at[indices].get(mode="fill", fill_value=np.nan)

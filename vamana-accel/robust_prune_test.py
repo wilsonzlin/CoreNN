@@ -2,7 +2,7 @@ from greedy_search import greedy_search
 from index import init_random_graph
 from jax.numpy.linalg import norm
 from jaxtyping import Array
-from jaxtyping import Float16
+from jaxtyping import BFloat16
 from robust_prune import compute_robust_pruned
 from typing import List
 from util import NULL_ID
@@ -11,10 +11,10 @@ import jax.random as rand
 
 
 def ref_compute_robust_pruned(
-    vecs: Float16[Array, "n d"],
+    vecs: BFloat16[Array, "n d"],
     p: int,
     candidates: List[int],
-    distance_threshold: Float16[Array, ""],
+    distance_threshold: BFloat16[Array, ""],
     degree_bound: int,
 ):
     candidates.sort(key=lambda n: norm(vecs[p] - vecs[n]))
@@ -45,13 +45,13 @@ def test_compute_robust_pruned():
     d = 128
     node = 0
     seed = 0
-    dist_thresh = np.float16(1.1)
+    dist_thresh = np.bfloat16(1.1)
     candidate_count = 70
     start = 0
     query = 7777
     g = init_random_graph(n=n, m=degree_bound, seed=seed)
     vecs = rand.uniform(
-        rand.PRNGKey(seed), (n, d), dtype=np.float16, minval=-1, maxval=1
+        rand.PRNGKey(seed), (n, d), dtype=np.bfloat16, minval=-1, maxval=1
     )
     candidates = greedy_search(
         vecs=vecs,

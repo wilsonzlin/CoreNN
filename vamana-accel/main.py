@@ -28,9 +28,10 @@ args = parser.parse_args()
 print("Loading vectors")
 dtype = np.dtype(args.dtype)
 with open(args.vectors, "rb") as f:
-    # Cast to float16 for faster calculations.
+    # Cast to bfloat16 for faster calculations.
+    # WARNING: Do not use float16, it only has a range of +/-65504, which means a max dist of +/-sqrt(65504) => +/-255 (as we use L2 norms) which is too small.
     vecs = (
-        np.frombuffer(f.read(), dtype=dtype).reshape((-1, args.dim)).astype(np.float16)
+        np.frombuffer(f.read(), dtype=dtype).reshape((-1, args.dim)).astype(np.bfloat16)
     )
 n, _ = vecs.shape
 assert n < NULL_ID
@@ -38,7 +39,7 @@ m = args.m
 ef = args.ef
 search_iter = args.iter or args.ef
 update_batch_size = args.batch
-dist_thresh = np.float16(args.alpha)
+dist_thresh = np.bfloat16(args.alpha)
 seed = 0
 medoid_sample_size = 10_000
 print(f"{n=} {m=} {ef=} {search_iter=} {update_batch_size=} {dist_thresh=}")
