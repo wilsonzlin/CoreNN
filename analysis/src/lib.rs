@@ -173,19 +173,13 @@ pub fn eval<'a, 'g: 'a, G: GreedySearchableSync<f32, f32> + Send + Sync>(
   }
 }
 
-pub fn export_index(ds: &Dataset, out_dir: &str, graph: &DashMap<Id, Vec<Id>>, medoid: Id) {
+pub fn export_index_sidecars(
+  ds: &Dataset,
+  out_dir: &str,
+  graph: &DashMap<Id, Vec<Id>>,
+  medoid: Id,
+) {
   let vecs = ds.read_vectors();
-
-  fs::write(
-    format!("dataset/{}/out/{out_dir}/graph.msgpack", ds.name),
-    rmp_serde::to_vec_named(&graph).unwrap(),
-  )
-  .unwrap();
-  fs::write(
-    format!("dataset/{}/out/{out_dir}/medoid.txt", ds.name),
-    medoid.to_string(),
-  )
-  .unwrap();
 
   let ann_dists = graph
     .par_iter()
@@ -225,6 +219,21 @@ pub fn export_index(ds: &Dataset, out_dir: &str, graph: &DashMap<Id, Vec<Id>>, m
       .collect_vec(),
   )
   .unwrap();
+}
+
+pub fn export_index(ds: &Dataset, out_dir: &str, graph: &DashMap<Id, Vec<Id>>, medoid: Id) {
+  fs::write(
+    format!("dataset/{}/out/{out_dir}/graph.msgpack", ds.name),
+    rmp_serde::to_vec_named(&graph).unwrap(),
+  )
+  .unwrap();
+  fs::write(
+    format!("dataset/{}/out/{out_dir}/medoid.txt", ds.name),
+    medoid.to_string(),
+  )
+  .unwrap();
+
+  export_index_sidecars(ds, out_dir, graph, medoid);
 }
 
 pub fn new_pb_with_template(len: impl ToPrimitive, template: &'static str) -> ProgressBar {

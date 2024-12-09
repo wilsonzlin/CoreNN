@@ -1,17 +1,13 @@
 #![feature(exit_status_error)]
 
-use ahash::HashMap;
-use ahash::HashMapExt;
 use clap::Parser;
 use dashmap::DashMap;
-use hnswlib_rs::HnswIndex;
-use libroxanne::common::metric_euclidean;
 use libroxanne::common::Id;
-use ndarray::ArrayView1;
-use roxanne_analysis::export_index;
+use roxanne_analysis::export_index_sidecars;
 use roxanne_analysis::Dataset;
 use std::fs;
-use std::fs::File;
+use std::fs::read;
+use std::fs::read_to_string;
 use std::process::Command;
 
 #[derive(Parser, Debug)]
@@ -67,4 +63,12 @@ fn main() {
     .unwrap()
     .exit_ok()
     .unwrap();
+
+  let graph: DashMap<Id, Vec<Id>> =
+    rmp_serde::from_slice(&read(format!("{out}/graph.msgpack")).unwrap()).unwrap();
+  let medoid = read_to_string(format!("{out}/medoid.txt"))
+    .unwrap()
+    .parse::<Id>()
+    .unwrap();
+  export_index_sidecars(&ds, &variant, &graph, medoid);
 }
