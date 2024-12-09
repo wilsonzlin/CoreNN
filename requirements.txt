@@ -4,6 +4,7 @@ jaxtyping
 matplotlib
 msgpack
 numpy
+pytest
 scikit-learn
 scipy
 seaborn
