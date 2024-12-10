@@ -10,6 +10,15 @@ import jax.numpy as np
 NULL_ID = np.uint32(np.iinfo(np.int32).max)
 
 
+def read_vecs(path: str, dim: int, dtype: np.dtype):
+    with open(path, "rb") as f:
+        # Cast to bfloat16 for faster calculations.
+        # WARNING: Do not use float16, it only has a range of +/-65504, which means a max dist of +/-sqrt(65504) => +/-255 (as we use L2 norms) which is too small.
+        return (
+            np.frombuffer(f.read(), dtype=dtype).reshape((-1, dim)).astype(np.bfloat16)
+        )
+
+
 # By default, np.arange returns int32 which causes a lot of issues with JAX.
 @partial(jit, static_argnames=["n"])
 def arange(n: int):
