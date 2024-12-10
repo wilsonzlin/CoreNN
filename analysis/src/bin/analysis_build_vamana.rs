@@ -6,6 +6,7 @@ use roxanne_analysis::new_pb;
 use roxanne_analysis::Dataset;
 use std::fs;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -55,6 +56,7 @@ fn main() {
   };
 
   let pb = new_pb(n);
+  let started = Instant::now();
   let index = InMemoryIndex::<f32, f32>::builder(
     (0..n).collect(),
     (0..n).map(|i| vecs.row(i).to_owned()).collect(),
@@ -68,8 +70,9 @@ fn main() {
   .precomputed_dists(precomputed_dists)
   .on_progress(|completed| pb.set_position(completed as u64))
   .build();
+  let build_secs = started.elapsed().as_secs_f64();
   pb.finish();
-  println!("Built graph");
+  println!("Built graph in {} seconds", build_secs);
 
   export_index(&ds, &out_dir, &index.graph, index.medoid);
 }

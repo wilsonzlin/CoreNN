@@ -1,6 +1,7 @@
 import hnswlib
 import numpy as np
 import os
+import time
 
 dataset = os.environ["DS"]
 out_dir = os.environ["OUT"]
@@ -18,7 +19,9 @@ index = hnswlib.Index("l2", dim)
 # Keep ef_construction the same as Vamana's search_list_cap and M as Vamana's degree bound.
 index.init_index(max_elements=n, ef_construction=ef, M=m)
 print("[build_hnsw] Indexing")
+started = time.time()
 index.add_items(mat, np.arange(n))
+print("[build_hnsw] Indexing took", time.time() - started, "seconds")
 print("[build_hnsw] Saving")
 index.save_index(f"dataset/{dataset}/out/{out_dir}/index.hnsw")
 print("[build_hnsw] All done!")
