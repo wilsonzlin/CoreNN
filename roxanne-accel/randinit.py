@@ -1,4 +1,5 @@
 from argparse import ArgumentParser
+from functools import partial
 from index import calc_approx_medoid
 from index import optimize_graph
 from jax.numpy.linalg import norm
@@ -35,11 +36,12 @@ assert n < NULL_ID
 m = args.m
 ef = args.ef
 it = args.iter
+batch = args.batch
 dist_thresh = np.bfloat16(args.alpha)
 seed = 0
 rk = rand.PRNGKey(seed)
 medoid_sample_size = 10_000
-print(f"{n=} {m=} {ef=} {it=} {dist_thresh=}")
+print(f"{n=} {m=} {ef=} {it=} {batch=} {dist_thresh=}")
 
 print("Calculating approx. medoid")
 medoid = calc_approx_medoid(
@@ -65,17 +67,42 @@ def optimize_graph_node(
     return candidates[sort_i][:m]
 
 
-optimize_graph = jax.vmap(optimize_graph_node, in_axes=(None, None, 0), out_axes=0)
+optimize_graph_batch = jax.jit(jax.vmap(optimize_graph_node, in_axes=(None, None, 0), out_axes=0))
 
-graph = rand.choice(rk, arange(n), shape=(n, ef), replace=True)
-dists = norm(vecs[:, None, :] - vecs[graph], axis=2)
-sort_i = np.argsort(dists, axis=1)
-graph = graph[arange(n)[:, None], sort_i]
+
+@partial(jax.jit, static_argnames=("n", "batch"))
+def optimize_graph(
+    *,
+    graph: UInt32[Array, "n m"],
+    vecs: BFloat16[Array, "n d"],
+    n: int,
+    batch: int,
+):
+    nodes = arange(n)
+    for start, end, b in batches(n, batch):
+        graph = graph.at[start:end].set(
+            optimize_graph_batch(graph, vecs, nodes[start:end])
+        )
+    return graph
+
+
+@partial(jax.jit, static_argnames=("n", "ef", "seed"))
+def init_graph(
+    *,
+    n: int,
+    ef: int,
+    seed: int,
+):
+    rk = rand.PRNGKey(seed)
+    graph = rand.choice(rk, arange(n), shape=(n, ef), replace=True)
+    return graph
+
+print("Initializing graph")
+graph = init_graph(n=n, ef=ef, seed=seed)
 for i in tqdm(range(it), desc="Optimizing graph"):
     # Batching (instead of just doing all nodes at once) not only helps with larger datasets and/or smaller GPUs,
     # but also increases chance of finding better neighbors within an iteration, as later batches may use previous intra-batch updates.
-    for start, end, b in batches(n, args.batch):
-        graph = optimize_graph(graph, vecs, arange(n)[start:end])
+    graph = optimize_graph(graph=graph, vecs=vecs, n=n, batch=batch)
 print("Final prune")
 graph = compute_robust_pruned(
     vecs=vecs,
