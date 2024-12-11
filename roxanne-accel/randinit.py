@@ -7,7 +7,7 @@ from jaxtyping import BFloat16
 from jaxtyping import UInt32
 from robust_prune import compute_robust_pruned
 from tqdm import tqdm
-from util import arange
+from util import arange, batches
 from util import NULL_ID
 from util import read_vecs
 import jax
@@ -24,6 +24,7 @@ parser.add_argument("--m", type=int, help="Degree bound")
 parser.add_argument("--ef", type=int, help="Search list cap")
 parser.add_argument("--iter", type=int, help="Update iterations")
 parser.add_argument("--alpha", type=float, help="Distance threshold", default=1.1)
+parser.add_argument("--batch", type=int, help="Batch size", default=1000)
 args = parser.parse_args()
 
 print("Loading vectors")
@@ -70,11 +71,11 @@ graph = rand.choice(rk, arange(n), shape=(n, ef), replace=True)
 dists = norm(vecs[:, None, :] - vecs[graph], axis=2)
 sort_i = np.argsort(dists, axis=1)
 graph = graph[arange(n)[:, None], sort_i]
-pb = tqdm(total=it, desc="Optimizing graph")
-for i in range(it):
-    graph = optimize_graph(graph, vecs, arange(n))
-    pb.update(1)
-pb.close()
+for i in tqdm(range(it), desc="Optimizing graph"):
+    # Batching (instead of just doing all nodes at once) not only helps with larger datasets and/or smaller GPUs,
+    # but also increases chance of finding better neighbors within an iteration, as later batches may use previous intra-batch updates.
+    for start, end, b in batches(n, args.batch):
+        graph = optimize_graph(graph, vecs, arange(n)[start:end])
 print("Final prune")
 graph = compute_robust_pruned(
     vecs=vecs,
