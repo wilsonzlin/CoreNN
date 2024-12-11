@@ -1,14 +1,14 @@
 from argparse import ArgumentParser
 from functools import partial
 from index import calc_approx_medoid
-from index import optimize_graph
 from jax.numpy.linalg import norm
 from jaxtyping import Array
 from jaxtyping import BFloat16
 from jaxtyping import UInt32
 from robust_prune import compute_robust_pruned
 from tqdm import tqdm
-from util import arange, batches
+from util import arange
+from util import batches
 from util import NULL_ID
 from util import read_vecs
 import jax
@@ -67,7 +67,9 @@ def optimize_graph_node(
     return candidates[sort_i][:m]
 
 
-optimize_graph_batch = jax.jit(jax.vmap(optimize_graph_node, in_axes=(None, None, 0), out_axes=0))
+optimize_graph_batch = jax.jit(
+    jax.vmap(optimize_graph_node, in_axes=(None, None, 0), out_axes=0)
+)
 
 
 @partial(jax.jit, static_argnames=("n", "batch"))
@@ -97,12 +99,16 @@ def init_graph(
     graph = rand.choice(rk, arange(n), shape=(n, ef), replace=True)
     return graph
 
+
 print("Initializing graph")
 graph = init_graph(n=n, ef=ef, seed=seed)
+print("Compiling optimizer")
+optimize_graph.lower(graph=graph, vecs=vecs, n=n, batch=batch).compile()
 for i in tqdm(range(it), desc="Optimizing graph"):
     # Batching (instead of just doing all nodes at once) not only helps with larger datasets and/or smaller GPUs,
     # but also increases chance of finding better neighbors within an iteration, as later batches may use previous intra-batch updates.
-    graph = optimize_graph(graph=graph, vecs=vecs, n=n, batch=batch)
+    # block_until_ready() for more accurate progress.
+    graph = optimize_graph(graph=graph, vecs=vecs, n=n, batch=batch).block_until_ready()
 print("Final prune")
 graph = compute_robust_pruned(
     vecs=vecs,
@@ -110,7 +116,7 @@ graph = compute_robust_pruned(
     cand_ids=graph,
     m=m,
     dist_thresh=dist_thresh,
-)
+).block_until_ready()
 print("Saving", graph.dtype, graph.shape)
 with open(args.out, "wb") as f:
     # WARNING: Do not convert to Python type and serialize as MessagePack/JSON/etc. as that conversion + serialization process will be extremely slow in Python.
