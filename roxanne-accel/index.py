@@ -79,6 +79,7 @@ def optimize_graph_batch(
     )  # (b, search_iter)
     # Always prune as we have more than m candidates, unless search_iter is set to a tiny value less than m which should never be done.
     new_neighbors = compute_robust_pruned(
+        # Include visited as there may already have backedges added from previous iterations.
         cand_ids=np.hstack([visited, graph[batch_nodes]]),
         dist_thresh=dist_thresh,
         m=m,

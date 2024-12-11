@@ -18,6 +18,7 @@ use ndarray::Array2;
 use ndarray::ArrayView2;
 use num::ToPrimitive;
 use ordered_float::OrderedFloat;
+use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
@@ -171,6 +172,30 @@ pub fn eval<'a, 'g: 'a, G: GreedySearchableSync<f32, f32> + Send + Sync>(
     query_metrics,
     total: q * k,
   }
+}
+
+pub fn read_graph_matrix(path: impl AsRef<Path>, (n, m): (usize, usize)) -> DashMap<Id, Vec<Id>> {
+  let raw = fs::read(path).unwrap();
+  let flat: &[u32] = cast_slice(&raw);
+  assert_eq!(flat.len(), n * m);
+  let graph: DashMap<Id, Vec<Id>> = DashMap::new();
+  flat
+    .into_par_iter()
+    .chunks(m)
+    .enumerate()
+    .for_each(|(id, row)| {
+      // NULL_ID is i32::MAX.
+      graph.insert(
+        id,
+        row
+          .into_iter()
+          .cloned()
+          .filter(|&v| v != i32::MAX as u32)
+          .map(|v| v as Id)
+          .collect(),
+      );
+    });
+  graph
 }
 
 pub fn export_index_sidecars(

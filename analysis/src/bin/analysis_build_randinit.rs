@@ -33,12 +33,12 @@ fn main() {
 
   let args = Args::parse();
 
-  let variant = format!("vamanaaccel-{}M-{}ef-{}a", args.m, args.ef, args.alpha);
+  let variant = format!("randinit-{}M-{}ef-{}a", args.m, args.ef, args.alpha);
   let out = format!("dataset/{}/out/{}", ds.name, variant);
   fs::create_dir_all(&out).unwrap();
 
   Command::new("python")
-    .arg("roxanne-accel/main.py")
+    .arg("roxanne-accel/randinit.py")
     .arg("--dtype")
     .arg("float32")
     .arg("--dim")
