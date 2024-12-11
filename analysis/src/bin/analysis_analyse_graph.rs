@@ -22,7 +22,8 @@ struct Args {
   #[arg(long, default_value_t = 1)]
   beam_width: usize,
 
-  #[arg(long)]
+  /// This must be at least 100 (as k=100). For consistent benchmarking results, this should be 100.
+  #[arg(long, default_value_t = 100)]
   search_list_cap: usize,
 
   #[arg(long)]

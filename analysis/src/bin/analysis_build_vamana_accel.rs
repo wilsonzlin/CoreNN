@@ -39,7 +39,7 @@ fn main() {
   fs::create_dir_all(&out).unwrap();
 
   Command::new("python")
-    .arg("vamana-accel/main.py")
+    .arg("roxanne-accel/main.py")
     .arg("--dtype")
     .arg("float32")
     .arg("--dim")

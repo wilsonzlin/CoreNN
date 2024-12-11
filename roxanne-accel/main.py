@@ -52,6 +52,8 @@ graph = init_random_graph(
     seed=seed,
 )
 if args.profile:
+    # It may be worth disabling the JIT for clearer profiling results.
+    # To do so, set JAX_DISABLE_JIT=1 in the environment.
     with jax.profiler.trace(args.profile, create_perfetto_link=True):
         print("Profiling")
         optimize_graph_batch(
