@@ -129,13 +129,18 @@ def optimize_graph_batched(
     Updating in batches is slower than all at once. Avoid this function when possible.
     """
     # Updating batches then writing back after each batch is even worse, as that requires a memory barrier/sync between batches.
-    new_graph = np.zeros(graph.shape, dtype=graph.dtype)
     nodes = arange(n)
-    for start, end, _ in batches(n, batch):
-        new_graph = new_graph.at[start:end].set(
+    assert n % batch == 0
+    num_batches = n % batch
+    def loop_body(i, new_graph):
+        start = i * batch
+        end = start + batch
+        return new_graph.at[start:end].set(
             optimize_graph_batch(graph, vecs, nodes[start:end], ef)
         )
-    return new_graph
+    new_graph = np.zeros(graph.shape, dtype=graph.dtype)
+    # Don't use Python loop as that will get unrolled and not reduce memory usage.
+    return jax.lax.fori_loop(0, num_batches, loop_body, new_graph)
 
 
 @partial(jax.jit, static_argnames=("n", "ef"))
