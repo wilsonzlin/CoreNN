@@ -40,16 +40,18 @@ print("Loading vectors")
 dtype = np.dtype(args.dtype)
 vecs = read_vecs(args.vectors, args.dim, dtype)
 n, _ = vecs.shape
-assert n < NULL_ID
 m = args.m
 m_max = args.m_max
 ef = args.ef
+assert 1 <= m <= m_max <= ef <= m_max * m_max <= n < NULL_ID
 it = args.iter
 batch = args.batch
-dist_thresh = np.bfloat16(args.alpha)
+assert batch is None or n % batch == 0
+alpha = args.alpha
+dist_thresh = np.bfloat16(alpha)
 seed = 0
 rk = rand.PRNGKey(seed)
-print(f"{n=} {m=} {m_max=} {ef=} {it=} {batch=} {dist_thresh=}")
+print(f"{n=} {m=} {m_max=} {ef=} {it=} {batch=} {alpha=}")
 
 
 def optimize_l0_graph_node(
