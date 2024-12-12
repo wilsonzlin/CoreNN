@@ -137,6 +137,22 @@ def optimize_graph(
     n, _ = graph.shape
     rk = rand.key(seed)
     nodes = rand.permutation(rk, n).astype(np.uint32)
+
+    print("Compiling optimizer")
+    for b in [update_batch_size, n % update_batch_size]:
+        if not b:
+            continue
+        optimize_graph_batch.lower(
+            graph=graph,
+            vecs=vecs,
+            batch_nodes=nodes[:b],
+            id_medoid=id_medoid,
+            m=m,
+            ef=ef,
+            search_iter=search_iter,
+            dist_thresh=dist_thresh,
+        ).compile()
+
     pb = tqdm(total=n, desc="Optimizing graph", unit="nodes")
     for start, end, b in batches(n, update_batch_size):
         batch_nodes = nodes[start:end]  # (b,)
@@ -151,5 +167,6 @@ def optimize_graph(
             dist_thresh=dist_thresh,
         )
         pb.update(b)
+    graph = graph.block_until_ready()
     pb.close()
     return graph

@@ -77,7 +77,7 @@ else:
         dist_thresh=dist_thresh,
         update_batch_size=update_batch_size,
         seed=seed,
-    ).block_until_ready()
+    )
     print("Saving")
     with open(args.out, "wb") as f:
         # WARNING: Do not convert to Python type and serialize as MessagePack/JSON/etc. as that conversion + serialization process will be extremely slow in Python.
