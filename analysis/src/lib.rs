@@ -1,3 +1,5 @@
+pub mod randinit;
+
 use ahash::HashMap;
 use ahash::HashSet;
 use bytemuck::cast_slice;
