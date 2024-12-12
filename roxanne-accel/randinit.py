@@ -126,17 +126,22 @@ def optimize_graph(
 @partial(jax.jit, static_argnames=("n", "m", "seed"))
 def init_graph(
     *,
+    vecs: BFloat16[Array, "n d"],
     n: int,
     m: int,
     seed: int,
 ):
     rk = rand.PRNGKey(seed)
-    graph = rand.choice(rk, arange(n), shape=(n, m), replace=True)
+    graph = rand.choice(rk, arange(n), shape=(n, m), replace=True) # (n, m)
+    # (n, 1, d) - (n, m, d) = (n, m, d)
+    dists = norm(vecs[:, None] - select_vecs(vecs, graph), axis=2)  # (n, m)
+    sort_i = np.argsort(dists, axis=1) # (n, m)
+    graph = graph[arange(n)[:, None], sort_i]  # (n, m)
     return graph
 
 
 print("Initializing graph")
-graph = init_graph(n=n, m=m_max, seed=seed)
+graph = init_graph(vecs=vecs, n=n, m=m_max, seed=seed)
 print("Compiling optimizer")
 opt_fn = optimize_graph.lower(graph=graph, vecs=vecs, n=n, ef=ef).compile()
 print(
