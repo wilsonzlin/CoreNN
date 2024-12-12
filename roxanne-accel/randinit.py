@@ -73,6 +73,7 @@ def optimize_l0_graph_node(
     # 2) Of those neighbors, which of their neighbors (i.e. neighbor-neighbors) to pick? All, first/closest X, random X.
     # Alternatively, it's possible to pick all/first-X/random-X across all neighbors and neighbor-neighbors as a flat list, which is what we're doing (first X).
     # TODO We also want to minimise getting stuck in local minima and not exploiting new/unseen/novel nodes i.e. keep picking the same nodes each iteration. (Although this is not 100% terrible as even seen nodes may have new neighbors between iterations.) Analyze this.
+    # TODO It appears that this strategy does often get trapped in local minima, where an extremely-high ef (i.e. degrading to brute force global pairwise scan) is required to overcome low accuracy.
     # We pick the first `ef` ordered in anti-diagonal order as that approximates the closest nodes in `candidates`,
     # which we hope will converge faster to the true nearest neighbors. (Once again this is a heuristic, not a guarantee.)
     candidates = flatten_by_anti_diagonals(candidates)  # (m * (1 + m),)
@@ -116,12 +117,11 @@ optimize_l0_graph_batch = jax.vmap(
 )
 
 
-@partial(jax.jit, static_argnames=("n", "ef", "batch"))
+@partial(jax.jit, static_argnames=("ef", "batch"))
 def optimize_l0_graph_batched(
     *,
     graph: UInt32[Array, "n m"],
     vecs: BFloat16[Array, "n d"],
-    n: int,
     ef: int,
     batch: int,
 ):
@@ -129,6 +129,7 @@ def optimize_l0_graph_batched(
     Updating in batches is slower than all at once. Avoid this function when possible.
     """
     # Updating batches then writing back after each batch is even worse, as that requires a memory barrier/sync between batches.
+    n, _ = graph.shape
     nodes = arange(n)
     assert n % batch == 0
     num_batches = n // batch
@@ -144,14 +145,14 @@ def optimize_l0_graph_batched(
     return jax.lax.fori_loop(0, num_batches, loop_body, new_graph, unroll=False)
 
 
-@partial(jax.jit, static_argnames=("n", "ef"))
+@partial(jax.jit, static_argnames=("ef",))
 def optimize_l0_graph(
     *,
     graph: UInt32[Array, "n m"],
     vecs: BFloat16[Array, "n d"],
-    n: int,
     ef: int,
 ):
+    n, _ = graph.shape
     return optimize_l0_graph_batch(graph, vecs, arange(n), ef)
 
 
@@ -176,10 +177,10 @@ print("Initializing L0 graph")
 graph = init_l0_graph(vecs=vecs, n=n, m=m_max, seed=seed)
 print("Compiling optimizer")
 if batch is None:
-    opt_fn = optimize_l0_graph.lower(graph=graph, vecs=vecs, n=n, ef=ef).compile()
+    opt_fn = optimize_l0_graph.lower(graph=graph, vecs=vecs, f=ef).compile()
 else:
     opt_fn = optimize_l0_graph_batched.lower(
-        graph=graph, vecs=vecs, n=n, ef=ef, batch=batch
+        graph=graph, vecs=vecs, ef=ef, batch=batch
     ).compile()
 for i in tqdm(range(it), desc="Optimizing L0 graph"):
     # block_until_ready() for more accurate progress.
@@ -232,14 +233,43 @@ for i in range(1, math.floor(math.log(n, m)) + 1):
 entry_node = shuffled_nodes[0]
 
 
+@partial(jax.jit, static_argnames=("m", "batch"))
+def compute_robust_prune_batched(
+    *,
+    graph: UInt32[Array, "n m_max"],
+    vecs: BFloat16[Array, "n d"],
+    m: int,
+    batch: int,
+):
+    n, m_max = graph.shape
+    nodes = arange(n)
+    assert n % batch == 0
+    num_batches = n // batch
+
+    def loop_body(i, new_graph):
+        start = i * batch
+        batch_nodes = jax.lax.dynamic_slice(nodes, (start,), (batch,))
+        batch_cand_ids = jax.lax.dynamic_slice(graph, (start, 0), (batch, m_max))
+        batch_res = compute_robust_pruned(
+            vecs=vecs,
+            node_ids=batch_nodes,
+            cand_ids=batch_cand_ids,
+            m=m,
+            dist_thresh=dist_thresh,
+        )
+        return jax.lax.dynamic_update_slice(new_graph, batch_res, (start, 0))
+
+    new_graph = np.zeros(shape=(n, m), dtype=np.uint32)
+    # Don't use Python loop as that will get unrolled and not reduce memory usage.
+    return jax.lax.fori_loop(0, num_batches, loop_body, new_graph, unroll=False)
+
+# RobustPrune isn't just for accuracy, it also removes redundant edges for faster query times.
 print("Final prune")
-# TODO Batch
-graph = compute_robust_pruned(
+graph = compute_robust_prune_batched(
+    graph=graph,
     vecs=vecs,
-    node_ids=arange(n),
-    cand_ids=graph,
     m=m,
-    dist_thresh=dist_thresh,
+    batch=batch or n,
 ).block_until_ready()
 print("Saving", graph.dtype, graph.shape)
 with open(args.out, "wb") as f:
