@@ -74,27 +74,29 @@ def optimize_graph_node(
     candidates = flatten_by_anti_diagonals(candidates)  # (m * (1 + m),)
     # Filter self-edges.
     candidates = np.where(candidates == node, NULL_ID, candidates)
+    # Add a NULL_ID to ensure our later `np.argmax(candidates == NULL_ID)` doesn't return a false positive.
     # Unfortunately, the JAX implementation of np.unique(return_index=True) does not pad the returned indices with NULL_ID,
     # but instead with the index of the smallest unique value repeatedly.
-    #           0  1  2     3  4     5  6  7  8   9
-    # Example: [1, 3, 5, NULL, 5, NULL, 2, 4, 1, -1]
-    candidates = np.hstack([candidates.astype(np.int32), np.int32(-1)])
+    #           0  1  2     3  4     5  6  7  8     9  10
+    # Example: [1, 3, 5, NULL, 5, NULL, 2, 4, 1, NULL, -1]
+    candidates = np.hstack([candidates.astype(np.int32), NULL_ID, np.int32(-1)])
     # return_index to preserve ordering. We can't limit size=ef as that doesn't guarantee closest ef elements.
-    # Example: [9, 0, 6, 1, 7, 2, 3, 9, 9, 9]
+    # Example: [9, 0, 6, 1, 7, 2, 3, 9, 9, 9, 9]
     uniq_i = np.unique(
         candidates, return_index=True, size=candidates.shape[0], fill_value=NULL_ID
     )[1]
     # Index of the first NULL. We only need the first because np.unique() always returns the first index for it in `uniq_i`.
+    # Since we previously inserted a NULL_ID, this will never be a false positive (i.e. 0 when there are no NULL_IDs)
     cand_null_i = np.argmax(candidates == NULL_ID)
     # Remove the index of the first NULL so it gets sorted to the end and unlikely to be picked.
-    # Example: [9, 0, 6, 1, 7, 2, NULL, 9, 9, 9]
+    # Example: [9, 0, 6, 1, 7, 2, NULL, 9, 9, 9, 9]
     uniq_i = np.where(uniq_i != cand_null_i, uniq_i, NULL_ID)
     # Sort the indices so we get back our original optimal candidates order, now with duplicates filtered.
-    # Example: [0, 1, 2, 6, 7, 9, 9, 9, 9, NULL]
+    # Example: [0, 1, 2, 6, 7, 9, 9, 9, 9, 9, NULL]
     uniq_i = np.sort(uniq_i)
-    # Drop our dummy -1. Now, attempts to access it should return NULL_ID if used with `.get("fill", NULL_ID)`.
+    # Drop our dummy NULL and -1. Now, attempts to access them should return NULL_ID if used with `.get("fill", NULL_ID)`.
     # Example: [1, 3, 5, NULL, 5, NULL, 2, 4, 1]
-    candidates = candidates[:-1].astype(np.uint32)
+    candidates = candidates[:-2].astype(np.uint32)
     # Retrieve our original candidates in the optimal order, without duplicates or self-edges.
     # Example: [1, 3, 5, 2, 4, NULL, NULL, NULL, NULL, NULL]
     candidates = candidates.at[uniq_i].get(mode="fill", fill_value=NULL_ID)
