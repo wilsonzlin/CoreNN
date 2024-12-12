@@ -23,6 +23,9 @@ struct Args {
 
   #[arg(long)]
   alpha: f64,
+
+  #[arg(long)]
+  batch: Option<usize>,
 }
 
 fn main() {
@@ -37,7 +40,8 @@ fn main() {
   let out = format!("dataset/{}/out/{}", ds.name, variant);
   create_dir_all(&out).unwrap();
 
-  Command::new("python")
+  let mut cmd = Command::new("python");
+  cmd
     .arg("roxanne-accel/randinit.py")
     .arg("--dtype")
     .arg("float32")
@@ -59,11 +63,11 @@ fn main() {
     .arg(format!("{out}/level_graphs.msgpack"))
     .arg("--out-medoid")
     .arg(format!("{out}/medoid.txt"))
-    .arg(format!("dataset/{}/vectors.bin", ds.name))
-    .status()
-    .unwrap()
-    .exit_ok()
-    .unwrap();
+    .arg(format!("dataset/{}/vectors.bin", ds.name));
+  if let Some(batch) = args.batch {
+    cmd.arg("--batch").arg(batch.to_string());
+  }
+  cmd.status().unwrap().exit_ok().unwrap();
 
   export_randinit(&ds, &out, &variant, args.m);
 }

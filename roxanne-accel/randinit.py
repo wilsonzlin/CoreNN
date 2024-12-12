@@ -30,6 +30,9 @@ parser.add_argument("--m", type=int, help="Degree bound")
 parser.add_argument("--m-max", type=int, help="Maximum degree bound")
 parser.add_argument("--ef", type=int, help="Search list cap")
 parser.add_argument("--iter", type=int, help="Update iterations")
+parser.add_argument(
+    "--batch", type=int, help="Optionally batch; slower but uses less memory"
+)
 parser.add_argument("--alpha", type=float, help="Distance threshold", default=1.1)
 args = parser.parse_args()
 
@@ -42,10 +45,11 @@ m = args.m
 m_max = args.m_max
 ef = args.ef
 it = args.iter
+batch = args.batch
 dist_thresh = np.bfloat16(args.alpha)
 seed = 0
 rk = rand.PRNGKey(seed)
-print(f"{n=} {m=} {m_max=} {ef=} {it=} {dist_thresh=}")
+print(f"{n=} {m=} {m_max=} {ef=} {it=} {batch=} {dist_thresh=}")
 
 
 def optimize_graph_node(
@@ -112,6 +116,28 @@ optimize_graph_batch = jax.vmap(
 )
 
 
+@partial(jax.jit, static_argnames=("n", "ef", "batch"))
+def optimize_graph_batched(
+    *,
+    graph: UInt32[Array, "n m"],
+    vecs: BFloat16[Array, "n d"],
+    n: int,
+    ef: int,
+    batch: int,
+):
+    """
+    Updating in batches is slower than all at once. Avoid this function when possible.
+    """
+    # Updating batches then writing back after each batch is even worse, as that requires a memory barrier/sync between batches.
+    new_graph = np.zeros(graph.shape, dtype=graph.dtype)
+    nodes = arange(n)
+    for start, end, _ in batches(n, batch):
+        new_graph = new_graph.at[start:end].set(
+            optimize_graph_batch(graph, vecs, nodes[start:end], ef)
+        )
+    return new_graph
+
+
 @partial(jax.jit, static_argnames=("n", "ef"))
 def optimize_graph(
     *,
@@ -134,10 +160,10 @@ def init_graph(
     seed: int,
 ):
     rk = rand.PRNGKey(seed)
-    graph = rand.choice(rk, arange(n), shape=(n, m), replace=True) # (n, m)
+    graph = rand.choice(rk, arange(n), shape=(n, m), replace=True)  # (n, m)
     # (n, 1, d) - (n, m, d) = (n, m, d)
     dists = norm(vecs[:, None] - select_vecs(vecs, graph), axis=2)  # (n, m)
-    sort_i = np.argsort(dists, axis=1) # (n, m)
+    sort_i = np.argsort(dists, axis=1)  # (n, m)
     graph = graph[arange(n)[:, None], sort_i]  # (n, m)
     return graph
 
@@ -145,14 +171,18 @@ def init_graph(
 print("Initializing graph")
 graph = init_graph(vecs=vecs, n=n, m=m_max, seed=seed)
 print("Compiling optimizer")
-opt_fn = optimize_graph.lower(graph=graph, vecs=vecs, n=n, ef=ef).compile()
+if batch is None:
+    opt_fn = optimize_graph.lower(graph=graph, vecs=vecs, n=n, ef=ef).compile()
+else:
+    opt_fn = optimize_graph_batched.lower(
+        graph=graph, vecs=vecs, n=n, ef=ef, batch=batch
+    ).compile()
 print(
     "Optimization cost per iteration:",
     opt_fn.cost_analysis()[0]["flops"] / 1e12,
     "TFLOPS",
 )
 for i in tqdm(range(it), desc="Optimizing graph"):
-    # Batching (instead of just doing all nodes at once) helps with larger datasets and/or smaller GPUs.
     # block_until_ready() for more accurate progress.
     graph = opt_fn(graph=graph, vecs=vecs).block_until_ready()
 
