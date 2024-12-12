@@ -181,11 +181,6 @@ else:
     opt_fn = optimize_graph_batched.lower(
         graph=graph, vecs=vecs, n=n, ef=ef, batch=batch
     ).compile()
-print(
-    "Optimization cost per iteration:",
-    opt_fn.cost_analysis()[0]["flops"] / 1e12,
-    "TFLOPS",
-)
 for i in tqdm(range(it), desc="Optimizing graph"):
     # block_until_ready() for more accurate progress.
     graph = opt_fn(graph=graph, vecs=vecs).block_until_ready()
