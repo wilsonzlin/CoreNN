@@ -8,6 +8,7 @@ from robust_prune import compute_robust_pruned
 from tqdm import tqdm
 from util import arange
 from util import batches
+from util import flatten_by_anti_diagonals
 from util import NULL_ID
 from util import read_vecs
 from util import select_nodes
@@ -26,8 +27,8 @@ parser.add_argument("--out-medoid", type=str, help="Medoid output path")
 parser.add_argument("--dtype", type=str, help="Data type name e.g. float32")
 parser.add_argument("--dim", type=int, help="Vector dimensions")
 parser.add_argument("--m", type=int, help="Degree bound")
+parser.add_argument("--m-max", type=int, help="Maximum degree bound")
 parser.add_argument("--ef", type=int, help="Search list cap")
-parser.add_argument("--beam", type=int, help="Beam width (<= ef)", default=1)
 parser.add_argument("--iter", type=int, help="Update iterations")
 parser.add_argument("--alpha", type=float, help="Distance threshold", default=1.1)
 args = parser.parse_args()
@@ -38,29 +39,49 @@ vecs = read_vecs(args.vectors, args.dim, dtype)
 n, _ = vecs.shape
 assert n < NULL_ID
 m = args.m
+m_max = args.m_max
 ef = args.ef
-beam = args.beam
 it = args.iter
 dist_thresh = np.bfloat16(args.alpha)
 seed = 0
 rk = rand.PRNGKey(seed)
-print(f"{n=} {m=} {ef=} {beam=} {it=} {dist_thresh=}")
+print(f"{n=} {m=} {m_max=} {ef=} {it=} {dist_thresh=}")
 
 
 def optimize_graph_node(
     graph: UInt32[Array, "n m"],
     vecs: BFloat16[Array, "n d"],
     node: UInt32[Array, ""],
-    beam: int,
+    ef: int,
 ):
     _, m = graph.shape
     neighbors = graph[node]  # (m,)
     # Neighbors can be NULL_ID due to np.unique after a few iterations.
-    neighbor_neighbors = select_nodes(graph, neighbors[:beam]).flatten()  # (m * beam,)
-    candidates = np.concatenate([neighbors, neighbor_neighbors])  # (c = m + m * beam,)
-    candidates = np.unique(candidates, size=candidates.size, fill_value=NULL_ID)  # (c,)
-    dists = norm(vecs[node] - select_vecs(vecs, candidates), axis=1)  # (c,)
-    # Sort (instead of partition) as beam depends on [:beam] being ordered.
+    neighbor_neighbors = select_nodes(graph, neighbors)  # (m, m)
+    candidates = np.vstack([neighbors[None], neighbor_neighbors])  # (1 + m, m)
+    # NOTE: Esp. in high dim. spaces, it's possible for a far neighbor N to have its neighbor U actually be closer to us than N,
+    # so this is merely a heuristic, that we hope is better than these other strategies:
+    # - Randomly pick X neighbor-neighbors of **every** neighbor (even far ones).
+    # - Pick the first (i.e. closest) X neighbor-neighbors of **every** neighbor (even far ones).
+    # - Pick all neighbor-neighbors of the first (i.e. closest) X neighbors.
+    # Basically, strategies have two axes:
+    # 1) Which neighbors to pick? All, first/closest X, random X.
+    # 2) Of those neighbors, which of their neighbors (i.e. neighbor-neighbors) to pick? All, first/closest X, random X.
+    # Alternatively, it's possible to pick all/first-X/random-X across all neighbors and neighbor-neighbors as a flat list, which is what we're doing (first X).
+    # TODO We also want to minimise getting stuck in local minima and not exploiting new/unseen/novel nodes i.e. keep picking the same nodes each iteration. Analyze this.
+    # We pick the first `ef` ordered in anti-diagonal order as that approximates the closest nodes in `candidates`,
+    # which we hope will converge faster to the true nearest neighbors. (Once again this is a heuristic, not a guarantee.)
+    candidates = flatten_by_anti_diagonals(candidates)  # (m * (1 + m),)
+    # Filter self-edges.
+    candidates = np.where(candidates == node, NULL_ID, candidates)
+    # return_index to preserve ordering. We can't limit size=ef as that doesn't guarantee closest ef elements.
+    uniq_i = np.unique(
+        candidates, return_index=True, size=candidates.shape[0], fill_value=NULL_ID
+    )[1]
+    candidates = candidates.at[np.sort(uniq_i)].get(mode="fill", fill_value=NULL_ID)[
+        :ef
+    ]  # (ef,)
+    dists = norm(vecs[node] - select_vecs(vecs, candidates), axis=1)  # (ef,)
     sort_i = np.argsort(dists)
     return candidates[sort_i[:m]]
 
@@ -70,35 +91,35 @@ optimize_graph_batch = jax.vmap(
 )
 
 
-@partial(jax.jit, static_argnames=("n", "beam"))
+@partial(jax.jit, static_argnames=("n", "ef"))
 def optimize_graph(
     *,
     graph: UInt32[Array, "n m"],
     vecs: BFloat16[Array, "n d"],
     n: int,
-    beam: int,
+    ef: int,
 ):
     # Updating in batches is slower than all at once.
     # Updating batches then writing back after each batch is even worse, as that requires a memory barrier/sync between batches.
-    return optimize_graph_batch(graph, vecs, arange(n), beam)
+    return optimize_graph_batch(graph, vecs, arange(n), ef)
 
 
-@partial(jax.jit, static_argnames=("n", "ef", "seed"))
+@partial(jax.jit, static_argnames=("n", "m", "seed"))
 def init_graph(
     *,
     n: int,
-    ef: int,
+    m: int,
     seed: int,
 ):
     rk = rand.PRNGKey(seed)
-    graph = rand.choice(rk, arange(n), shape=(n, ef), replace=True)
+    graph = rand.choice(rk, arange(n), shape=(n, m), replace=True)
     return graph
 
 
 print("Initializing graph")
-graph = init_graph(n=n, ef=ef, seed=seed)
+graph = init_graph(n=n, m=m_max, seed=seed)
 print("Compiling optimizer")
-opt_fn = optimize_graph.lower(graph=graph, vecs=vecs, n=n, beam=beam).compile()
+opt_fn = optimize_graph.lower(graph=graph, vecs=vecs, n=n, ef=ef).compile()
 print(
     "Optimization cost per iteration:",
     opt_fn.cost_analysis()[0]["flops"] / 1e12,

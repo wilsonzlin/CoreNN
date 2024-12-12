@@ -1,6 +1,5 @@
 #![feature(exit_status_error)]
 
-use ahash::HashMapExt;
 use clap::Parser;
 use roxanne_analysis::randinit::export_randinit;
 use roxanne_analysis::Dataset;
@@ -14,19 +13,16 @@ struct Args {
   m: usize,
 
   #[arg(long)]
+  m_max: usize,
+
+  #[arg(long)]
   ef: usize,
 
   #[arg(long)]
   iter: usize,
 
   #[arg(long)]
-  beam: usize,
-
-  #[arg(long)]
   alpha: f64,
-
-  #[arg(long)]
-  batch: usize,
 }
 
 fn main() {
@@ -35,8 +31,8 @@ fn main() {
   let args = Args::parse();
 
   let variant = format!(
-    "randinit-{}M-{}ef-{}iter-{}a",
-    args.m, args.ef, args.iter, args.alpha
+    "randinit-{}M-{}Mmax-{}ef-{}iter-{}a",
+    args.m, args.m_max, args.ef, args.iter, args.alpha
   );
   let out = format!("dataset/{}/out/{}", ds.name, variant);
   create_dir_all(&out).unwrap();
@@ -49,16 +45,14 @@ fn main() {
     .arg(ds.info.dim.to_string())
     .arg("--m")
     .arg(args.m.to_string())
+    .arg("--m-max")
+    .arg(args.m_max.to_string())
     .arg("--ef")
     .arg(args.ef.to_string())
     .arg("--iter")
     .arg(args.iter.to_string())
-    .arg("--beam")
-    .arg(args.beam.to_string())
     .arg("--alpha")
     .arg(args.alpha.to_string())
-    .arg("--batch")
-    .arg(args.batch.to_string())
     .arg("--out")
     .arg(format!("{out}/graph.mat"))
     .arg("--out-levels")

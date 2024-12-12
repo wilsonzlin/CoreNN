@@ -25,6 +25,29 @@ def arange(n: int):
     return np.arange(n, dtype=np.uint32)
 
 
+def flatten_by_anti_diagonals(arr):
+    """
+    Flatten a 2D array by anti-diagonals.
+    Example:
+      [[1 2 3]
+       [4 5 6]
+       [7 8 9]]
+    will be flattened as:
+      [1 4 2 7 5 3 8 6 9]
+    """
+    # arr is of shape (N, M)
+    N, M = arr.shape
+    i, j = np.indices((N, M))
+    diag_sum = i + j
+
+    # We want to sort first by diag_sum (ascending),
+    # and then by i (descending) for elements with the same diag_sum.
+    # Sorting by i descending is equivalent to sorting by -i ascending.
+    order = np.lexsort((-i.ravel(), diag_sum.ravel()))
+
+    return arr.ravel()[order]
+
+
 def batches(n: int, sz: int):
     for start in range(0, n, sz):
         end = min(start + sz, n)
