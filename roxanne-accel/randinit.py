@@ -134,9 +134,9 @@ def optimize_graph_batched(
     num_batches = n % batch
     def loop_body(i, new_graph):
         start = i * batch
-        batch_nodes = jax.lax.dynamic_slice(nodes, (start,), (batch,))
+        batch_nodes = jax.lax.dynamic_slice(nodes, (start, 0), (batch, ef))
         batch_res = optimize_graph_batch(graph, vecs, batch_nodes, ef)
-        return jax.lax.dynamic_update_slice(new_graph, batch_res, (start,))
+        return jax.lax.dynamic_update_slice(new_graph, batch_res, (start, 0))
     new_graph = np.zeros(graph.shape, dtype=graph.dtype)
     # Don't use Python loop as that will get unrolled and not reduce memory usage.
     return jax.lax.fori_loop(0, num_batches, loop_body, new_graph)
