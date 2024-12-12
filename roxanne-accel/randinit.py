@@ -52,7 +52,7 @@ rk = rand.PRNGKey(seed)
 print(f"{n=} {m=} {m_max=} {ef=} {it=} {batch=} {dist_thresh=}")
 
 
-def optimize_graph_node(
+def optimize_l0_graph_node(
     graph: UInt32[Array, "n m"],
     vecs: BFloat16[Array, "n d"],
     node: UInt32[Array, ""],
@@ -111,13 +111,13 @@ def optimize_graph_node(
     return candidates[sort_i[:m]]
 
 
-optimize_graph_batch = jax.vmap(
-    optimize_graph_node, in_axes=(None, None, 0, None), out_axes=0
+optimize_l0_graph_batch = jax.vmap(
+    optimize_l0_graph_node, in_axes=(None, None, 0, None), out_axes=0
 )
 
 
 @partial(jax.jit, static_argnames=("n", "ef", "batch"))
-def optimize_graph_batched(
+def optimize_l0_graph_batched(
     *,
     graph: UInt32[Array, "n m"],
     vecs: BFloat16[Array, "n d"],
@@ -131,32 +131,32 @@ def optimize_graph_batched(
     # Updating batches then writing back after each batch is even worse, as that requires a memory barrier/sync between batches.
     nodes = arange(n)
     assert n % batch == 0
-    num_batches = n % batch
+    num_batches = n // batch
+
     def loop_body(i, new_graph):
         start = i * batch
         batch_nodes = jax.lax.dynamic_slice(nodes, (start,), (batch,))
-        batch_res = optimize_graph_batch(graph, vecs, batch_nodes, ef)
+        batch_res = optimize_l0_graph_batch(graph, vecs, batch_nodes, ef)
         return jax.lax.dynamic_update_slice(new_graph, batch_res, (start, 0))
-    new_graph = np.zeros(graph.shape, dtype=graph.dtype)
+
+    new_graph = np.zeros_like(graph)
     # Don't use Python loop as that will get unrolled and not reduce memory usage.
     return jax.lax.fori_loop(0, num_batches, loop_body, new_graph, unroll=False)
 
 
 @partial(jax.jit, static_argnames=("n", "ef"))
-def optimize_graph(
+def optimize_l0_graph(
     *,
     graph: UInt32[Array, "n m"],
     vecs: BFloat16[Array, "n d"],
     n: int,
     ef: int,
 ):
-    # Updating in batches is slower than all at once.
-    # Updating batches then writing back after each batch is even worse, as that requires a memory barrier/sync between batches.
-    return optimize_graph_batch(graph, vecs, arange(n), ef)
+    return optimize_l0_graph_batch(graph, vecs, arange(n), ef)
 
 
 @partial(jax.jit, static_argnames=("n", "m", "seed"))
-def init_graph(
+def init_l0_graph(
     *,
     vecs: BFloat16[Array, "n d"],
     n: int,
@@ -172,18 +172,38 @@ def init_graph(
     return graph
 
 
-print("Initializing graph")
-graph = init_graph(vecs=vecs, n=n, m=m_max, seed=seed)
+print("Initializing L0 graph")
+graph = init_l0_graph(vecs=vecs, n=n, m=m_max, seed=seed)
 print("Compiling optimizer")
 if batch is None:
-    opt_fn = optimize_graph.lower(graph=graph, vecs=vecs, n=n, ef=ef).compile()
+    opt_fn = optimize_l0_graph.lower(graph=graph, vecs=vecs, n=n, ef=ef).compile()
 else:
-    opt_fn = optimize_graph_batched.lower(
+    opt_fn = optimize_l0_graph_batched.lower(
         graph=graph, vecs=vecs, n=n, ef=ef, batch=batch
     ).compile()
-for i in tqdm(range(it), desc="Optimizing graph"):
+for i in tqdm(range(it), desc="Optimizing L0 graph"):
     # block_until_ready() for more accurate progress.
     graph = opt_fn(graph=graph, vecs=vecs).block_until_ready()
+
+
+@partial(jax.jit, static_argnames=("level_m",))
+def build_level_graph(
+    *,
+    level_m: int,
+    level_nodes: UInt32[Array, "n"],
+    level_vecs: BFloat16[Array, "n d"],
+):
+    (level_size,) = level_nodes.shape
+    level_g = np.full((level_size, level_m), NULL_ID, dtype=np.uint32)
+    # Avoid OOM in larger levels.
+    # TODO Use batch param.
+    for start, end, _ in batches(level_size, 1000):
+        batch_nodes = level_nodes[start:end]
+        batch_vecs = vecs[batch_nodes]
+        dists = norm(batch_vecs[:, None] - level_vecs, axis=2)
+        sort_i = np.argsort(dists, axis=1)[:, :level_m]
+        level_g = level_g.at[start:end].set(level_nodes[sort_i])
+    return level_g
 
 
 # Since descending levels must have at least the above nodes, we sample by using a prefix of a specific fixed permutation of indices.
@@ -193,16 +213,13 @@ for i in range(1, math.floor(math.log(n, m)) + 1):
     level_size = math.floor(n * (m**-i) * (1 - 1 / m))
     print(f"Level {i}: {level_size} nodes")
     level_m = min(m, level_size)
-    level_g = np.full((level_size, level_m), NULL_ID, dtype=np.uint32)
     level_nodes = shuffled_nodes[:level_size]
     level_vecs = vecs[level_nodes]
-    # Avoid OOM in larger levels.
-    for start, end, batch_size in batches(level_size, 1000):
-        batch_nodes = level_nodes[start:end]
-        batch_vecs = vecs[batch_nodes]
-        dists = norm(batch_vecs[:, None] - level_vecs, axis=2)
-        sort_i = np.argsort(dists, axis=1)[:, :level_m]
-        level_g = level_g.at[start:end].set(level_nodes[sort_i])
+    level_g = build_level_graph(
+        level_m=level_m,
+        level_nodes=level_nodes,
+        level_vecs=level_vecs,
+    )
     level_graphs.append(
         {
             "level": i,
@@ -216,6 +233,7 @@ entry_node = shuffled_nodes[0]
 
 
 print("Final prune")
+# TODO Batch
 graph = compute_robust_pruned(
     vecs=vecs,
     node_ids=arange(n),
