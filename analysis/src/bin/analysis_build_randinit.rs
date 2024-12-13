@@ -23,7 +23,7 @@ struct Args {
   ef: usize,
 
   #[arg(long)]
-  it: String,
+  it: usize,
 
   #[arg(long)]
   alpha: f64,
@@ -63,15 +63,11 @@ fn main() {
     .arg("--ef")
     .arg(args.ef.to_string())
     .arg("--it")
-    .arg(args.it)
+    .arg(args.it.to_string())
     .arg("--alpha")
     .arg(args.alpha.to_string())
     .arg("--out")
-    .arg(format!("{out}/graph.mat"))
-    .arg("--out-levels")
-    .arg(format!("{out}/level_graphs.msgpack"))
-    .arg("--out-medoid")
-    .arg(format!("{out}/medoid.txt"))
+    .arg(out.clone())
     .arg("--eval-q")
     .arg(format!("dataset/{}/queries.bin", ds.name))
     .arg("--eval-r")

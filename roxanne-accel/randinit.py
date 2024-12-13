@@ -27,8 +27,6 @@ def optimize_l0_graph_node(
     vecs: BFloat16[Array, "n d"],
     node: UInt32[Array, ""],
     ef: int,
-    strat: str,
-    rk,
 ):
     _, m = graph.shape
     neighbors = graph[node]  # (m,)
@@ -43,15 +41,6 @@ def optimize_l0_graph_node(
     # 1) Which neighbors to pick? All, first/closest X, random X.
     # 2) Of those neighbors, which of their neighbors (i.e. neighbor-neighbors) to pick? All, first/closest X, random X.
     neighbor_neighbors = neighbor_neighbors.flatten()  # (m * (1 + m),)
-    # This should only affect neighbor-neighbors; our current neighbors and backedges should always be used.
-    if strat == "F":
-        pass
-    elif strat == "L":
-        neighbor_neighbors = np.flip(neighbor_neighbors)
-    elif strat == "R":
-        neighbor_neighbors = rand.permutation(rk, neighbor_neighbors)
-    else:
-        assert False
     # Add backedges as candidates (and prioritise them by adding to the front).
     candidates = np.hstack(
         [neighbors, backedges[node], neighbor_neighbors]
@@ -95,7 +84,7 @@ def optimize_l0_graph_node(
 
 
 optimize_l0_graph_batch = jax.vmap(
-    optimize_l0_graph_node, in_axes=(None, None, None, 0, None, None, None), out_axes=0
+    optimize_l0_graph_node, in_axes=(None, None, None, 0, None), out_axes=0
 )
 
 
@@ -115,7 +104,7 @@ def calc_backedges(
     return backedges[sort_i]
 
 
-@partial(jax.jit, static_argnames=["ef", "r", "batch", "strat"])
+@partial(jax.jit, static_argnames=["ef", "r", "batch"])
 def optimize_l0_graph_batched(
     *,
     graph: UInt32[Array, "n m"],
@@ -123,8 +112,6 @@ def optimize_l0_graph_batched(
     ef: int,
     r: int,
     batch: int,
-    strat: str,
-    rk,
 ):
     n, _ = graph.shape
     nodes = arange(n)
@@ -144,9 +131,7 @@ def optimize_l0_graph_batched(
     def loop_body(i, new_graph):
         start = i * batch
         batch_nodes = jax.lax.dynamic_slice(nodes, (start,), (batch,))
-        batch_res = optimize_l0_graph_batch(
-            graph, backedges, vecs, batch_nodes, ef, strat, rk
-        )
+        batch_res = optimize_l0_graph_batch(graph, backedges, vecs, batch_nodes, ef)
         return jax.lax.dynamic_update_slice(new_graph, batch_res, (start, 0))
 
     new_graph = np.zeros_like(graph)
@@ -246,16 +231,14 @@ intersect_count_batch = jax.jit(jax.vmap(intersect_count, in_axes=(0, 0), out_ax
 def main():
     parser = ArgumentParser(description="Build a RandInit graph using the GPU.")
     parser.add_argument("vectors", type=str, help="Path to a packed matrix of vectors")
-    parser.add_argument("--out", type=str, help="Graph output path")
-    parser.add_argument("--out-levels", type=str, help="Level graphs output path")
-    parser.add_argument("--out-medoid", type=str, help="Medoid output path")
+    parser.add_argument("--out", type=str, help="Output folder")
     parser.add_argument("--dtype", type=str, help="Data type name e.g. float32")
     parser.add_argument("--dim", type=int, help="Vector dimensions")
     parser.add_argument("--m", type=int, help="Degree bound")
     parser.add_argument("--m-max", type=int, help="Maximum degree bound")
     parser.add_argument("--ef", type=int, help="Search list cap")
-    parser.add_argument("--it", type=str, help="Strategy per iter (e.g. FFLRFLRF)")
-    parser.add_argument("--r", type=int, help="Backedges to insert")
+    parser.add_argument("--it", type=int, help="Update iterations")
+    parser.add_argument("--r", type=int, help="Backedges to insert", default=0)
     parser.add_argument(
         "--eval-q", type=str, help="[Optional] Path to f32 query vectors"
     )
@@ -282,7 +265,7 @@ def main():
     m_max = args.m_max
     ef = args.ef
     r = args.r
-    assert 1 <= m <= m_max <= ef <= m_max * m_max <= n < NULL_ID
+    assert 1 <= m <= m_max <= ef <= (m_max + r + m_max * m_max) <= n < NULL_ID
     it = args.it
     batch = args.batch
     assert batch is None or n % batch == 0
@@ -321,10 +304,9 @@ def main():
 
     print("Initializing L0 graph")
     l0_graph = init_l0_graph(vecs=vecs, n=n, m=m_max, rk=rk)
-    l0_rks = rand.split(rk, len(it))
     pb = None
     if not (args.nn_samp or args.eval_q):
-        pb = tqdm(total=len(it), desc="Optimizing L0 graph", unit="iterations")
+        pb = tqdm(total=it, desc="Optimizing L0 graph", unit="iterations")
     if args.nn_samp:
         nn_samp_nodes = shuffled_nodes[: args.nn_samp]
         nn_samp_knn = brute_force_knn(nodes=nn_samp_nodes, vecs=vecs, k=m_max)
@@ -345,7 +327,7 @@ def main():
         print(
             "Loaded eval queries", eval_queries.shape, "and results", eval_results.shape
         )
-    for i, strat in enumerate(it):
+    for i in range(it):
         # block_until_ready() for more accurate progress.
         l0_graph = optimize_l0_graph_batched(
             graph=l0_graph,
@@ -353,8 +335,6 @@ def main():
             ef=ef,
             r=r,
             batch=batch or n,
-            strat=strat,
-            rk=l0_rks[i],
         ).block_until_ready()
         if pb:
             pb.update(1)
@@ -409,10 +389,10 @@ def main():
     ).block_until_ready()
 
     print("Saving", l0_graph.dtype, l0_graph.shape)
-    with open(args.out, "wb") as f:
+    with open(f"{args.out}/graph.mat", "wb") as f:
         # WARNING: Do not convert to Python type and serialize as MessagePack/JSON/etc. as that conversion + serialization process will be extremely slow in Python.
         f.write(l0_graph.tobytes())
-    with open(args.out_levels, "wb") as f:
+    with open(f"{args.out}/level_graphs.msgpack", "wb") as f:
         f.write(
             msgpack.packb(
                 [
@@ -427,7 +407,7 @@ def main():
                 ]
             )  # type: ignore
         )
-    with open(args.out_medoid, "w") as f:
+    with open(f"{args.out}/medoid.txt", "w") as f:
         f.write(str(entry_node.item()))
     print("All done!")
 
