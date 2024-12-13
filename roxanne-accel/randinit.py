@@ -9,6 +9,7 @@ from tqdm import tqdm
 from util import arange
 from util import batches
 from util import flatten_by_anti_diagonals
+from util import group_by_y_id_limit
 from util import NULL_ID
 from util import read_vecs
 from util import select_nodes
@@ -30,8 +31,11 @@ parser.add_argument("--m", type=int, help="Degree bound")
 parser.add_argument("--m-max", type=int, help="Maximum degree bound")
 parser.add_argument("--ef", type=int, help="Search list cap")
 parser.add_argument("--iter", type=int, help="Update iterations")
+parser.add_argument("--r", type=int, help="Backedges to insert")
 parser.add_argument(
-    "--batch", type=int, help="Optionally batch; slower but uses less memory"
+    "--batch",
+    type=int,
+    help="Optionally batch; slower but uses less memory and doesn't affect results",
 )
 parser.add_argument("--alpha", type=float, help="Distance threshold", default=1.1)
 args = parser.parse_args()
@@ -43,6 +47,7 @@ n, _ = vecs.shape
 m = args.m
 m_max = args.m_max
 ef = args.ef
+r = args.r
 assert 1 <= m <= m_max <= ef <= m_max * m_max <= n < NULL_ID
 it = args.iter
 batch = args.batch
@@ -56,6 +61,7 @@ print(f"{n=} {m=} {m_max=} {ef=} {it=} {batch=} {alpha=}")
 
 def optimize_l0_graph_node(
     graph: UInt32[Array, "n m"],
+    backedges: UInt32[Array, "n r"],
     vecs: BFloat16[Array, "n d"],
     node: UInt32[Array, ""],
     ef: int,
@@ -79,14 +85,19 @@ def optimize_l0_graph_node(
     # We pick the first `ef` ordered in anti-diagonal order as that approximates the closest nodes in `candidates`,
     # which we hope will converge faster to the true nearest neighbors. (Once again this is a heuristic, not a guarantee.)
     candidates = flatten_by_anti_diagonals(candidates)  # (m * (1 + m),)
+    # Add backedges as candidates (and prioritise them by adding to the front).
+    candidates = np.hstack([backedges[node], candidates])  # (r + m * (1 + m),)
     # Filter self-edges.
     candidates = np.where(candidates == node, NULL_ID, candidates)
     # Add a NULL_ID to ensure our later `np.argmax(candidates == NULL_ID)` doesn't return a false positive.
     # Unfortunately, the JAX implementation of np.unique(return_index=True) does not pad the returned indices with NULL_ID,
     # but instead with the index of the smallest unique value repeatedly.
+    # Therefore, we add a -1 to distinguish padding from the index of the true lowest value, as -1 will always be the lowest.
     #           0  1  2     3  4     5  6  7  8     9  10
     # Example: [1, 3, 5, NULL, 5, NULL, 2, 4, 1, NULL, -1]
-    candidates = np.hstack([candidates.astype(np.int32), NULL_ID, np.int32(-1)])
+    #                    ^        ^              ⬑ Inserted NULL, not existing one.
+    #           Existing NULLs can come from the graph, or filtering out self-edges.
+    candidates = np.hstack([candidates, NULL_ID, -1], dtype=np.int32)
     # return_index to preserve ordering. We can't limit size=ef as that doesn't guarantee closest ef elements.
     # Example: [9, 0, 6, 1, 7, 2, 3, 9, 9, 9, 9]
     uniq_i = np.unique(
@@ -107,7 +118,7 @@ def optimize_l0_graph_node(
     # Retrieve our original candidates in the optimal order, without duplicates or self-edges.
     # Example: [1, 3, 5, 2, 4, NULL, NULL, NULL, NULL, NULL]
     candidates = candidates.at[uniq_i].get(mode="fill", fill_value=NULL_ID)
-    # The code above may be a mind bender, but note: do not sort the candidates here, we've carefully preserved the order intentionally.
+    # All the above is so that we pick high quality `ef` candidates and not let any `ef` slot go to waste.
     candidates = candidates[:ef]  # (ef,)
     dists = norm(vecs[node] - select_vecs(vecs, candidates), axis=1)  # (ef,)
     sort_i = np.argsort(dists)
@@ -115,16 +126,33 @@ def optimize_l0_graph_node(
 
 
 optimize_l0_graph_batch = jax.vmap(
-    optimize_l0_graph_node, in_axes=(None, None, 0, None), out_axes=0
+    optimize_l0_graph_node, in_axes=(None, None, None, 0, None), out_axes=0
 )
 
 
-@partial(jax.jit, static_argnames=("ef", "batch"))
+@partial(jax.jit, static_argnames=["r"])
+def calc_backedges(
+    graph: UInt32[Array, "n m"],
+    r: int,
+):
+    n, m = graph.shape
+    back_nodes, backedges = group_by_y_id_limit(
+        M_id=arange(n),
+        M=graph,
+        d=r,
+        u=n + 1,  # NULL_ID is a possible value.
+    )
+    sort_i = np.argsort(back_nodes)
+    return backedges[sort_i]
+
+
+@partial(jax.jit, static_argnames=["ef", "r", "batch"])
 def optimize_l0_graph_batched(
     *,
     graph: UInt32[Array, "n m"],
     vecs: BFloat16[Array, "n d"],
     ef: int,
+    r: int,
     batch: int,
 ):
     """
@@ -136,10 +164,15 @@ def optimize_l0_graph_batched(
     assert n % batch == 0
     num_batches = n // batch
 
+    # Compute at the start of each iteration, not end:
+    # - Computing at end means we waste it on the last iteration, and don't use it in the first iteration (the graph is initialized sorted, so calc. backedges is useful even on the first iteration).
+    # - We don't have to return it and receive it as a parameter.
+    backedges = calc_backedges(graph, r)
+
     def loop_body(i, new_graph):
         start = i * batch
         batch_nodes = jax.lax.dynamic_slice(nodes, (start,), (batch,))
-        batch_res = optimize_l0_graph_batch(graph, vecs, batch_nodes, ef)
+        batch_res = optimize_l0_graph_batch(graph, backedges, vecs, batch_nodes, ef)
         return jax.lax.dynamic_update_slice(new_graph, batch_res, (start, 0))
 
     new_graph = np.zeros_like(graph)
@@ -147,18 +180,20 @@ def optimize_l0_graph_batched(
     return jax.lax.fori_loop(0, num_batches, loop_body, new_graph, unroll=False)
 
 
-@partial(jax.jit, static_argnames=("ef",))
+@partial(jax.jit, static_argnames=["ef", "r"])
 def optimize_l0_graph(
     *,
     graph: UInt32[Array, "n m"],
     vecs: BFloat16[Array, "n d"],
     ef: int,
+    r: int,
 ):
     n, _ = graph.shape
-    return optimize_l0_graph_batch(graph, vecs, arange(n), ef)
+    backedges = calc_backedges(graph, r)
+    return optimize_l0_graph_batch(graph, backedges, vecs, arange(n), ef)
 
 
-@partial(jax.jit, static_argnames=("n", "m", "seed"))
+@partial(jax.jit, static_argnames=["n", "m", "seed"])
 def init_l0_graph(
     *,
     vecs: BFloat16[Array, "n d"],
@@ -179,17 +214,17 @@ print("Initializing L0 graph")
 graph = init_l0_graph(vecs=vecs, n=n, m=m_max, seed=seed)
 print("Compiling optimizer")
 if batch is None:
-    opt_fn = optimize_l0_graph.lower(graph=graph, vecs=vecs, f=ef).compile()
+    opt_fn = optimize_l0_graph.lower(graph=graph, vecs=vecs, ef=ef, r=r).compile()
 else:
     opt_fn = optimize_l0_graph_batched.lower(
-        graph=graph, vecs=vecs, ef=ef, batch=batch
+        graph=graph, vecs=vecs, ef=ef, r=r, batch=batch
     ).compile()
 for i in tqdm(range(it), desc="Optimizing L0 graph"):
     # block_until_ready() for more accurate progress.
     graph = opt_fn(graph=graph, vecs=vecs).block_until_ready()
 
 
-@partial(jax.jit, static_argnames=("level_m",))
+@partial(jax.jit, static_argnames=["level_m"])
 def build_level_graph(
     *,
     level_m: int,
@@ -235,7 +270,7 @@ for i in range(1, math.floor(math.log(n, m)) + 1):
 entry_node = shuffled_nodes[0]
 
 
-@partial(jax.jit, static_argnames=("m", "batch"))
+@partial(jax.jit, static_argnames=["m", "batch"])
 def compute_robust_prune_batched(
     *,
     graph: UInt32[Array, "n m_max"],
@@ -264,6 +299,7 @@ def compute_robust_prune_batched(
     new_graph = np.zeros(shape=(n, m), dtype=np.uint32)
     # Don't use Python loop as that will get unrolled and not reduce memory usage.
     return jax.lax.fori_loop(0, num_batches, loop_body, new_graph, unroll=False)
+
 
 # RobustPrune isn't just for accuracy, it also removes redundant edges for faster query times.
 print("Final prune")

@@ -16,6 +16,9 @@ struct Args {
   m_max: usize,
 
   #[arg(long)]
+  r: usize,
+
+  #[arg(long)]
   ef: usize,
 
   #[arg(long)]
@@ -34,8 +37,8 @@ fn main() {
   let args = Args::parse();
 
   let variant = format!(
-    "randinit-{}M-{}Mmax-{}ef-{}iter-{}a",
-    args.m, args.m_max, args.ef, args.iter, args.alpha
+    "randinit-{}M-{}Mmax-{}r-{}ef-{}iter-{}a",
+    args.m, args.m_max, args.r, args.ef, args.iter, args.alpha
   );
   let out = format!("dataset/{}/out/{}", ds.name, variant);
   create_dir_all(&out).unwrap();
@@ -51,6 +54,8 @@ fn main() {
     .arg(args.m.to_string())
     .arg("--m-max")
     .arg(args.m_max.to_string())
+    .arg("--r")
+    .arg(args.r.to_string())
     .arg("--ef")
     .arg(args.ef.to_string())
     .arg("--iter")

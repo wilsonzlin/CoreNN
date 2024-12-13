@@ -7,6 +7,7 @@ from typing import Tuple
 import jax.numpy as np
 
 # Use int32.max as some functions use/return int32, which if we provide the uint32 max value, will overflow to -1, which is a legal index.
+# We also sometimes need int32 arrays ourselves and will use this value in them.
 NULL_ID = np.uint32(np.iinfo(np.int32).max)
 
 
@@ -102,6 +103,63 @@ def group_by_y_id(
     row_mask = np.any(mask, axis=2)
     N = np.where(row_mask, M_id[None, :], NULL_ID)
     return N_id, N  # type: ignore
+
+
+@partial(jit, static_argnames=["d", "u"])
+def group_by_y_id_limit(
+    M_id: UInt32[Array, "x"],
+    M: UInt32[Array, "x y"],
+    d: int,
+    # This is provided in case you know for sure that there are less than x * y maximum possible unique M IDs.
+    u: int,
+) -> Tuple[UInt32[Array, "u"], UInt32[Array, "u d"]]:
+    """
+    Same as group_by_y_id, but more memory efficient by limiting max. group size per distinct ID to `d`
+    and not using a full u * x * y mask.
+    """
+    x, y = M.shape
+    M_flat = M.reshape(-1)
+
+    V, inv, counts = np.unique(
+        M_flat, return_inverse=True, return_counts=True, size=u, fill_value=NULL_ID
+    )
+    # V: shape (u,), unique values sorted
+    # inv: shape (x*y,), maps each M_flat entry to an index in [0, u-1]
+    # counts: shape (u,), number of occurrences for each unique value
+
+    # Sort inv to group identical values together
+    # sorted_idx is the permutation that sorts inv, so elements with the same inv value are consecutive
+    sorted_idx = np.argsort(inv)
+
+    # Compute the starting offset for each unique value block
+    # offsets[i] = sum(counts[:i])
+    offsets = np.concatenate(
+        [np.array([0], dtype=counts.dtype), np.cumsum(counts[:-1])]
+    )
+
+    # We want R of shape (u, d)
+    # For each unique value i:
+    #   block = sorted_idx[offsets[i] : offsets[i]+counts[i]]
+    # We take up to d occurrences from this block.
+
+    J = arange(d)  # (d,)
+    # Ensure we never index out-of-bounds by clipping J to counts[i]-1
+    # This ensures we always pick a valid index for each value block, even if counts[i]<d.
+    # We'll mask out the invalid ones anyway.
+    clipped_J = np.minimum(J[None, :], counts[:, None] - 1)
+
+    # Mask to indicate which positions are valid (have occurrences)
+    mask = J[None, :] < counts[:, None]
+
+    # Compute the indices in sorted_idx for these occurrences
+    idx_block = offsets[:, None] + clipped_J
+    # Gather the row indices
+    row_indices = sorted_idx[idx_block] // y
+
+    # Fill invalid entries with NULL_ID where mask is False
+    R = np.where(mask, row_indices, NULL_ID)
+
+    return V, M_id.at[R].get(mode="fill", fill_value=NULL_ID)
 
 
 # Handles NULL_ID indices.
