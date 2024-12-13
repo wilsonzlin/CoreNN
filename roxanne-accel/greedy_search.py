@@ -17,17 +17,17 @@ def greedy_search(
     *,
     graph: UInt32[Array, "n m"],
     vecs: BFloat16[Array, "n d"],
-    id_targets: UInt32[Array, "b"],  # Batched.
+    target_vecs: BFloat16[Array, "b d"],  # Batched.
     k: Optional[int],  # If None, return all visited node IDs instead of top k.
     ef: int,
     iterations: int,
     id_start: UInt32[Array, ""],
 ):
     n, m = graph.shape
-    (b,) = id_targets.shape
+    b, _ = target_vecs.shape
 
     # Cache outside loop.
-    b_id_target_vecs = vecs[id_targets, None, :]  # (b, 1, d)
+    b_id_target_vecs = target_vecs[:, None, :]  # (b, 1, d)
     b_row_indices = arange(b)[:, None]  # (b, 1)
 
     visited_ids = np.full((b, iterations), NULL_ID, dtype=np.uint32)  # (b, iterations)
@@ -39,9 +39,7 @@ def greedy_search(
     cand_dists = np.full((b, ef + m), np.nan, dtype=np.bfloat16)  # (b, ef + m)
 
     cand_ids = cand_ids.at[:, 0].set(id_start)
-    cand_dists = cand_dists.at[:, 0].set(
-        norm(vecs[id_targets] - vecs[id_start], axis=1)
-    )
+    cand_dists = cand_dists.at[:, 0].set(norm(target_vecs - vecs[id_start], axis=1))
 
     cand_seen = np.full((b, n), False, dtype=bool)  # (b, n)
     for i in range(iterations):
@@ -79,6 +77,32 @@ def greedy_search(
 
     if k is None:
         return visited_ids  # (b, iterations)
-    return visited_ids[
-        arange(b), np.argpartition(visited_dists, k, axis=1)[:, :k]
-    ]  # (b, k)
+    # If k == iterations, argpartition will raise an error.
+    if k > iterations:
+        visited_ids = visited_ids[
+            arange(b), np.argpartition(visited_dists, k, axis=1)[:, :k]
+        ]
+    return visited_ids  # (b, k)
+
+
+@partial(jit, static_argnames=["k", "ef", "iterations"])
+def greedy_search_ids(
+    *,
+    graph: UInt32[Array, "n m"],
+    vecs: BFloat16[Array, "n d"],
+    id_targets: UInt32[Array, "b"],  # Batched.
+    k: Optional[int],  # If None, return all visited node IDs instead of top k.
+    ef: int,
+    iterations: int,
+    id_start: UInt32[Array, ""],
+):
+    target_vecs = select_vecs(vecs, id_targets)
+    return greedy_search(
+        graph=graph,
+        vecs=vecs,
+        target_vecs=target_vecs,
+        k=k,
+        ef=ef,
+        iterations=iterations,
+        id_start=id_start,
+    )

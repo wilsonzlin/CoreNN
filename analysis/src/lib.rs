@@ -1,3 +1,4 @@
+pub mod analyze;
 pub mod randinit;
 
 use ahash::HashMap;

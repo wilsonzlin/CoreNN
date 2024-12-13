@@ -1,4 +1,4 @@
-from greedy_search import greedy_search
+from greedy_search import greedy_search_ids
 from index import init_random_graph
 from jax.numpy.linalg import norm
 from jaxtyping import Array
@@ -103,7 +103,7 @@ def test_greedy_search_top_k():
         )[0]
     )
     got = set(
-        greedy_search(
+        greedy_search_ids(
             vecs=vecs,
             id_start=start,
             graph=g,
@@ -151,7 +151,7 @@ def test_greedy_search_visited():
     )[1]
     got = [
         v
-        for v in greedy_search(
+        for v in greedy_search_ids(
             vecs=vecs,
             id_start=start,
             graph=g,

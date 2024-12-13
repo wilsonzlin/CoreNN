@@ -1,4 +1,4 @@
-from greedy_search import greedy_search
+from greedy_search import greedy_search_ids
 from index import init_random_graph
 from jax.numpy.linalg import norm
 from jaxtyping import Array
@@ -53,7 +53,7 @@ def test_compute_robust_pruned():
     vecs = rand.uniform(
         rand.PRNGKey(seed), (n, d), dtype=np.bfloat16, minval=-1, maxval=1
     )
-    candidates = greedy_search(
+    candidates = greedy_search_ids(
         vecs=vecs,
         id_start=start,
         graph=g,

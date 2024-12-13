@@ -5,7 +5,7 @@
 # WARNING: Make sure to return from bench_*, or else the JIT will optimize away the function.
 
 from argparse import ArgumentParser
-from greedy_search import greedy_search
+from greedy_search import greedy_search_ids
 from index import init_random_graph
 from jax.numpy.linalg import norm
 from robust_prune import compute_robust_pruned
@@ -66,7 +66,7 @@ graph = init_random_graph(
 
 
 def bench_greedy_search():
-    return greedy_search(
+    return greedy_search_ids(
         graph=graph,
         vecs=vecs,
         id_targets=search_node_ids,

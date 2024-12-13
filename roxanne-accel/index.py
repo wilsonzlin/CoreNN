@@ -1,5 +1,5 @@
 from functools import partial
-from greedy_search import greedy_search
+from greedy_search import greedy_search_ids
 from jax import jit
 from jax.numpy.linalg import norm
 from jaxtyping import Array
@@ -68,7 +68,7 @@ def optimize_graph_batch(
     dist_thresh: BFloat16[Array, ""],
 ):
     # NOTE: While the original greedy_search doesn't have a fixed search_iter and can drop visited from the search list, so it seems like we could get very early distant nodes that would otherwise be pruned, we only want the set of visited nodes (as per the official insert/optimize algorithm), not the nearest ef/search_iter visited nodes. For example, even in the original implementation, the medoid is always returned.
-    visited = greedy_search(
+    visited = greedy_search_ids(
         graph=graph,
         vecs=vecs,
         id_targets=batch_nodes,
