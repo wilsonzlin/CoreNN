@@ -171,6 +171,7 @@ def select_nodes(
     return graph.at[indices].get(mode="fill", fill_value=NULL_ID)
 
 
+# Helper function for indexing into the `vecs` 2D array.
 # Handles NULL_ID indices.
 @jit
 def select_vecs(

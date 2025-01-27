@@ -1,6 +1,9 @@
 from argparse import ArgumentParser
 from functools import partial
 from greedy_search import greedy_search
+from jax.lax import dynamic_slice
+from jax.lax import dynamic_update_slice
+from jax.lax import fori_loop
 from jax.numpy.linalg import norm
 from jaxtyping import Array
 from jaxtyping import BFloat16
@@ -116,7 +119,6 @@ def optimize_l0_graph_batched(
     n, _ = graph.shape
     nodes = arange(n)
     assert n % batch == 0
-    num_batches = n // batch
 
     # Compute at the start of each iteration, not end:
     # - Computing at end means we waste it on the last iteration, and don't use it in the first iteration (the graph is initialized sorted, so calc. backedges is useful even on the first iteration).
@@ -130,45 +132,62 @@ def optimize_l0_graph_batched(
     # Updating batches then writing back after each batch is even worse, as that requires a memory barrier/sync between batches.
     def loop_body(i, new_graph):
         start = i * batch
-        batch_nodes = jax.lax.dynamic_slice(nodes, (start,), (batch,))
+        batch_nodes = dynamic_slice(nodes, (start,), (batch,))
         batch_res = optimize_l0_graph_batch(graph, backedges, vecs, batch_nodes, ef)
-        return jax.lax.dynamic_update_slice(new_graph, batch_res, (start, 0))
+        return dynamic_update_slice(new_graph, batch_res, (start, 0))
 
-    new_graph = np.zeros_like(graph)
     # Don't use Python loop as that will get unrolled and not reduce memory usage.
-    return jax.lax.fori_loop(0, num_batches, loop_body, new_graph, unroll=False)
+    return fori_loop(0, n // batch, loop_body, np.zeros_like(graph), unroll=False)
 
 
-@partial(jax.jit, static_argnames=["n", "m"])
+@partial(jax.jit, static_argnames=["m", "batch"])
 def init_l0_graph(
     *,
     vecs: BFloat16[Array, "n d"],
-    n: int,
     m: int,
+    batch: int,
     rk,
 ):
+    n, d = vecs.shape
+    assert n % batch == 0
     graph = rand.choice(rk, arange(n), shape=(n, m), replace=True)  # (n, m)
-    # (n, 1, d) - (n, m, d) = (n, m, d)
-    dists = norm(vecs[:, None] - select_vecs(vecs, graph), axis=2)  # (n, m)
+
+    def loop_body(i, dists):
+        start = i * batch
+        batch_nodes = dynamic_slice(graph, (start, 0), (batch, m))
+        batch_vecs = dynamic_slice(vecs, (start, 0), (batch, d))
+        # (batch, 1, d) - (batch, m, d) = (batch, m, d)
+        batch_dists = norm(batch_vecs[:, None] - select_vecs(vecs, batch_nodes), axis=2)
+        return dynamic_update_slice(dists, batch_dists, (start, 0))
+
+    # Combined final result: (n, 1, d) - (n, m, d) = (n, m, d)
+    dists = fori_loop(
+        0,
+        n // batch,
+        loop_body,
+        np.empty((n, m), dtype=np.bfloat16),
+        unroll=False,
+    )
     # If we don't sort now, our first iteration will pick the first ef neighbor-neighbors, assuming they're closest when they're not, and essentially pick more random nodes when it's already random, a waste of an iteration.
     sort_i = np.argsort(dists, axis=1)  # (n, m)
     graph = graph[arange(n)[:, None], sort_i]  # (n, m)
     return graph
 
 
-@partial(jax.jit, static_argnames=["level_m"])
+@partial(jax.jit, static_argnames=["level_m", "batch"])
 def build_level_graph(
     *,
     vecs: BFloat16[Array, "n d"],
     level_m: int,
     level_nodes: UInt32[Array, "n"],
     level_vecs: BFloat16[Array, "n d"],
+    batch: int,
 ):
     (level_size,) = level_nodes.shape
     level_g = np.full((level_size, level_m), NULL_ID, dtype=np.uint32)
     # Avoid OOM in larger levels.
-    # TODO Use batch param.
-    for start, end, _ in batches(level_size, 1000):
+    # We don't use fori_loop as that requires the batch size to be an exact multiple of the level size, which is unlikely given level size's calculation.
+    for start, end, _ in batches(level_size, batch):
         batch_nodes = level_nodes[start:end]
         batch_vecs = vecs[batch_nodes]
         dists = norm(batch_vecs[:, None] - level_vecs, axis=2)
@@ -189,12 +208,11 @@ def compute_robust_prune_batched(
     n, m_max = graph.shape
     nodes = arange(n)
     assert n % batch == 0
-    num_batches = n // batch
 
     def loop_body(i, new_graph):
         start = i * batch
-        batch_nodes = jax.lax.dynamic_slice(nodes, (start,), (batch,))
-        batch_cand_ids = jax.lax.dynamic_slice(graph, (start, 0), (batch, m_max))
+        batch_nodes = dynamic_slice(nodes, (start,), (batch,))
+        batch_cand_ids = dynamic_slice(graph, (start, 0), (batch, m_max))
         batch_res = compute_robust_pruned(
             vecs=vecs,
             node_ids=batch_nodes,
@@ -202,11 +220,11 @@ def compute_robust_prune_batched(
             m=m,
             dist_thresh=dist_thresh,
         )
-        return jax.lax.dynamic_update_slice(new_graph, batch_res, (start, 0))
+        return dynamic_update_slice(new_graph, batch_res, (start, 0))
 
     new_graph = np.zeros(shape=(n, m), dtype=np.uint32)
     # Don't use Python loop as that will get unrolled and not reduce memory usage.
-    return jax.lax.fori_loop(0, num_batches, loop_body, new_graph, unroll=False)
+    return fori_loop(0, n // batch, loop_body, new_graph, unroll=False)
 
 
 @partial(jax.jit, static_argnames=["k"])
@@ -251,7 +269,7 @@ def main():
     parser.add_argument(
         "--batch",
         type=int,
-        help="[Optional] Enable batching of size; slower but uses less memory and doesn't affect results",
+        help="[Optional] Enable batching of size; slower but uses less memory; doesn't affect results",
     )
     parser.add_argument("--alpha", type=float, help="Distance threshold", default=1.1)
     args = parser.parse_args()
@@ -267,8 +285,8 @@ def main():
     r = args.r
     assert 1 <= m <= m_max <= ef <= (m_max + r + m_max * m_max) <= n < NULL_ID
     it = args.it
-    batch = args.batch
-    assert batch is None or n % batch == 0
+    batch = args.batch or n
+    assert n % batch == 0
     alpha = args.alpha
     dist_thresh = np.bfloat16(alpha)
     seed = 0
@@ -291,6 +309,7 @@ def main():
             level_m=level_m,
             level_nodes=level_nodes,
             level_vecs=level_vecs,
+            batch=batch,
         )
         level_graphs.append(
             {
@@ -303,7 +322,7 @@ def main():
     entry_node = shuffled_nodes[0]
 
     print("Initializing L0 graph")
-    l0_graph = init_l0_graph(vecs=vecs, n=n, m=m_max, rk=rk)
+    l0_graph = init_l0_graph(vecs=vecs, m=m_max, batch=batch, rk=rk)
     pb = None
     if not (args.nn_samp or args.eval_q):
         pb = tqdm(total=it, desc="Optimizing L0 graph", unit="iterations")
@@ -334,7 +353,7 @@ def main():
             vecs=vecs,
             ef=ef,
             r=r,
-            batch=batch or n,
+            batch=batch,
         ).block_until_ready()
         if pb:
             pb.update(1)
@@ -347,10 +366,18 @@ def main():
         if args.eval_q:
             # Find entry node at level 0. We drop straight to level 0 by simply doing a brute-force search over all level nodes.
             start_cands = level_graphs[0]["nodes"]  # (c,)
-            # (qn, 1, d) - (1, c, d) = (qn, c, d)
-            dist_to_start_cands = norm(
-                eval_queries[:, None] - select_vecs(vecs, start_cands)[None], axis=2
+            dist_to_start_cands = np.empty(
+                (eval_q_n, len(start_cands)), dtype=np.bfloat16
             )  # (qn, c)
+            # Combined final result: (qn, 1, d) - (1, c, d) = (qn, c, d)
+            # No need to use fori_loop, as we're not JIT compiling, and that also requires `batch` to be an exact multiple of `eval_q_n`.
+            for start, end, _ in batches(eval_q_n, batch):
+                batch_queries = eval_queries[start:end]
+                batch_dists = norm(
+                    batch_queries[:, None] - select_vecs(vecs, start_cands)[None],
+                    axis=2,
+                )
+                dist_to_start_cands = dist_to_start_cands.at[start:end].set(batch_dists)
             starts = start_cands[np.argmin(dist_to_start_cands, axis=1)]  # (qn,)
             # Perform prune to reproduce how the final graph would be for accurate results.
             eval_graph = compute_robust_prune_batched(
@@ -358,7 +385,7 @@ def main():
                 vecs=vecs,
                 m=m,
                 dist_thresh=dist_thresh,
-                batch=batch or n,
+                batch=batch,
             )
             # Do greedy search.
             # NOTE: This isn't how our Vamana GreedySearch works (because we haven't merged the higher-level edges so it can't take those paths),
@@ -385,7 +412,7 @@ def main():
         vecs=vecs,
         m=m,
         dist_thresh=dist_thresh,
-        batch=batch or n,
+        batch=batch,
     ).block_until_ready()
 
     print("Saving", l0_graph.dtype, l0_graph.shape)
