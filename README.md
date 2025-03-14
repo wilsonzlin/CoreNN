@@ -16,17 +16,17 @@ Roxanne achieves **top marks in all quadrants**: accuracy, build speed, build co
 
 ## Why use Roxanne?
 
-**Novel disk-first algorithm and data layout**
+**Disk-first algorithm and data layout**
 
 Roxanne is designed from the ground up to use flash storage, not expensive DRAM, retaining high accuracy and throughput while costing 40x–100x less. This means you can index more vectors than can fit in memory. It's derived from a [new algorithm](https://suhasjs.github.io/files/diskann_neurips19.pdf) designed to exploit SSD characteristics, where current algorithms fail due to being designed for RAM access patterns.
 
-**Production-scale real-time updates and deletes**
+**Real-time updates and deletes**
 
 Roxanne supports true in-place updates and deletes such that they free space and don't degrade query performance, and don't require a full rebuild or dump. Other vector databases and algorithms operate by soft-deleting and building small immutable shards, which degrade query performance and accuracy.
 
 Roxanne can handle thousands of inserts, updates, and deletes per second. Queries don't block updates and vice versa. It seamlessly scales from 1 to 1 billion vectors without downtime, dynamically adjusting strategy automatically.
 
-**Unified experience across many platforms**
+**Unified experience**
 
 Roxanne uses a shared core library with a consistent self-contained data storage format, so you can use it across your favorite stack, interact with whatever tool is the most handy, and have it adapt with your growing infra and codebase. One example journey:
 
