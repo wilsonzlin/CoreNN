@@ -3,18 +3,14 @@ use ahash::HashSet;
 use bytemuck::cast_slice;
 use clap::Args;
 use half::f16;
-use libroxanne::cfg::RoxanneDbCfg;
 use libroxanne::util::AsyncConcurrentIteratorExt;
-use libroxanne::RoxanneDb;
-use libroxanne::RoxanneDbDir;
+use libroxanne::util::AtomUsz;
+use libroxanne::Roxanne;
 use ndarray::Array1;
 use std::iter::zip;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::fs::read;
-use tokio::fs::read_to_string;
 use tokio::fs::File;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
@@ -36,15 +32,12 @@ pub struct EvalArgs {
 
 impl EvalArgs {
   pub async fn exec(self) {
-    let dir = RoxanneDbDir::new(self.path);
-    let idx = Arc::new(RoxanneDb::<f16, f32>::open(dir.db()).await);
-    let cfg_raw = read_to_string(dir.cfg()).await.unwrap();
-    let cfg: RoxanneDbCfg = toml::from_str(&cfg_raw).unwrap();
+    let rox = Arc::new(Roxanne::open(self.path).await);
     tracing::info!("loaded database");
 
     let queries: Vec<Array1<f16>> = {
       let raw = read(&self.queries).await.unwrap();
-      let raw_vec_len = size_of::<f16>() * cfg.dim;
+      let raw_vec_len = size_of::<f16>() * rox.dim();
       assert_eq!(raw.len() % raw_vec_len, 0);
       raw
         .chunks(raw_vec_len)
@@ -66,12 +59,12 @@ impl EvalArgs {
     tracing::info!("loaded k-NN");
 
     let pb = new_pb_with_msg(queries.len());
-    let correct = Arc::new(AtomicUsize::new(0));
-    let total = Arc::new(AtomicUsize::new(0));
+    let correct = Arc::new(AtomUsz::new(0));
+    let total = Arc::new(AtomUsz::new(0));
     zip(queries, knn_ids)
       .map(|(q, k)| {
         (
-          idx.clone(),
+          rox.clone(),
           pb.clone(),
           correct.clone(),
           total.clone(),
@@ -80,23 +73,20 @@ impl EvalArgs {
         )
       })
       .spawn_for_each(
-        |(idx, pb, correct, total, query, knn_expected)| async move {
+        |(rox, pb, correct, total, query, knn_expected)| async move {
           let k = knn_expected.len();
-          let knn_got = idx
+          let knn_got = rox
             .query(&query.view(), k)
             .await
             .into_iter()
             .map(|e| e.0)
             .collect::<HashSet<_>>();
 
-          correct.fetch_add(
-            knn_expected.intersection(&knn_got).count(),
-            Ordering::Relaxed,
-          );
-          total.fetch_add(k, Ordering::Relaxed);
+          correct.inc(knn_expected.intersection(&knn_got).count());
+          total.inc(k);
 
-          let correct = correct.load(Ordering::Relaxed);
-          let total = total.load(Ordering::Relaxed);
+          let correct = correct.get();
+          let total = total.get();
           let pc = correct as f64 / total as f64 * 100.0;
           pb.set_message(format!("Correct: {pc:.2}% ({correct}/{total})"));
           pb.inc(1);

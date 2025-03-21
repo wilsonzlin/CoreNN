@@ -5,7 +5,7 @@ use axum::Json;
 use axum::Router;
 use clap::Args;
 use half::f16;
-use libroxanne::RoxanneDb;
+use libroxanne::Roxanne;
 use ndarray::Array1;
 use serde::Deserialize;
 use serde::Serialize;
@@ -29,7 +29,7 @@ pub struct ServeArgs {
 }
 
 struct Ctx {
-  db: Arc<RoxanneDb<f16, f32>>,
+  db: Arc<Roxanne>,
 }
 
 #[derive(Deserialize)]
@@ -52,8 +52,7 @@ async fn handle_post_insert(State(ctx): State<Arc<Ctx>>, Json(req): Json<PostIns
         .into_iter()
         .map(|v| (v.key, Array1::from(v.vector))),
     )
-    .await
-    .unwrap();
+    .await;
 }
 
 #[derive(Deserialize)]
@@ -64,7 +63,7 @@ struct PostQueryReq {
 
 #[derive(Serialize)]
 struct PostQueryRes {
-  results: Vec<(String, f64)>,
+  results: Vec<(String, f32)>,
 }
 
 async fn handle_post_query(
@@ -77,7 +76,7 @@ async fn handle_post_query(
 
 impl ServeArgs {
   pub async fn exec(self) {
-    let db = RoxanneDb::open(self.path).await;
+    let db = Roxanne::open(self.path).await;
 
     let ctx = Ctx { db };
 

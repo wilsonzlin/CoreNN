@@ -4,7 +4,6 @@ use jemallocator::Jemalloc;
 use roxanne::cmd::eval::EvalArgs;
 use roxanne::cmd::export_vectors::ExportVectorsArgs;
 use roxanne::cmd::migrate_hnsw::MigrateHnswArgs;
-use roxanne::cmd::migrate_sharded_hnsw::MigrateShardedHnswArgs;
 use roxanne::cmd::serve::ServeArgs;
 
 // Use jemalloc as the GNU malloc doesn't return freed memory to system during full-database iteration. Also see https://github.com/facebook/rocksdb/issues/12425#issuecomment-2004733577.
@@ -19,8 +18,6 @@ enum Commands {
   ExportVectors(ExportVectorsArgs),
   /// Create a new Roxanne database from an existing HNSW index.
   MigrateHnsw(MigrateHnswArgs),
-  /// Create a new Roxanne database from a set of existing HNSW uniform-shard indices.
-  MigrateShardedHnsw(MigrateShardedHnswArgs),
   /// Serve a Roxanne database over HTTP.
   Serve(ServeArgs),
 }
@@ -40,7 +37,6 @@ async fn main() {
     Commands::Eval(args) => args.exec().await,
     Commands::ExportVectors(args) => args.exec().await,
     Commands::MigrateHnsw(args) => args.exec().await,
-    Commands::MigrateShardedHnsw(args) => args.exec().await,
     Commands::Serve(args) => args.exec().await,
   };
 }

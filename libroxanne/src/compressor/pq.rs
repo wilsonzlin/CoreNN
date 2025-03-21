@@ -1,3 +1,8 @@
+use super::Compressor;
+use crate::util::AsyncConcurrentIteratorExt;
+use crate::Roxanne;
+use futures::StreamExt;
+use half::f16;
 use linfa::traits::FitWith;
 use linfa::traits::Predict;
 use linfa::DatasetBase;
@@ -16,6 +21,7 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
+use std::cmp::min;
 
 #[derive(Serialize, Deserialize)]
 pub struct ProductQuantizer<T: Float> {
@@ -68,6 +74,35 @@ impl<T: Float> ProductQuantizer<T> {
       dims,
       subspace_codebooks,
     }
+  }
+
+  pub async fn train_from_roxanne(rox: &Roxanne) -> ProductQuantizer<f32> {
+    // In-memory cache doesn't contain all vectors, and may be skewed.
+    // Reservoir sampling from DB would require full disk read.
+    // So we sample by ID, and assume there aren't many gaps (deletions).
+    // TODO Handle gaps better.
+    let samp_sz = min(rox.count.get(), rox.cfg.pq_sample_size());
+    let ids = rand::seq::index::sample(&mut thread_rng(), rox.count.get(), samp_sz);
+    let samp_nodes = ids
+      .into_iter()
+      .filter_map_concurrent(|id| rox.db.maybe_read_node(id))
+      .collect::<Vec<_>>()
+      .await;
+    let actual_samp_sz = samp_nodes.len();
+
+    let mut mat = Array2::zeros((actual_samp_sz, rox.dim.get()));
+    for (i, node) in samp_nodes.into_iter().enumerate() {
+      mat.row_mut(i).assign(&node.vector.mapv(|x| x.to_f32()));
+    }
+    let pq = ProductQuantizer::train(&mat.view(), rox.cfg.pq_subspaces());
+
+    tracing::info!(
+      sample_inputs = actual_samp_sz,
+      subspaces = rox.cfg.pq_subspaces(),
+      "trained PQ"
+    );
+
+    pq
   }
 
   pub fn encode(&self, mat: &ArrayView2<T>) -> Array2<u8> {
@@ -136,11 +171,23 @@ impl<T: Float> ProductQuantizer<T> {
   }
 }
 
+impl Compressor for ProductQuantizer<f32> {
+  fn compress(&self, v: &ArrayView1<f16>) -> Vec<u8> {
+    self.encode_1(&v.mapv(|x| x.to_f32()).view()).to_vec()
+  }
+
+  fn decompress(&self, v: &[u8]) -> Array1<f16> {
+    let v = ArrayView1::from(v);
+    self.decode_1(&v).mapv(|x| f16::from_f32(x))
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::ProductQuantizer;
-  use crate::common::metric_euclidean;
+  use crate::common::dist_l2;
   use ahash::HashSet;
+  use half::f16;
   use itertools::Itertools;
   use ndarray::Array;
   use ndarray::Array2;
@@ -151,14 +198,14 @@ mod tests {
   use rand::thread_rng;
   use std::iter::zip;
 
-  fn pairwise_euclidean_distance(matrix: &Array2<f32>) -> Array2<f32> {
+  fn pairwise_euclidean_distance(matrix: &Array2<f16>) -> Array2<f32> {
     let n = matrix.nrows();
     let mut distances = Array2::zeros((n, n));
 
     // Compute squared Euclidean distances
     for i in 0..n {
       for j in i + 1..n {
-        let squared_dist = metric_euclidean(&matrix.row(i), &matrix.row(j)) as f32;
+        let squared_dist = dist_l2(&matrix.row(i), &matrix.row(j));
         distances[[i, j]] = squared_dist;
         distances[[j, i]] = squared_dist; // Distance matrix is symmetric
       }

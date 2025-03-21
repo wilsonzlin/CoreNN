@@ -1,6 +1,6 @@
 use half::f16;
 use itertools::Itertools;
-use libroxanne::RoxanneDb;
+use libroxanne::Roxanne;
 use ndarray::Array1;
 use numpy::PyReadonlyArray1;
 use numpy::PyReadonlyArray2;
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[pyclass]
-struct RoxanneDbPy(Arc<RoxanneDb<f16, f32>>);
+struct RoxanneDbPy(Arc<Roxanne>);
 
 #[pymethods]
 impl RoxanneDbPy {
@@ -26,7 +26,7 @@ impl RoxanneDbPy {
     // We must use pyo3_async_runtimes as we need to have the Tokio runtime running, as libroxanne uses tokio::spawn.
     // (PyO3 does support async methods, but won't start a Rust runtime.)
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-      let db = RoxanneDb::open(dir).await;
+      let db = Roxanne::open(dir).await;
       Ok(RoxanneDbPy(db))
     })
   }
@@ -47,10 +47,7 @@ impl RoxanneDbPy {
         (k, Array1::from(v))
       })
       .collect_vec();
-    pyo3_async_runtimes::tokio::future_into_py(
-      py,
-      async move { Ok(db.insert(entries).await.unwrap()) },
-    )
+    pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(db.insert(entries).await) })
   }
 
   pub fn query<'a>(

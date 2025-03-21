@@ -1,13 +1,15 @@
-use crate::common::Dtype;
+use crate::cfg::CfgRaw;
 use crate::common::Id;
+use crate::compressor::pq::ProductQuantizer;
 use bitcode::decode;
 use bitcode::encode;
-use bitcode::Decode;
 use bitcode::Encode;
 use bytemuck::cast_slice;
 use flume::r#async::RecvStream;
 use futures::Stream;
 use futures::StreamExt;
+use half::f16;
+use ndarray::Array1;
 use rocksdb::BlockBasedOptions;
 use rocksdb::Direction;
 use rocksdb::IteratorMode;
@@ -17,23 +19,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug, Encode, Decode)]
-pub enum DbIndexMode {
-  BruteForce,
-  InMemory,
-  LongTerm,
-}
-
 #[derive(PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum DbKeyT {
-  AdditionalOutNeighbors, // (Id)
-  Deleted,                // (Id)
-  IndexMode,
-  Id,  // (Vec<u8>)
-  Key, // (Id)
-  Medoid,
+  AddEdges, // (Id)
+  // For simplicity, the entire Cfg is just one DB entry, given that all fields are optional.
+  Cfg,
+  Count,
+  Deleted, // (Id)
+  Id,      // (Vec<u8>)
+  Key,     // (Id)
+  NextId,
   Node, // (Id)
+  PQModel,
 }
 
 pub trait DbKey {
@@ -90,7 +88,7 @@ impl DbTransaction {
   }
 
   pub fn delete_additional_out_neighbors(&mut self, id: Id) {
-    self.delete_raw((DbKeyT::AdditionalOutNeighbors, id));
+    self.delete_raw((DbKeyT::AddEdges, id));
   }
 
   pub fn delete_deleted(&mut self, id: Id) {
@@ -105,12 +103,12 @@ impl DbTransaction {
     self.delete_raw((DbKeyT::Key, id));
   }
 
-  pub fn delete_medoid(&mut self) {
-    self.delete_raw(DbKeyT::Medoid);
-  }
-
   pub fn delete_node(&mut self, id: Id) {
     self.delete_raw((DbKeyT::Node, id));
+  }
+
+  pub fn delete_pq_model(&mut self) {
+    self.delete_raw(DbKeyT::PQModel);
   }
 
   fn write_raw(&mut self, k: impl DbKey, v: impl AsRef<[u8]>) {
@@ -121,8 +119,17 @@ impl DbTransaction {
     self.write_raw(k, encode(v));
   }
 
-  pub fn write_additional_out_neighbors(&mut self, id: Id, neighbors: &Vec<Id>) {
-    self.write((DbKeyT::AdditionalOutNeighbors, id), neighbors);
+  pub fn write_add_edges(&mut self, id: Id, neighbors: &Vec<Id>) {
+    self.write((DbKeyT::AddEdges, id), neighbors);
+  }
+
+  pub fn write_cfg(&mut self, cfg: &CfgRaw) {
+    // Use MessagePack for future compatibility/extensibility.
+    self.write_raw(DbKeyT::Cfg, rmp_serde::to_vec(cfg).unwrap());
+  }
+
+  pub fn write_count(&mut self, count: usize) {
+    self.write(DbKeyT::Count, &count);
   }
 
   pub fn write_deleted(&mut self, id: Id) {
@@ -133,20 +140,20 @@ impl DbTransaction {
     self.write((DbKeyT::Id, key), &id);
   }
 
-  pub fn write_index_mode(&mut self, mode: DbIndexMode) {
-    self.write(DbKeyT::IndexMode, &mode);
-  }
-
   pub fn write_key(&mut self, id: Id, key: &str) {
     self.write_raw((DbKeyT::Key, id), key.as_bytes());
   }
 
-  pub fn write_medoid(&mut self, medoid: Id) {
-    self.write(DbKeyT::Medoid, &medoid);
+  pub fn write_next_id(&mut self, id: Id) {
+    self.write(DbKeyT::NextId, &id);
   }
 
-  pub fn write_node<T: Dtype>(&mut self, id: Id, node: &NodeData<T>) {
+  pub fn write_node(&mut self, id: Id, node: &NodeData) {
     self.write_raw((DbKeyT::Node, id), node.serialize());
+  }
+
+  pub fn write_pq_model(&mut self, pq: &ProductQuantizer<f32>) {
+    self.write_raw(DbKeyT::PQModel, rmp_serde::to_vec(pq).unwrap());
   }
 
   pub async fn commit(self, db: &Db) {
@@ -163,22 +170,24 @@ impl DbTransaction {
 // - It compactly stores integers using reduced bits.
 // - It doesn't use space to store field names or types.
 // These are crucial as we want to pack this in under one disk page read, which DiskANN relies on.
-pub struct NodeData<T> {
+#[derive(Clone)]
+pub struct NodeData {
   pub neighbors: Vec<Id>,
-  pub vector: Vec<T>,
+  pub vector: Array1<f16>,
 }
 
-impl<T: Dtype> NodeData<T> {
+impl NodeData {
   pub fn serialize(&self) -> Vec<u8> {
     // Bitcode doesn't support f16 at this time, so we must convert to raw [u8] first.
     // WARNING: This decision is permanent, unless we want to break the disk format.
-    let vec_raw: Vec<u8> = cast_slice(&self.vector).to_vec();
+    let vec_raw: Vec<u8> = cast_slice(self.vector.as_slice().unwrap()).to_vec();
     encode(&(self.neighbors.clone(), vec_raw))
   }
 
   pub fn deserialize(raw: &[u8]) -> Self {
     let (neighbors, vec_raw): (Vec<Id>, Vec<u8>) = decode(raw).unwrap();
-    let vector: Vec<T> = cast_slice(&vec_raw).to_vec();
+    let vector: Vec<f16> = cast_slice(&vec_raw).to_vec();
+    let vector = Array1::from_vec(vector);
     Self { neighbors, vector }
   }
 }
@@ -258,8 +267,8 @@ impl Db {
     recv.into_stream()
   }
 
-  pub fn iter_additional_out_neighbors(&self) -> RecvStream<(Id, Vec<Id>)> {
-    self.iter(DbKeyT::AdditionalOutNeighbors, |v| decode(&v).unwrap())
+  pub fn iter_add_edges(&self) -> RecvStream<(Id, Vec<Id>)> {
+    self.iter(DbKeyT::AddEdges, |v| decode(&v).unwrap())
   }
 
   pub fn iter_deleted(&self) -> impl Stream<Item = Id> + '_ {
@@ -270,7 +279,7 @@ impl Db {
     self.iter(DbKeyT::Id, |v| String::from_utf8(v.into_vec()).unwrap())
   }
 
-  pub fn iter_nodes<T: Dtype>(&self) -> RecvStream<(Id, NodeData<T>)> {
+  pub fn iter_nodes(&self) -> RecvStream<(Id, NodeData)> {
     self.iter(DbKeyT::Node, |v| NodeData::deserialize(&v))
   }
 
@@ -280,24 +289,28 @@ impl Db {
     spawn_blocking(move || db.get(key).unwrap()).await.unwrap()
   }
 
-  async fn read_raw(&self, k: impl DbKey) -> Vec<u8> {
-    self.maybe_read_raw(k).await.unwrap()
-  }
-
-  pub async fn read_additional_out_neighbors(&self, id: Id) -> Vec<Id> {
+  pub async fn read_add_edges(&self, id: Id) -> Vec<Id> {
     self
-      .maybe_read_raw((DbKeyT::AdditionalOutNeighbors, id))
+      .maybe_read_raw((DbKeyT::AddEdges, id))
       .await
       .map(|raw| decode(&raw).unwrap())
       .unwrap_or_default()
   }
 
-  pub async fn read_index_mode(&self) -> DbIndexMode {
+  pub async fn read_cfg(&self) -> CfgRaw {
     self
-      .maybe_read_raw(DbKeyT::IndexMode)
+      .maybe_read_raw(DbKeyT::Cfg)
+      .await
+      .map(|raw| rmp_serde::from_slice(&raw).unwrap())
+      .unwrap_or_default()
+  }
+
+  pub async fn read_count(&self) -> usize {
+    self
+      .maybe_read_raw(DbKeyT::Count)
       .await
       .map(|raw| decode(&raw).unwrap())
-      .unwrap_or(DbIndexMode::BruteForce)
+      .unwrap_or_default()
   }
 
   pub async fn read_deleted(&self, id: Id) -> bool {
@@ -322,15 +335,33 @@ impl Db {
     self.maybe_read_key(id).await.unwrap()
   }
 
-  pub async fn maybe_read_medoid(&self) -> Option<Id> {
+  pub async fn read_next_id(&self) -> Id {
     self
-      .maybe_read_raw(DbKeyT::Medoid)
+      .maybe_read_raw(DbKeyT::NextId)
       .await
       .map(|raw| decode(&raw).unwrap())
+      .unwrap_or_default()
   }
 
-  pub async fn read_node<T: Dtype>(&self, id: Id) -> NodeData<T> {
-    let raw = self.read_raw((DbKeyT::Node, id)).await;
-    NodeData::deserialize(&raw)
+  pub async fn maybe_read_node(&self, id: Id) -> Option<NodeData> {
+    self
+      .maybe_read_raw((DbKeyT::Node, id))
+      .await
+      .map(|raw| NodeData::deserialize(&raw))
+  }
+
+  pub async fn read_node(&self, id: Id) -> NodeData {
+    self.maybe_read_node(id).await.unwrap()
+  }
+
+  pub async fn maybe_read_pq_model(&self) -> Option<ProductQuantizer<f32>> {
+    self
+      .maybe_read_raw(DbKeyT::PQModel)
+      .await
+      .map(|raw| rmp_serde::from_slice(&raw).unwrap())
+  }
+
+  pub async fn read_pq_model(&self) -> ProductQuantizer<f32> {
+    self.maybe_read_pq_model().await.unwrap()
   }
 }

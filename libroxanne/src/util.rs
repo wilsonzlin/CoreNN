@@ -2,116 +2,16 @@ use futures::stream::FuturesOrdered;
 use futures::stream::FuturesUnordered;
 use futures::Stream;
 use futures::StreamExt;
-use std::collections::VecDeque;
-use std::convert::identity;
 use std::future::Future;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-pub trait CollectionExt<T> {
-  fn insert_into_ordered<K: Ord>(&mut self, v: T, key: impl Fn(&T) -> K);
-
-  // WARNING: We can't collect all positions and then insert by index descending, as that doesn't account for when multiple source values are inserted at the same position but between themselves are not sorted. This costs the same anyway because we need to do N insertions.
-  fn extend_into_ordered<K: Ord>(
-    &mut self,
-    src: impl IntoIterator<Item = T>,
-    key: impl Fn(&T) -> K + Copy,
-  ) {
-    for v in src {
-      self.insert_into_ordered(v, key);
-    }
-  }
-}
-
-impl<T> CollectionExt<T> for VecDeque<T> {
-  fn insert_into_ordered<K: Ord>(&mut self, v: T, key: impl Fn(&T) -> K) {
-    let pos = self
-      .binary_search_by(|s| key(s).cmp(&key(&v)))
-      .map_or_else(identity, identity);
-    self.insert(pos, v);
-  }
-}
-
-#[cfg(test)]
-mod tests_insert_into_ordered_vecdeque {
-  use crate::util::CollectionExt;
-  use itertools::Itertools;
-  use std::collections::VecDeque;
-
-  #[test]
-  fn test_insert_into_ordered_vecdeque() {
-    // Empty destination.
-    let mut dest = VecDeque::new();
-    dest.extend_into_ordered([3, 1, 4], |&x| x);
-    assert_eq!(dest.into_iter().collect_vec(), vec![1, 3, 4]);
-
-    // Empty source.
-    let mut dest = VecDeque::from(vec![1, 2, 3]);
-    dest.extend_into_ordered([], |&x| x);
-    assert_eq!(dest.into_iter().collect_vec(), vec![1, 2, 3]);
-
-    // Both empty.
-    let mut dest = VecDeque::<usize>::new();
-    dest.extend_into_ordered([], |&x| x);
-    assert!(dest.is_empty());
-
-    // Interleaved values.
-    let mut dest = VecDeque::from(vec![2, 4, 6]);
-    dest.extend_into_ordered([1, 3, 5], |&x| x);
-    assert_eq!(dest.into_iter().collect_vec(), vec![1, 2, 3, 4, 5, 6]);
-
-    // All duplicates.
-    let mut dest = VecDeque::from(vec![1, 1, 1]);
-    dest.extend_into_ordered([1, 1], |&x| x);
-    assert_eq!(dest.into_iter().collect_vec(), vec![1, 1, 1, 1, 1]);
-
-    // All source elements larger.
-    let mut dest = VecDeque::from(vec![1, 2, 3]);
-    dest.extend_into_ordered([4, 5, 6], |&x| x);
-    assert_eq!(dest.into_iter().collect_vec(), vec![1, 2, 3, 4, 5, 6]);
-
-    // All source elements smaller.
-    let mut dest = VecDeque::from(vec![4, 5, 6]);
-    dest.extend_into_ordered([1, 2, 3], |&x| x);
-    assert_eq!(dest.into_iter().collect_vec(), vec![1, 2, 3, 4, 5, 6]);
-
-    // Custom key function.
-    let mut dest = VecDeque::from(vec!["aa", "cccc"]);
-    dest.extend_into_ordered(["bbb", "d"], |s| s.len());
-    assert_eq!(dest.into_iter().collect_vec(), vec![
-      "d", "aa", "bbb", "cccc"
-    ]);
-
-    // Single element source and dest.
-    let mut dest = VecDeque::from(vec![2]);
-    dest.extend_into_ordered([1], |&x| x);
-    assert_eq!(dest.into_iter().collect_vec(), vec![1, 2]);
-  }
-}
-
-pub struct ArcMap<T, R> {
-  _owner: Arc<T>,
-  v: R,
-}
-
-impl<T, R> ArcMap<T, R> {
-  pub fn map<'l, F>(arc: Arc<T>, mapper: F) -> Self
-  where
-    F: FnOnce(&'l T) -> R,
-    T: 'l,
-  {
-    // SAFETY: Arc allocates on heap and data will always live at that stable address.
-    let t_ptr = Arc::as_ptr(&arc);
-    let r = mapper(unsafe { &*t_ptr });
-    Self { _owner: arc, v: r }
-  }
-}
-
-impl<T, R> std::ops::Deref for ArcMap<T, R> {
-  type Target = R;
-
-  fn deref(&self) -> &Self::Target {
-    &self.v
-  }
+pub fn unarc<T>(arc: Arc<T>) -> T {
+  let Some(v) = Arc::into_inner(arc) else {
+    panic!("Arc is not owned");
+  };
+  v
 }
 
 pub trait AsyncConcurrentIteratorExt<T>: Iterator<Item = T> + Sized {
@@ -178,3 +78,38 @@ pub trait AsyncConcurrentStreamExt<T>: Stream<Item = T> + Sized + Unpin {
 }
 
 impl<T, S: Stream<Item = T> + Unpin> AsyncConcurrentStreamExt<T> for S {}
+
+// AtomicUsize counter with more ergonomic methods.
+#[derive(Debug, Default)]
+pub struct AtomUsz(AtomicUsize);
+
+impl AtomUsz {
+  pub fn new(v: usize) -> Self {
+    Self(AtomicUsize::new(v))
+  }
+
+  pub fn set(&self, v: usize) {
+    self.0.store(v, Ordering::Relaxed);
+  }
+
+  // Can't overload += as that's &mut.
+  pub fn inc(&self, v: usize) {
+    self.0.fetch_add(v, Ordering::Relaxed);
+  }
+
+  // Can't overload -= as that's &mut.
+  pub fn dec(&self, v: usize) {
+    self.0.fetch_sub(v, Ordering::Relaxed);
+  }
+
+  // Can't overload Deref as that requires returning a reference.
+  pub fn get(&self) -> usize {
+    self.0.load(Ordering::Relaxed)
+  }
+}
+
+impl From<usize> for AtomUsz {
+  fn from(v: usize) -> Self {
+    Self::new(v)
+  }
+}

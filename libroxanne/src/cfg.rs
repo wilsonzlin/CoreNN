@@ -1,109 +1,196 @@
 use crate::common::StdMetric;
+use crate::util::AtomUsz;
+use parking_lot::RwLock;
 use serde::Deserialize;
 use serde::Serialize;
 
-fn default_beam_width() -> usize {
-  4
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CompressionMode {
+  // TODO Other options:
+  // - PCA
+  // - UMAP
+  // - Scalar quantization (int8/int4/int2/int1)
+  PQ,
+  // For Matryoshka embeddings.
+  Trunc,
 }
 
-fn default_brute_force_index_cap() -> usize {
-  10_000
-}
-
-fn default_degree_bound() -> usize {
-  80
-}
-
-fn default_distance_threshold() -> f64 {
-  1.1
-}
-
-fn default_in_memory_index_cap() -> usize {
-  // Approx. 128 GB of RAM if dim=512, dtype=fp16, degree_bound=80.
-  80_000_000
-}
-
-fn default_max_degree_bound() -> usize {
-  160
-}
-
-fn default_merge_threshold_additional_edges() -> usize {
-  // Approx. 8 GB of RAM.
-  1_000_000_000
-}
-
-fn default_merge_threshold_deletes() -> usize {
-  // Approx. 3% of 1 billion.
-  30_000_000
-}
-
-fn default_pq_sample_size() -> usize {
-  100_000
-}
-
-fn default_query_search_list_cap() -> usize {
-  160
-}
-
-fn default_update_batch_size() -> usize {
-  64
-}
-
-fn default_update_search_list_cap() -> usize {
-  // Double the query's.
-  320
-}
-
+// This is the sparse object stored in the DB.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RoxanneDbCfg {
-  #[serde(default = "default_beam_width")]
-  pub beam_width: usize,
-  #[serde(default = "default_brute_force_index_cap")]
-  pub brute_force_index_cap: usize,
-  #[serde(default = "default_degree_bound")]
-  pub degree_bound: usize,
-  pub dim: usize,
-  #[serde(default = "default_distance_threshold")]
-  pub distance_threshold: f64,
-  #[serde(default = "default_in_memory_index_cap")]
-  pub in_memory_index_cap: usize,
-  #[serde(default = "default_max_degree_bound")]
-  pub max_degree_bound: usize,
-  #[serde(default = "default_merge_threshold_additional_edges")]
-  pub merge_threshold_additional_edges: usize,
-  #[serde(default = "default_merge_threshold_deletes")]
-  pub merge_threshold_deletes: usize,
-  pub metric: StdMetric,
-  #[serde(default = "default_pq_sample_size")]
-  pub pq_sample_size: usize,
-  pub pq_subspaces: usize,
-  #[serde(default = "default_query_search_list_cap")]
-  pub query_search_list_cap: usize,
-  #[serde(default = "default_update_batch_size")]
-  pub update_batch_size: usize,
-  #[serde(default = "default_update_search_list_cap")]
-  pub update_search_list_cap: usize,
+pub struct CfgRaw {
+  pub beam_width: Option<usize>,
+  pub compaction_threshold_deletes: Option<usize>,
+  pub compression_mode: Option<CompressionMode>,
+  pub compression_threshold: Option<usize>,
+  pub distance_threshold: Option<f32>,
+  pub max_add_edges: Option<usize>,
+  pub max_edges: Option<usize>,
+  pub metric: Option<StdMetric>,
+  pub pq_sample_size: Option<usize>,
+  pub pq_subspaces: Option<usize>,
+  pub query_search_list_cap: Option<usize>,
+  pub trunc_dims: Option<usize>,
+  pub update_batch_size: Option<usize>,
+  pub update_search_list_cap: Option<usize>,
 }
 
-impl Default for RoxanneDbCfg {
-  /// This should only be used to complete optional fields (e.g. `..Default.default()`); required fields will be initialized to garbage values and must not be used.
+impl Default for CfgRaw {
   fn default() -> Self {
     Self {
-      beam_width: default_beam_width(),
-      brute_force_index_cap: default_brute_force_index_cap(),
-      degree_bound: default_degree_bound(),
-      dim: 0,
-      distance_threshold: default_distance_threshold(),
-      in_memory_index_cap: default_in_memory_index_cap(),
-      max_degree_bound: default_max_degree_bound(),
-      merge_threshold_additional_edges: default_merge_threshold_additional_edges(),
-      merge_threshold_deletes: default_merge_threshold_deletes(),
-      metric: StdMetric::L2,
-      pq_sample_size: default_pq_sample_size(),
-      pq_subspaces: 0,
-      query_search_list_cap: default_query_search_list_cap(),
-      update_batch_size: default_update_batch_size(),
-      update_search_list_cap: default_update_search_list_cap(),
+      beam_width: None,
+      compaction_threshold_deletes: None,
+      compression_mode: None,
+      compression_threshold: None,
+      distance_threshold: None,
+      max_add_edges: None,
+      max_edges: None,
+      metric: None,
+      pq_sample_size: None,
+      pq_subspaces: None,
+      query_search_list_cap: None,
+      trunc_dims: None,
+      update_batch_size: None,
+      update_search_list_cap: None,
     }
+  }
+}
+
+// Wrapper that computes final Cfg values, many of which are dynamic: system RAM, vector count, dim., etc.
+pub struct Cfg {
+  pub raw: RwLock<CfgRaw>,
+  // Atomic and public as this should change after first insert.
+  pub dim: AtomUsz,
+  system_memory: usize,
+}
+
+impl Cfg {
+  pub fn new(raw: CfgRaw) -> Self {
+    let sysinfo = sysinfo::System::new();
+    let system_memory = sysinfo.total_memory() as usize;
+    Self {
+      raw: RwLock::new(raw),
+      dim: AtomUsz::new(0),
+      system_memory,
+    }
+  }
+
+  fn avail_mem(&self) -> usize {
+    // Assume 80% of system memory is for us.
+    (self.system_memory * 8) / 10
+  }
+
+  fn dim(&self) -> usize {
+    let mut dim = self.dim.get();
+    if dim == 0 {
+      // Assume reasonable default.
+      dim = 512;
+    };
+    dim
+  }
+
+  pub fn beam_width(&self) -> usize {
+    self.raw.read().beam_width.unwrap_or(4)
+  }
+
+  pub fn compaction_threshold_deletes(&self) -> usize {
+    self
+      .raw
+      .read()
+      .compaction_threshold_deletes
+      .unwrap_or(1_000_000)
+  }
+
+  pub fn compression_mode(&self) -> CompressionMode {
+    // PQ is the safe bet.
+    self
+      .raw
+      .read()
+      .compression_mode
+      .unwrap_or(CompressionMode::PQ)
+  }
+
+  pub fn compression_threshold(&self) -> usize {
+    self.raw.read().compression_threshold.unwrap_or_else(|| {
+      let avail_mem = self.avail_mem();
+      let bytes_per_vec = self.dim() * 2; // f16.
+      avail_mem / bytes_per_vec
+    })
+  }
+
+  pub fn distance_threshold(&self) -> f32 {
+    self.raw.read().distance_threshold.unwrap_or(1.1)
+  }
+
+  pub fn max_add_edges(&self) -> usize {
+    // Default to allowing a node to expand up to 2x max_edges.
+    self
+      .raw
+      .read()
+      .max_add_edges
+      .unwrap_or_else(|| self.max_edges())
+  }
+
+  pub fn max_edges(&self) -> usize {
+    self.raw.read().max_edges.unwrap_or_else(|| {
+      let dim = self.dim();
+      // Complete guesses, but reasonable for modern Transformer-based embeddings representing unstructured data.
+      // `dim` values near boundaries likely have issues.
+      if dim <= 128 {
+        dim / 4
+      } else if dim <= 1024 {
+        dim / 8
+      } else {
+        dim / 12
+      }
+    })
+  }
+
+  pub fn metric(&self) -> StdMetric {
+    // Cosine is the one that works better for high-dimensional embeddings, esp. ones representing unstructured data.
+    // However, L2 is important for lots of other classic applications: manual features, GIST, etc.
+    // So this is a toss-up. Go with Cosine because more people likely have that use case.
+    self.raw.read().metric.unwrap_or(StdMetric::Cosine)
+  }
+
+  pub fn pq_sample_size(&self) -> usize {
+    // Default: plenty, while fast to train.
+    self.raw.read().pq_sample_size.unwrap_or(10_000)
+  }
+
+  pub fn pq_subspaces(&self) -> usize {
+    self
+      .raw
+      .read()
+      .pq_subspaces
+      .unwrap_or_else(|| self.dim() / 8)
+  }
+
+  pub fn query_search_list_cap(&self) -> usize {
+    self
+      .raw
+      .read()
+      .query_search_list_cap
+      .unwrap_or_else(|| self.max_edges() * 2)
+  }
+
+  pub fn trunc_dims(&self) -> usize {
+    // This default is completely arbitrary — anyone using Trunc (i.e. Matryoshka embeddings) should manually set this.
+    self.raw.read().trunc_dims.unwrap_or_else(|| 64)
+  }
+
+  pub fn update_batch_size(&self) -> usize {
+    self
+      .raw
+      .read()
+      .update_batch_size
+      .unwrap_or_else(|| num_cpus::get())
+  }
+
+  pub fn update_search_list_cap(&self) -> usize {
+    self
+      .raw
+      .read()
+      .update_search_list_cap
+      .unwrap_or_else(|| self.query_search_list_cap())
   }
 }
