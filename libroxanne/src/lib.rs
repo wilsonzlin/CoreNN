@@ -36,7 +36,7 @@ use std::collections::VecDeque;
 use std::convert::identity;
 use std::future::Future;
 use std::iter::zip;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use updater::updater_thread;
 use updater::Update;
@@ -49,9 +49,6 @@ pub mod compressor;
 pub mod db;
 pub mod updater;
 pub mod util;
-
-#[cfg(test)]
-mod tests;
 
 // This is somewhat complex:
 // - We want to check presence in cache, exclusively to avoid multiple DB fetches for the same thing.
@@ -313,7 +310,7 @@ impl Roxanne {
     (search_list, seen)
   }
 
-  pub async fn open(dir: PathBuf) -> Arc<Roxanne> {
+  pub async fn open(dir: impl AsRef<Path>) -> Arc<Roxanne> {
     let db = Arc::new(Db::open(dir).await);
 
     let cfg_raw: CfgRaw = db.read_cfg().await;

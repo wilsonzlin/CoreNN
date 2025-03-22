@@ -9,6 +9,5 @@ itertools = "0.13.0"
 libroxanne = { version = "0.2.0", path = "../libroxanne" }
 ndarray = "0.15.0" # libroxanne requires 0.15.0.
 numpy = { version = "0.23", features = ["half"] }
-ndarray-linalg = { version = "0.15.0", features = ["openblas"] }
 pyo3 = { version = "0.23", features = ["extension-module", "generate-import-lib"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }

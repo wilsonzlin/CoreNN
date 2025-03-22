@@ -15,6 +15,7 @@ use rocksdb::Direction;
 use rocksdb::IteratorMode;
 use rocksdb::ReadOptions;
 use rocksdb::WriteBatchWithTransaction;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
@@ -218,7 +219,8 @@ pub struct Db {
 }
 
 impl Db {
-  pub async fn open(dir: PathBuf) -> Self {
+  pub async fn open(dir: impl AsRef<Path>) -> Self {
+    let dir = PathBuf::from(dir.as_ref());
     let db = spawn_blocking(move || rocksdb::DB::open(&rocksdb_options(), dir).unwrap())
       .await
       .unwrap()

@@ -243,8 +243,8 @@ mod tests {
     let mat_pq = pq.encode(&mat.view());
 
     let k = 10;
-    let dists = pairwise_euclidean_distance(&mat);
-    let dists_pq = pairwise_euclidean_distance(&pq.decode(&mat_pq.view()));
+    let dists = pairwise_euclidean_distance(&mat.mapv(f16::from_f32));
+    let dists_pq = pairwise_euclidean_distance(&pq.decode(&mat_pq.view()).mapv(f16::from_f32));
     let mut correct = 0;
     for (top, top_pq) in zip(top_k_per_row(&dists, k), top_k_per_row(&dists_pq, k)) {
       correct += top.intersection(&top_pq).count();

@@ -6,6 +6,8 @@ use roxanne::cmd::export_vectors::ExportVectorsArgs;
 use roxanne::cmd::migrate_hnsw::MigrateHnswArgs;
 use roxanne::cmd::serve::ServeArgs;
 
+extern crate blas_src;
+
 // Use jemalloc as the GNU malloc doesn't return freed memory to system during full-database iteration. Also see https://github.com/facebook/rocksdb/issues/12425#issuecomment-2004733577.
 #[global_allocator]
 static ALLOC: Jemalloc = Jemalloc;
