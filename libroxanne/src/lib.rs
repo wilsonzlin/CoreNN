@@ -32,13 +32,13 @@ use ndarray::ArrayView1;
 use ordered_float::OrderedFloat;
 use parking_lot::Mutex;
 use signal_future::SignalFuture;
-use tracing::debug;
 use std::collections::VecDeque;
 use std::convert::identity;
 use std::future::Future;
 use std::iter::zip;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::debug;
 use updater::updater_thread;
 use updater::Update;
 use util::AsyncConcurrentStreamExt;
@@ -251,7 +251,7 @@ impl Roxanne {
       // Pop and mark beam_width nodes for expansion.
       // We pop as we'll later re-rank then re-insert with updated dists.
       let to_expand = search_list
-        .extract_if(|p| !expanded.insert(p.id))
+        .extract_if(|p| expanded.insert(p.id))
         .take(self.cfg.beam_width())
         .collect_vec();
       if to_expand.is_empty() {
@@ -342,7 +342,12 @@ impl Roxanne {
       dim.set(n.1.vector.len());
     };
     let metric = cfg.metric().get_fn();
-    debug!(dim = dim.get(), count = count.get(), next_id = next_id.get(), "loaded state");
+    debug!(
+      dim = dim.get(),
+      count = count.get(),
+      next_id = next_id.get(),
+      "loaded state"
+    );
 
     let mode = if count.get() > cfg.compression_threshold() {
       let compressor: Option<Box<dyn Compressor>> = match cfg.compression_mode() {
@@ -412,16 +417,18 @@ impl Roxanne {
   }
 
   pub async fn insert(&self, entries: impl IntoIterator<Item = (String, Array1<f16>)>) {
-    iter(entries).for_each_concurrent(None, async |(k, v)| {
-      let (signal, ctl) = SignalFuture::new();
-      self
-        .update_sender
-        // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
-        .send_async(Update::Insert(k, v.mapv(|e| nan_to_num(e)), ctl))
-        .await
-        .unwrap();
-      signal.await;
-    }).await;
+    iter(entries)
+      .for_each_concurrent(None, async |(k, v)| {
+        let (signal, ctl) = SignalFuture::new();
+        self
+          .update_sender
+          // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
+          .send_async(Update::Insert(k, v.mapv(|e| nan_to_num(e)), ctl))
+          .await
+          .unwrap();
+        signal.await;
+      })
+      .await;
   }
 
   pub async fn delete(&self, key: &str) {

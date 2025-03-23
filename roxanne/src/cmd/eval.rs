@@ -56,7 +56,8 @@ async fn read_vecs(path: &PathBuf, dtype: Dtype, dim: usize) -> Vec<Array1<f16>>
     Dtype::F16 => size_of::<f16>(),
     Dtype::F32 => size_of::<f32>(),
   };
-  raw.chunks(dtype_size * dim)
+  raw
+    .chunks(dtype_size * dim)
     .map(|raw_vec| {
       let raw: Vec<f16> = match dtype {
         Dtype::F16 => cast_slice(raw_vec).to_vec(),
@@ -79,9 +80,14 @@ impl EvalArgs {
       let vectors: Vec<Array1<f16>> = read_vecs(vectors_path, self.dtype, self.dim.unwrap()).await;
       let n = vectors.len();
 
-      rox.insert(
-        vectors.into_iter().enumerate().map(|(id, v)| (id.to_string(), v)),
-      ).await;
+      rox
+        .insert(
+          vectors
+            .into_iter()
+            .enumerate()
+            .map(|(id, v)| (id.to_string(), v)),
+        )
+        .await;
       tracing::info!(n, "inserted vectors");
     };
 

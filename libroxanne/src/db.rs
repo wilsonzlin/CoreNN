@@ -171,7 +171,7 @@ impl DbTransaction {
 // - It compactly stores integers using reduced bits.
 // - It doesn't use space to store field names or types.
 // These are crucial as we want to pack this in under one disk page read, which DiskANN relies on.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NodeData {
   pub neighbors: Vec<Id>,
   pub vector: Array1<f16>,
@@ -277,8 +277,8 @@ impl Db {
     self.iter(DbKeyT::Deleted, |_| ()).map(|(id, _)| id)
   }
 
-  pub fn iter_ids(&self) -> RecvStream<(Id, String)> {
-    self.iter(DbKeyT::Id, |v| String::from_utf8(v.into_vec()).unwrap())
+  pub fn iter_keys(&self) -> RecvStream<(Id, String)> {
+    self.iter(DbKeyT::Key, |v| String::from_utf8(v.to_vec()).unwrap())
   }
 
   pub fn iter_nodes(&self) -> RecvStream<(Id, NodeData)> {

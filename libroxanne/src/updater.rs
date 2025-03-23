@@ -23,9 +23,9 @@ use half::f16;
 use itertools::Itertools;
 use ndarray::Array1;
 use signal_future::SignalFutureController;
-use tracing::debug;
 use std::iter::zip;
 use std::sync::Arc;
+use tracing::debug;
 
 pub enum Update {
   Insert(String, Array1<f16>, SignalFutureController<()>),
@@ -41,7 +41,11 @@ struct Updates {
 }
 
 /// Awaits the next update, then collects any further buffered updates. Returns None if the channel has closed. Otherwise, returns organized data about the updates.
-async fn collect_updates(receiver: &Receiver<Update>, next_id: &AtomUsz, cfg: &Cfg) -> Option<Updates> {
+async fn collect_updates(
+  receiver: &Receiver<Update>,
+  next_id: &AtomUsz,
+  cfg: &Cfg,
+) -> Option<Updates> {
   // DashMap instead of HashMap is a workaround for collect_msg otherwise borrowing to_insert mutably, so we can't get its length outside of the closure.
   let to_insert = DashMap::new();
   let mut to_delete = HashSet::new();
@@ -201,7 +205,11 @@ async fn maybe_enable_compression(rox: &Roxanne) {
   if rox.count.get() <= rox.cfg.compression_threshold() {
     return;
   };
-  tracing::warn!(threshold = rox.cfg.compression_threshold(), n = rox.count.get(), "enabling compression");
+  tracing::warn!(
+    threshold = rox.cfg.compression_threshold(),
+    n = rox.count.get(),
+    "enabling compression"
+  );
 
   let compressor: Box<dyn Compressor> = match rox.cfg.compression_mode() {
     CompressionMode::PQ => {
@@ -367,6 +375,15 @@ pub async fn updater_thread(rox: Arc<Roxanne>, receiver: Receiver<Update>) {
       txn.write_id(key, id);
       rox.count.inc(1);
     }
+    {
+      if is_first && insert_n > 0 {
+        // We will insert internal entry point node 0.
+        rox.count.inc(1);
+      };
+      let mut txn = txn.lock().await;
+      txn.write_count(rox.count.get());
+      txn.write_next_id(rox.next_id.get());
+    };
 
     let (node_data_updates, add_edges_updates) =
       update_persisted_graph(&txn, &rox, insert_ids, insert_vecs, is_first).await;

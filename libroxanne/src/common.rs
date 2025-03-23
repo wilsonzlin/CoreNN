@@ -15,17 +15,26 @@ pub struct PointDist {
 }
 
 pub fn dist_l2(a: &ArrayView1<f16>, b: &ArrayView1<f16>) -> f32 {
+  // We must convert to f32 to avoid overflow.
+  // It's also what most hardware does optimally.
+  let a = a.mapv(f16::to_f32);
+  let b = b.mapv(f16::to_f32);
   let diff = a - b;
   let squared_diff = &diff * &diff;
   let sum_squared_diff = squared_diff.sum();
-  sum_squared_diff.to_f32().sqrt()
+  sum_squared_diff.sqrt()
 }
 
 pub fn dist_cos(a: &ArrayView1<f16>, b: &ArrayView1<f16>) -> f32 {
-  let dot_product = a.dot(b).to_f32();
+  // We must convert to f32 to avoid overflow.
+  // It's also what most hardware does optimally.
+  let a = a.mapv(f16::to_f32);
+  let b = b.mapv(f16::to_f32);
 
-  let a_norm = a.dot(a).to_f32();
-  let b_norm = b.dot(b).to_f32();
+  let dot_product = a.dot(&b);
+
+  let a_norm = a.dot(&a);
+  let b_norm = b.dot(&b);
 
   let denominator = (a_norm * b_norm).sqrt();
 

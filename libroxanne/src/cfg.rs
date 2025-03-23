@@ -112,10 +112,8 @@ impl Cfg {
   }
 
   pub fn metric(&self) -> StdMetric {
-    // Cosine is the one that works better for high-dimensional embeddings, esp. ones representing unstructured data.
-    // However, L2 is important for lots of other classic applications: manual features, GIST, etc.
-    // So this is a toss-up. Go with Cosine because more people likely have that use case.
-    self.raw.read().metric.unwrap_or(StdMetric::Cosine)
+    // L2 is the safe bet.
+    self.raw.read().metric.unwrap_or(StdMetric::L2)
   }
 
   pub fn pq_sample_size(&self) -> usize {

@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::min;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ProductQuantizer<T: Float> {
   dims: usize,
   subspace_codebooks: Vec<KMeans<T, L2Dist>>,
