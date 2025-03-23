@@ -93,13 +93,15 @@ impl AtomUsz {
   }
 
   // Can't overload += as that's &mut.
-  pub fn inc(&self, v: usize) {
-    self.0.fetch_add(v, Ordering::Relaxed);
+  pub fn inc(&self, v: usize) -> usize {
+    let old = self.0.fetch_add(v, Ordering::Relaxed);
+    old + v
   }
 
   // Can't overload -= as that's &mut.
-  pub fn dec(&self, v: usize) {
-    self.0.fetch_sub(v, Ordering::Relaxed);
+  pub fn dec(&self, v: usize) -> usize {
+    let old = self.0.fetch_sub(v, Ordering::Relaxed);
+    old - v
   }
 
   // Can't overload Deref as that requires returning a reference.

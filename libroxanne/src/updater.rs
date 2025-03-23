@@ -23,11 +23,12 @@ use half::f16;
 use itertools::Itertools;
 use ndarray::Array1;
 use signal_future::SignalFutureController;
+use tracing::debug;
 use std::iter::zip;
 use std::sync::Arc;
 
 pub enum Update {
-  Insert(Vec<(String, Array1<f16>)>, SignalFutureController<()>),
+  Insert(String, Array1<f16>, SignalFutureController<()>),
   Delete(String, SignalFutureController<()>),
 }
 
@@ -39,53 +40,73 @@ struct Updates {
   signals: Vec<SignalFutureController<()>>,
 }
 
-impl Updates {
-  /// Awaits the next update, then collects any further buffered updates. Returns None if the channel has closed. Otherwise, returns organized data about the updates.
-  pub async fn receive(receiver: &Receiver<Update>, next_id: &AtomUsz, cfg: &Cfg) -> Option<Self> {
-    // DashMap instead of HashMap is a workaround for collect_msg otherwise borrowing to_insert mutably, so we can't get its length outside of the closure.
-    let to_insert = DashMap::new();
-    let mut to_delete = HashSet::new();
-    let mut signals = vec![];
-    let mut collect_msg = |msg: Update| {
-      match msg {
-        Update::Insert(ents, signal) => {
-          for (k, v) in ents {
-            // If there are duplicates within the same insert request or update batch, we can skip inserting the previous ones.
-            to_insert.insert(k.clone(), v);
-            // Delete any existing entry.
-            to_delete.insert(k);
-          }
-          signals.push(signal);
-        }
-        Update::Delete(key, signal) => {
-          to_insert.remove(&key);
-          // We still need to remove any existing one, even if a new insert was also requested with the same key (which we've now removed).
-          to_delete.insert(key);
-          signals.push(signal);
-        }
+/// Awaits the next update, then collects any further buffered updates. Returns None if the channel has closed. Otherwise, returns organized data about the updates.
+async fn collect_updates(receiver: &Receiver<Update>, next_id: &AtomUsz, cfg: &Cfg) -> Option<Updates> {
+  // DashMap instead of HashMap is a workaround for collect_msg otherwise borrowing to_insert mutably, so we can't get its length outside of the closure.
+  let to_insert = DashMap::new();
+  let mut to_delete = HashSet::new();
+  let mut signals = vec![];
+  let mut collect_msg = |msg: Update| {
+    match msg {
+      Update::Insert(k, v, signal) => {
+        // If there are duplicates within the same insert request or update batch, we can skip inserting the previous ones.
+        to_insert.insert(k.clone(), v);
+        // Delete any existing entry.
+        to_delete.insert(k);
+        signals.push(signal);
       }
-    };
-    collect_msg(receiver.recv_async().await.ok()?);
-    // Collect more if available.
-    while let Ok(msg) = receiver.try_recv() {
-      // Use batching as otherwise it's possible to build a poor graph. For example, the existing graph might have 5 nodes, and we're inserting 7,000; without batching, all edges can only be from those 5 nodes to the 7,000, hardly enough. Use batching to ensure there are enough high-quality optimized edges between our newly inserted nodes.
-      // Since we do batching here, we may as well not collect more than batch_size, otherwise we'll just do complex batching-within-batching.
-      if matches!(msg, Update::Insert(..)) && to_insert.len() >= cfg.update_batch_size() {
-        break;
-      };
-      collect_msg(msg);
+      Update::Delete(key, signal) => {
+        to_insert.remove(&key);
+        // We still need to remove any existing one, even if a new insert was also requested with the same key (which we've now removed).
+        to_delete.insert(key);
+        signals.push(signal);
+      }
     }
-    let (insert_keys, insert_vecs): (Vec<_>, Vec<_>) = to_insert.into_iter().unzip();
-    let insert_n = insert_keys.len();
-    let insert_ids = (0..insert_n).map(|i| next_id.get() + i).collect_vec();
-    next_id.inc(insert_n);
-    Some(Updates {
-      keys_to_delete_first: to_delete.into_iter().collect(),
-      insert_keys,
-      insert_ids,
-      insert_vecs,
-      signals,
-    })
+  };
+  collect_msg(receiver.recv_async().await.ok()?);
+  // Collect more if available.
+  while let Ok(msg) = receiver.try_recv() {
+    collect_msg(msg);
+    // Use batching as otherwise it's possible to build a poor graph. For example, the existing graph might have 5 nodes, and we're inserting 7,000; without batching, all edges can only be from those 5 nodes to the 7,000, hardly enough. Use batching to ensure there are enough high-quality optimized edges between our newly inserted nodes.
+    // Since we do batching here, we may as well not collect more than batch_size, otherwise we'll just do complex batching-within-batching.
+    if to_insert.len() >= cfg.update_batch_size() {
+      break;
+    };
+  }
+  let (insert_keys, insert_vecs): (Vec<_>, Vec<_>) = to_insert.into_iter().unzip();
+  let insert_n = insert_keys.len();
+  let insert_ids = (0..insert_n).map(|i| next_id.get() + i).collect_vec();
+  next_id.inc(insert_n);
+  Some(Updates {
+    keys_to_delete_first: to_delete.into_iter().collect(),
+    insert_keys,
+    insert_ids,
+    insert_vecs,
+    signals,
+  })
+}
+
+async fn update_persisted_graph_first_time(
+  txn: &Arc<tokio::sync::Mutex<DbTransaction>>,
+  rox: &Arc<Roxanne>,
+  insert_ids: Vec<Id>,
+  insert_vecs: Vec<Array1<f16>>,
+) {
+  let dim = insert_vecs[0].len();
+  debug!(dim, n = insert_ids.len(), "first graph update");
+  rox.dim.set(dim);
+
+  txn.lock().await.write_node(0, &NodeData {
+    neighbors: insert_ids.clone(),
+    vector: insert_vecs[0].clone(),
+  });
+  for (i, (&id, v)) in zip(&insert_ids, insert_vecs).enumerate() {
+    let mut neighbors = insert_ids.clone();
+    neighbors.remove(i);
+    txn.lock().await.write_node(id, &NodeData {
+      neighbors,
+      vector: v,
+    });
   }
 }
 
@@ -94,7 +115,13 @@ async fn update_persisted_graph(
   rox: &Arc<Roxanne>,
   insert_ids: Vec<Id>,
   insert_vecs: Vec<Array1<f16>>,
+  is_first: bool,
 ) -> (Arc<DashMap<Id, NodeData>>, Arc<DashMap<Id, Vec<Id>>>) {
+  if is_first {
+    update_persisted_graph_first_time(txn, rox, insert_ids, insert_vecs).await;
+    return Default::default();
+  };
+
   let backedges = Arc::new(DashMap::<Id, Vec<Id>>::new());
 
   zip(insert_ids, insert_vecs)
@@ -107,7 +134,7 @@ async fn update_persisted_graph(
         .1;
       // This is CPU bound, not I/O, so don't run in spawn_blocking.
       let neighbors = rox.prune_candidates(&v.view(), candidates).await;
-      // We can safely persist immediately: only existing nodes will be in `neighbors` so no non-existent node expansions occur if this is hit.
+      // We don't, but we *can* safely persist immediately: only existing nodes will be in `neighbors` so no non-existent node expansions occur if this is hit.
       txn.lock().await.write_node(id, &NodeData {
         neighbors: neighbors.clone(),
         vector: v,
@@ -120,8 +147,8 @@ async fn update_persisted_graph(
 
   // We cannot update in-memory data until DB is consistent.
   // So, we collect updates to do after transaction commit.
-  let new_nodes = Arc::new(DashMap::new());
-  let new_add_edges = Arc::new(DashMap::new());
+  let node_data_updates = Arc::new(DashMap::new());
+  let add_edges_updates = Arc::new(DashMap::new());
 
   unarc(backedges)
     .into_iter()
@@ -129,14 +156,14 @@ async fn update_persisted_graph(
       (
         rox.clone(),
         txn.clone(),
-        new_nodes.clone(),
-        new_add_edges.clone(),
+        node_data_updates.clone(),
+        add_edges_updates.clone(),
         id,
         backneighbors,
       )
     })
     .spawn_for_each(
-      |(rox, txn, new_nodes, new_add_edges, id, backneighbors)| async move {
+      |(rox, txn, node_data_updates, add_edges_updates, id, backneighbors)| async move {
         // We intentionally prune before, not after, adding new backneighbors.
         // Otherwise, we'd have to handle these add_edges to new nodes that aren't yet available in the DB.
         // From experience, that makes the system much more complex, subtle, and error-prone, as it breaks the simple source-of-truth and consistency invariants.
@@ -157,24 +184,24 @@ async fn update_persisted_graph(
           neighbors = rox.prune_candidates(&vector.view(), neighbors).await;
           let new_node = NodeData { neighbors, vector };
           txn.lock().await.write_node(id, &new_node);
-          new_nodes.insert(id, new_node);
+          node_data_updates.insert(id, new_node);
           add_edges.clear();
         }
         add_edges.extend(backneighbors);
         txn.lock().await.write_add_edges(id, &add_edges);
-        new_add_edges.insert(id, add_edges);
+        add_edges_updates.insert(id, add_edges);
       },
     )
     .await;
 
-  (new_nodes, new_add_edges)
+  (node_data_updates, add_edges_updates)
 }
 
 async fn maybe_enable_compression(rox: &Roxanne) {
   if rox.count.get() <= rox.cfg.compression_threshold() {
     return;
   };
-  tracing::warn!("enabling compression");
+  tracing::warn!(threshold = rox.cfg.compression_threshold(), n = rox.count.get(), "enabling compression");
 
   let compressor: Box<dyn Compressor> = match rox.cfg.compression_mode() {
     CompressionMode::PQ => {
@@ -300,7 +327,7 @@ async fn maybe_compact(rox: &Arc<Roxanne>) {
 // Because our Vamana implementation doesn't support parallel updates (it does batching instead), so a lot of complexity to split out insertion (thread-safe) and compaction (single thread) ultimately ends up being pointless. It's safer to get correct; if we need to optimize, we can profile in the future.
 // NOTE: Many operations in this method may seem incorrect due to only acquiring read locks (so it seems like changes could happen beneath our feet and we're not correctly looking at a stable consistent snapshot/view of the entire system/data), but remember that all updates are processed serially within this sole single-threaded/serially-executed function only.
 pub async fn updater_thread(rox: Arc<Roxanne>, receiver: Receiver<Update>) {
-  while let Some(u) = Updates::receive(&receiver, &rox.next_id, &rox.cfg).await {
+  while let Some(u) = collect_updates(&receiver, &rox.next_id, &rox.cfg).await {
     let Updates {
       keys_to_delete_first,
       insert_keys,
@@ -309,6 +336,9 @@ pub async fn updater_thread(rox: Arc<Roxanne>, receiver: Receiver<Update>) {
       signals,
     } = u;
     let insert_n = insert_ids.len();
+    // When first, when need to update `dim` and clone into entry point with ID 0.
+    let is_first = rox.count.get() == 0;
+    debug!(insert = insert_n, "received updates");
 
     // Use Tokio's lock as we need to hold across await.
     let txn = Arc::new(tokio::sync::Mutex::new(DbTransaction::new()));
@@ -338,22 +368,22 @@ pub async fn updater_thread(rox: Arc<Roxanne>, receiver: Receiver<Update>) {
       rox.count.inc(1);
     }
 
-    let (new_nodes, new_add_edges) =
-      update_persisted_graph(&txn, &rox, insert_ids, insert_vecs).await;
+    let (node_data_updates, add_edges_updates) =
+      update_persisted_graph(&txn, &rox, insert_ids, insert_vecs, is_first).await;
     unarc(txn).into_inner().commit(&rox.db).await;
     // Now the disk is up-to-date and consistent; we need to align in-memory data.
     let is_uncompressed = match &*rox.mode.read().await {
       Mode::Uncompressed(cache) => {
         // This currently doesn't race with Roxanne::get_point, where it clobbers our insert due to its async DB read.
         // new_nodes only has existing nodes, so get_point will never try to fetch from DB.
-        for (id, node) in unarc(new_nodes) {
+        for (id, node) in unarc(node_data_updates) {
           assert!(cache.insert(id, node));
         }
         true
       }
       _ => false,
     };
-    for (id, edges) in unarc(new_add_edges) {
+    for (id, edges) in unarc(add_edges_updates) {
       rox.add_edges.insert(id, edges);
     }
     for c in signals {

@@ -11,3 +11,5 @@ ndarray = "0.15.0" # libroxanne requires 0.15.0.
 numpy = { version = "0.23", features = ["half"] }
 pyo3 = { version = "0.23", features = ["extension-module", "generate-import-lib"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+pyo3-log = "0.12.2"
+tracing = { version = "0.1.41", features = ["log-always"] }

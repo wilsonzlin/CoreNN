@@ -342,7 +342,8 @@ impl Db {
       .maybe_read_raw(DbKeyT::NextId)
       .await
       .map(|raw| decode(&raw).unwrap())
-      .unwrap_or_default()
+      // 0 is reserved for entry point.
+      .unwrap_or(1)
   }
 
   pub async fn maybe_read_node(&self, id: Id) -> Option<NodeData> {

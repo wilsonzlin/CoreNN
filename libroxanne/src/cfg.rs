@@ -16,7 +16,7 @@ pub enum CompressionMode {
 }
 
 // This is the sparse object stored in the DB.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CfgRaw {
   pub beam_width: Option<usize>,
   pub compaction_threshold_deletes: Option<usize>,
@@ -34,49 +34,19 @@ pub struct CfgRaw {
   pub update_search_list_cap: Option<usize>,
 }
 
-impl Default for CfgRaw {
-  fn default() -> Self {
-    Self {
-      beam_width: None,
-      compaction_threshold_deletes: None,
-      compression_mode: None,
-      compression_threshold: None,
-      distance_threshold: None,
-      max_add_edges: None,
-      max_edges: None,
-      metric: None,
-      pq_sample_size: None,
-      pq_subspaces: None,
-      query_search_list_cap: None,
-      trunc_dims: None,
-      update_batch_size: None,
-      update_search_list_cap: None,
-    }
-  }
-}
-
 // Wrapper that computes final Cfg values, many of which are dynamic: system RAM, vector count, dim., etc.
 pub struct Cfg {
   pub raw: RwLock<CfgRaw>,
   // Atomic and public as this should change after first insert.
   pub dim: AtomUsz,
-  system_memory: usize,
 }
 
 impl Cfg {
   pub fn new(raw: CfgRaw) -> Self {
-    let sysinfo = sysinfo::System::new();
-    let system_memory = sysinfo.total_memory() as usize;
     Self {
       raw: RwLock::new(raw),
       dim: AtomUsz::new(0),
-      system_memory,
     }
-  }
-
-  fn avail_mem(&self) -> usize {
-    // Assume 80% of system memory is for us.
-    (self.system_memory * 8) / 10
   }
 
   fn dim(&self) -> usize {
@@ -110,11 +80,7 @@ impl Cfg {
   }
 
   pub fn compression_threshold(&self) -> usize {
-    self.raw.read().compression_threshold.unwrap_or_else(|| {
-      let avail_mem = self.avail_mem();
-      let bytes_per_vec = self.dim() * 2; // f16.
-      avail_mem / bytes_per_vec
-    })
+    self.raw.read().compression_threshold.unwrap_or(10_000_000)
   }
 
   pub fn distance_threshold(&self) -> f32 {

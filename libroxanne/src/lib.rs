@@ -32,6 +32,7 @@ use ndarray::ArrayView1;
 use ordered_float::OrderedFloat;
 use parking_lot::Mutex;
 use signal_future::SignalFuture;
+use tracing::debug;
 use std::collections::VecDeque;
 use std::convert::identity;
 use std::future::Future;
@@ -312,9 +313,11 @@ impl Roxanne {
 
   pub async fn open(dir: impl AsRef<Path>) -> Arc<Roxanne> {
     let db = Arc::new(Db::open(dir).await);
+    debug!("opened database");
 
     let cfg_raw: CfgRaw = db.read_cfg().await;
     let cfg = Cfg::new(cfg_raw);
+    debug!("loaded config");
 
     let deleted = DashSet::new();
     db.iter_deleted()
@@ -322,6 +325,7 @@ impl Roxanne {
         deleted.insert(id);
       })
       .await;
+    debug!(count = deleted.len(), "loaded deleted");
 
     let add_edges = DashMap::new();
     db.iter_add_edges()
@@ -329,6 +333,7 @@ impl Roxanne {
         add_edges.insert(id, add);
       })
       .await;
+    debug!(nodes = add_edges.len(), "loaded additional edges");
 
     let count: AtomUsz = db.read_count().await.into();
     let next_id: AtomUsz = db.read_next_id().await.into();
@@ -337,6 +342,7 @@ impl Roxanne {
       dim.set(n.1.vector.len());
     };
     let metric = cfg.metric().get_fn();
+    debug!(dim = dim.get(), count = count.get(), next_id = next_id.get(), "loaded state");
 
     let mode = if count.get() > cfg.compression_threshold() {
       let compressor: Option<Box<dyn Compressor>> = match cfg.compression_mode() {
@@ -371,14 +377,15 @@ impl Roxanne {
     // Spawn updater thread.
     let (oneshot_tx, oneshot_rx) = tokio::sync::oneshot::channel::<Arc<Roxanne>>();
     tokio::spawn({
-      let roxanne = oneshot_rx.await.unwrap();
       async move {
+        let roxanne = oneshot_rx.await.unwrap();
         updater_thread(roxanne, update_receiver).await;
       }
     });
     let Ok(_) = oneshot_tx.send(rox.clone()) else {
       unreachable!();
     };
+    debug!("spawned updater thread");
 
     rox
   }
@@ -405,22 +412,16 @@ impl Roxanne {
   }
 
   pub async fn insert(&self, entries: impl IntoIterator<Item = (String, Array1<f16>)>) {
-    let (signal, ctl) = SignalFuture::new();
-    self
-      .update_sender
-      .send_async(Update::Insert(
-        entries
-          .into_iter()
-          // TODO Check if expected, without race condition when initially zero.
-          .inspect(|e| self.dim.set(e.1.dim()))
-          // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
-          .map(|(k, v)| (k, v.mapv(|e| nan_to_num(e))))
-          .collect(),
-        ctl,
-      ))
-      .await
-      .unwrap();
-    signal.await;
+    iter(entries).for_each_concurrent(None, async |(k, v)| {
+      let (signal, ctl) = SignalFuture::new();
+      self
+        .update_sender
+        // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
+        .send_async(Update::Insert(k, v.mapv(|e| nan_to_num(e)), ctl))
+        .await
+        .unwrap();
+      signal.await;
+    }).await;
   }
 
   pub async fn delete(&self, key: &str) {
