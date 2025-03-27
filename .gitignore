@@ -1,12 +1,8 @@
 __pycache__/
+.testout/
 .venv*/
 Cargo.lock
 dist/
-example_2d.graph.webp
-example_2d.init_graph.webp
 node_modules/
 package-lock.json
 target/
-
-/dataset/*
-!/dataset/README.md

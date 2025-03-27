@@ -1,3 +1,4 @@
+use crate::new_pb;
 use crate::new_pb_with_msg;
 use ahash::HashSet;
 use bytemuck::cast_slice;
@@ -80,14 +81,23 @@ impl EvalArgs {
       let vectors: Vec<Array1<f16>> = read_vecs(vectors_path, self.dtype, self.dim.unwrap()).await;
       let n = vectors.len();
 
-      rox
-        .insert(
-          vectors
-            .into_iter()
-            .enumerate()
-            .map(|(id, v)| (id.to_string(), v)),
-        )
-        .await;
+      let pb = new_pb(n);
+
+      let mut next_id = 0;
+      for batch in vectors.chunks(1000) {
+        let batch_len = batch.len();
+        rox
+          .insert(
+            batch
+              .into_iter()
+              .enumerate()
+              .map(|(id, v)| ((next_id + id).to_string(), v.clone())),
+          )
+          .await;
+        next_id += batch_len;
+        pb.inc(batch_len as u64);
+      }
+      pb.finish();
       tracing::info!(n, "inserted vectors");
     };
 

@@ -1,5 +1,5 @@
-use crate::cfg::Cfg;
 use crate::cfg::CompressionMode;
+use crate::cfg::EffectiveCfg;
 use crate::common::Id;
 use crate::compressor::pq::ProductQuantizer;
 use crate::compressor::trunc::TruncCompressor;
@@ -25,6 +25,7 @@ use ndarray::Array1;
 use signal_future::SignalFutureController;
 use std::iter::zip;
 use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 use tracing::debug;
 
 pub enum Update {
@@ -44,7 +45,7 @@ struct Updates {
 async fn collect_updates(
   receiver: &Receiver<Update>,
   next_id: &AtomUsz,
-  cfg: &Cfg,
+  cfg: &EffectiveCfg,
 ) -> Option<Updates> {
   // DashMap instead of HashMap is a workaround for collect_msg otherwise borrowing to_insert mutably, so we can't get its length outside of the closure.
   let to_insert = DashMap::new();
@@ -73,7 +74,7 @@ async fn collect_updates(
     collect_msg(msg);
     // Use batching as otherwise it's possible to build a poor graph. For example, the existing graph might have 5 nodes, and we're inserting 7,000; without batching, all edges can only be from those 5 nodes to the 7,000, hardly enough. Use batching to ensure there are enough high-quality optimized edges between our newly inserted nodes.
     // Since we do batching here, we may as well not collect more than batch_size, otherwise we'll just do complex batching-within-batching.
-    if to_insert.len() >= cfg.update_batch_size() {
+    if to_insert.len() >= cfg.update_batch_size {
       break;
     };
   }
@@ -91,7 +92,7 @@ async fn collect_updates(
 }
 
 async fn update_persisted_graph_first_time(
-  txn: &Arc<tokio::sync::Mutex<DbTransaction>>,
+  txn: &Arc<TokioMutex<DbTransaction>>,
   rox: &Arc<Roxanne>,
   insert_ids: Vec<Id>,
   insert_vecs: Vec<Array1<f16>>,
@@ -115,8 +116,9 @@ async fn update_persisted_graph_first_time(
 }
 
 async fn update_persisted_graph(
-  txn: &Arc<tokio::sync::Mutex<DbTransaction>>,
+  txn: &Arc<TokioMutex<DbTransaction>>,
   rox: &Arc<Roxanne>,
+  cfg: &EffectiveCfg,
   insert_ids: Vec<Id>,
   insert_vecs: Vec<Array1<f16>>,
   is_first: bool,
@@ -126,16 +128,16 @@ async fn update_persisted_graph(
     return Default::default();
   };
 
+  let max_add_edges = cfg.max_add_edges;
+  let update_search_list_cap = cfg.update_search_list_cap;
+
   let backedges = Arc::new(DashMap::<Id, Vec<Id>>::new());
 
   zip(insert_ids, insert_vecs)
     .map(|(id, v)| (rox.clone(), backedges.clone(), txn.clone(), id, v.clone()))
     // Spawn as we'll do CPU-heavy calls so they should be spread across CPU cores.
     .spawn_for_each(|(rox, backedges, txn, id, v)| async move {
-      let candidates = rox
-        .search(&v.view(), 1, rox.cfg.update_search_list_cap())
-        .await
-        .1;
+      let candidates = rox.search(&v.view(), 1, update_search_list_cap).await.1;
       // This is CPU bound, not I/O, so don't run in spawn_blocking.
       let neighbors = rox.prune_candidates(&v.view(), candidates).await;
       // We don't, but we *can* safely persist immediately: only existing nodes will be in `neighbors` so no non-existent node expansions occur if this is hit.
@@ -178,7 +180,7 @@ async fn update_persisted_graph(
           .get(&id)
           .map(|e| e.clone())
           .unwrap_or_default();
-        if add_edges.len() + backneighbors.len() >= rox.cfg.max_add_edges() {
+        if add_edges.len() + backneighbors.len() >= max_add_edges {
           // We need to prune this neighbor.
           let NodeData {
             mut neighbors,
@@ -201,17 +203,17 @@ async fn update_persisted_graph(
   (node_data_updates, add_edges_updates)
 }
 
-async fn maybe_enable_compression(rox: &Roxanne) {
-  if rox.count.get() <= rox.cfg.compression_threshold() {
+async fn maybe_enable_compression(rox: &Roxanne, cfg: &EffectiveCfg) {
+  if rox.count.get() <= cfg.compression_threshold {
     return;
   };
   tracing::warn!(
-    threshold = rox.cfg.compression_threshold(),
+    threshold = cfg.compression_threshold,
     n = rox.count.get(),
     "enabling compression"
   );
 
-  let compressor: Box<dyn Compressor> = match rox.cfg.compression_mode() {
+  let compressor: Box<dyn Compressor> = match cfg.compression_mode {
     CompressionMode::PQ => {
       let pq = ProductQuantizer::<f32>::train_from_roxanne(rox).await;
       let mut txn = DbTransaction::new();
@@ -219,18 +221,17 @@ async fn maybe_enable_compression(rox: &Roxanne) {
       txn.commit(&rox.db).await;
       Box::new(pq)
     }
-    CompressionMode::Trunc => Box::new(TruncCompressor::new(rox.cfg.trunc_dims())),
+    CompressionMode::Trunc => Box::new(TruncCompressor::new(cfg.trunc_dims)),
   };
 
   *rox.mode.write().await = Mode::Compressed(compressor, Cache::new());
   tracing::info!("enabled compression");
 }
 
-async fn maybe_compact(rox: &Arc<Roxanne>) {
-  let cfg = &rox.cfg;
+async fn maybe_compact(rox: &Arc<Roxanne>, cfg: &EffectiveCfg) {
   let db = &rox.db;
 
-  if rox.deleted.len() < cfg.compaction_threshold_deletes() {
+  if rox.deleted.len() < cfg.compaction_threshold_deletes {
     // No need to merge yet.
     return;
   };
@@ -335,7 +336,11 @@ async fn maybe_compact(rox: &Arc<Roxanne>) {
 // Because our Vamana implementation doesn't support parallel updates (it does batching instead), so a lot of complexity to split out insertion (thread-safe) and compaction (single thread) ultimately ends up being pointless. It's safer to get correct; if we need to optimize, we can profile in the future.
 // NOTE: Many operations in this method may seem incorrect due to only acquiring read locks (so it seems like changes could happen beneath our feet and we're not correctly looking at a stable consistent snapshot/view of the entire system/data), but remember that all updates are processed serially within this sole single-threaded/serially-executed function only.
 pub async fn updater_thread(rox: Arc<Roxanne>, receiver: Receiver<Update>) {
-  while let Some(u) = collect_updates(&receiver, &rox.next_id, &rox.cfg).await {
+  loop {
+    let cfg = rox.cfg_lock.read().clone();
+    let Some(u) = collect_updates(&receiver, &rox.next_id, &cfg).await else {
+      break;
+    };
     let Updates {
       keys_to_delete_first,
       insert_keys,
@@ -349,7 +354,7 @@ pub async fn updater_thread(rox: Arc<Roxanne>, receiver: Receiver<Update>) {
     debug!(insert = insert_n, "received updates");
 
     // Use Tokio's lock as we need to hold across await.
-    let txn = Arc::new(tokio::sync::Mutex::new(DbTransaction::new()));
+    let txn = Arc::new(TokioMutex::new(DbTransaction::new()));
     let actually_deleted = AtomUsz::new(0);
     iter(&keys_to_delete_first)
       .for_each_concurrent(None, async |key| {
@@ -386,7 +391,7 @@ pub async fn updater_thread(rox: Arc<Roxanne>, receiver: Receiver<Update>) {
     };
 
     let (node_data_updates, add_edges_updates) =
-      update_persisted_graph(&txn, &rox, insert_ids, insert_vecs, is_first).await;
+      update_persisted_graph(&txn, &rox, &cfg, insert_ids, insert_vecs, is_first).await;
     unarc(txn).into_inner().commit(&rox.db).await;
     // Now the disk is up-to-date and consistent; we need to align in-memory data.
     let is_uncompressed = match &*rox.mode.read().await {
@@ -414,10 +419,10 @@ pub async fn updater_thread(rox: Arc<Roxanne>, receiver: Receiver<Update>) {
 
     // Opportunity to enable compression.
     if is_uncompressed {
-      maybe_enable_compression(&rox).await;
+      maybe_enable_compression(&rox, &cfg).await;
     }
 
     // Compact if enough deleted.
-    maybe_compact(&rox).await;
+    maybe_compact(&rox, &cfg).await;
   }
 }

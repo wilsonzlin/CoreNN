@@ -81,7 +81,8 @@ impl<T: Float> ProductQuantizer<T> {
     // Reservoir sampling from DB would require full disk read.
     // So we sample by ID, and assume there aren't many gaps (deletions).
     // TODO Handle gaps better.
-    let samp_sz = min(rox.count.get(), rox.cfg.pq_sample_size());
+    let cfg = rox.cfg_lock.read().clone();
+    let samp_sz = min(rox.count.get(), cfg.pq_sample_size);
     let ids = rand::seq::index::sample(&mut thread_rng(), rox.count.get(), samp_sz);
     let samp_nodes = ids
       .into_iter()
@@ -94,11 +95,11 @@ impl<T: Float> ProductQuantizer<T> {
     for (i, node) in samp_nodes.into_iter().enumerate() {
       mat.row_mut(i).assign(&node.vector.mapv(|x| x.to_f32()));
     }
-    let pq = ProductQuantizer::train(&mat.view(), rox.cfg.pq_subspaces());
+    let pq = ProductQuantizer::train(&mat.view(), cfg.pq_subspaces);
 
     tracing::info!(
       sample_inputs = actual_samp_sz,
-      subspaces = rox.cfg.pq_subspaces(),
+      subspaces = cfg.pq_subspaces,
       "trained PQ"
     );
 

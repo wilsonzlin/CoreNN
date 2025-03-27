@@ -1,4 +1,4 @@
-use crate::cfg::CfgRaw;
+use crate::cfg::SparseCfg;
 use crate::common::Id;
 use crate::compressor::pq::ProductQuantizer;
 use bitcode::decode;
@@ -124,7 +124,7 @@ impl DbTransaction {
     self.write((DbKeyT::AddEdges, id), neighbors);
   }
 
-  pub fn write_cfg(&mut self, cfg: &CfgRaw) {
+  pub fn write_cfg(&mut self, cfg: &SparseCfg) {
     // Use MessagePack for future compatibility/extensibility.
     self.write_raw(DbKeyT::Cfg, rmp_serde::to_vec(cfg).unwrap());
   }
@@ -299,7 +299,7 @@ impl Db {
       .unwrap_or_default()
   }
 
-  pub async fn read_cfg(&self) -> CfgRaw {
+  pub async fn read_cfg(&self) -> SparseCfg {
     self
       .maybe_read_raw(DbKeyT::Cfg)
       .await

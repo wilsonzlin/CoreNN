@@ -8,9 +8,9 @@
 use crate::util::AsyncConcurrentIteratorExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
-use cfg::Cfg;
-use cfg::CfgRaw;
 use cfg::CompressionMode;
+use cfg::EffectiveCfg;
+use cfg::SparseCfg;
 use common::nan_to_num;
 use common::Id;
 use common::Metric;
@@ -31,6 +31,7 @@ use ndarray::Array1;
 use ndarray::ArrayView1;
 use ordered_float::OrderedFloat;
 use parking_lot::Mutex;
+use parking_lot::RwLock;
 use signal_future::SignalFuture;
 use std::collections::VecDeque;
 use std::convert::identity;
@@ -38,6 +39,8 @@ use std::future::Future;
 use std::iter::zip;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::RwLock as TokioRwLock;
 use tracing::debug;
 use updater::updater_thread;
 use updater::Update;
@@ -48,6 +51,8 @@ pub mod cfg;
 pub mod common;
 pub mod compressor;
 pub mod db;
+#[cfg(test)]
+mod tests;
 pub mod updater;
 pub mod util;
 
@@ -57,7 +62,7 @@ pub mod util;
 // - We don't want exclusive lock over the entire cache, as that prevents concurrent DB reads.
 // So the current simple approach is DashMap<Id, Arc<Lock<Data>>> — the [ArbitraryLock](https://crates.io/crates/arbitrary-lock) pattern except locked data is persisted.
 // For simplicity, data must be Clone to avoid issues around holding locks and returning refs. I'm OK with the theoretical perf hit.
-struct Cache<D: Clone>(DashMap<Id, Arc<tokio::sync::Mutex<Option<D>>>>);
+struct Cache<D: Clone>(DashMap<Id, Arc<TokioMutex<Option<D>>>>);
 
 impl<D: Clone> Cache<D> {
   pub fn new() -> Self {
@@ -80,7 +85,7 @@ impl<D: Clone> Cache<D> {
   pub fn insert(&self, id: Id, data: D) -> bool {
     self
       .0
-      .insert(id, Arc::new(tokio::sync::Mutex::new(Some(data))))
+      .insert(id, Arc::new(TokioMutex::new(Some(data))))
       .is_some()
   }
 
@@ -101,32 +106,37 @@ enum Mode {
 
 pub struct Roxanne {
   add_edges: DashMap<Id, Vec<Id>>,
-  cfg: Cfg,
+  // Arc for cheap way to clone consistent snapshot.
+  // This is named `cfg_lock` and not `cfg` to discourage directly using to access the config, which doesn't provide a consistent view, and also repeatedly locks. Instead, do a cheap Arc clone.
+  cfg_lock: RwLock<Arc<EffectiveCfg>>,
   count: AtomUsz,
-  dim: AtomUsz, // Changes after first insert.
+  // Changes after first insert.
+  dim: AtomUsz,
   db: Arc<Db>,
   deleted: DashSet<Id>,
   metric: Metric,
-  mode: tokio::sync::RwLock<Mode>,
+  mode: TokioRwLock<Mode>,
   next_id: AtomUsz,
   update_sender: Sender<Update>,
 }
 
 impl Roxanne {
-  // For internal use only. No guarantees about DB schema or state.
+  /// For internal use only. No guarantees about DB schema or state.
   pub fn internal_db(&self) -> &Db {
     &self.db
   }
 
-  pub fn get_cfg(&self) -> CfgRaw {
-    self.cfg.raw.read().clone()
+  pub async fn get_cfg(&self) -> SparseCfg {
+    self.db.read_cfg().await
   }
 
-  pub async fn set_cfg(&self, cfg: CfgRaw) {
+  /// If you want to explicitly initialize/change the config, you must also provide the dimensionality of your vectors.
+  pub async fn set_cfg(&self, cfg: SparseCfg, dim: usize) {
     let mut txn = DbTransaction::new();
     txn.write_cfg(&cfg);
     txn.commit(&self.db).await;
-    *self.cfg.raw.write() = cfg;
+    self.dim.set(dim);
+    *self.cfg_lock.write() = Arc::new(EffectiveCfg::new(cfg, dim));
   }
 
   // TODO It's likely all callers of this have race conditions:
@@ -176,8 +186,9 @@ impl Roxanne {
     node: &ArrayView1<'_, f16>,
     candidate_ids: impl IntoIterator<Item = Id>,
   ) -> Vec<Id> {
-    let max_edges = self.cfg.max_edges();
-    let dist_thresh = self.cfg.distance_threshold();
+    let cfg = self.cfg_lock.read().clone();
+    let max_edges = cfg.max_edges;
+    let dist_thresh = cfg.distance_threshold;
 
     let mut candidates = candidate_ids
       .into_iter()
@@ -227,6 +238,8 @@ impl Roxanne {
     // And that's OK — simple makes this easier to understand and maintain.
     // The performance is still extremely fast — and probably fits in cache better and branches less.
 
+    let cfg = self.cfg_lock.read().clone();
+
     assert!(
       search_list_cap >= k,
       "search list capacity must be greater than or equal to k"
@@ -252,7 +265,7 @@ impl Roxanne {
       // We pop as we'll later re-rank then re-insert with updated dists.
       let to_expand = search_list
         .extract_if(|p| expanded.insert(p.id))
-        .take(self.cfg.beam_width())
+        .take(cfg.beam_width)
         .collect_vec();
       if to_expand.is_empty() {
         break;
@@ -315,8 +328,13 @@ impl Roxanne {
     let db = Arc::new(Db::open(dir).await);
     debug!("opened database");
 
-    let cfg_raw: CfgRaw = db.read_cfg().await;
-    let cfg = Cfg::new(cfg_raw);
+    let dim = AtomUsz::new(0);
+    if let Some(n) = db.iter_nodes().next().await {
+      dim.set(n.1.vector.len());
+    };
+
+    let cfg_raw: SparseCfg = db.read_cfg().await;
+    let cfg = EffectiveCfg::new(cfg_raw, dim.get());
     debug!("loaded config");
 
     let deleted = DashSet::new();
@@ -337,11 +355,7 @@ impl Roxanne {
 
     let count: AtomUsz = db.read_count().await.into();
     let next_id: AtomUsz = db.read_next_id().await.into();
-    let dim = AtomUsz::new(0);
-    if let Some(n) = db.iter_nodes().next().await {
-      dim.set(n.1.vector.len());
-    };
-    let metric = cfg.metric().get_fn();
+    let metric = cfg.metric.get_fn();
     debug!(
       dim = dim.get(),
       count = count.get(),
@@ -349,13 +363,13 @@ impl Roxanne {
       "loaded state"
     );
 
-    let mode = if count.get() > cfg.compression_threshold() {
-      let compressor: Option<Box<dyn Compressor>> = match cfg.compression_mode() {
+    let mode = if count.get() > cfg.compression_threshold {
+      let compressor: Option<Box<dyn Compressor>> = match cfg.compression_mode {
         CompressionMode::PQ => db.maybe_read_pq_model().await.map(|pq| {
           let compressor: Box<dyn Compressor> = Box::new(pq);
           compressor
         }),
-        CompressionMode::Trunc => Some(Box::new(TruncCompressor::new(cfg.trunc_dims()))),
+        CompressionMode::Trunc => Some(Box::new(TruncCompressor::new(cfg.trunc_dims))),
       };
       match compressor {
         Some(c) => Mode::Compressed(c, Cache::new()),
@@ -368,7 +382,7 @@ impl Roxanne {
     let (update_sender, update_receiver) = flume::unbounded();
     let rox = Arc::new(Roxanne {
       add_edges,
-      cfg,
+      cfg_lock: RwLock::new(Arc::new(cfg)),
       count,
       dim,
       db: db.clone(),
@@ -376,7 +390,7 @@ impl Roxanne {
       metric,
       next_id,
       update_sender,
-      mode: tokio::sync::RwLock::new(mode),
+      mode: TokioRwLock::new(mode),
     });
 
     // Spawn updater thread.
@@ -400,10 +414,8 @@ impl Roxanne {
     query: &'ref_ ArrayView1<'array, f16>,
     k: usize,
   ) -> Vec<(String, f32)> {
-    let res = self
-      .search(query, k, self.cfg.query_search_list_cap())
-      .await
-      .0;
+    let cfg = self.cfg_lock.read().clone();
+    let res = self.search(query, k, cfg.query_search_list_cap).await.0;
     let keys = res
       .iter()
       .map_concurrent(|r| self.db.maybe_read_key(r.id))

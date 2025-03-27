@@ -3,7 +3,7 @@ use ahash::HashMap;
 use clap::Args;
 use half::f16;
 use itertools::Itertools;
-use libroxanne::cfg::CfgRaw;
+use libroxanne::cfg::SparseCfg;
 use libroxanne::common::StdMetric;
 use libroxanne::db::Db;
 use libroxanne::db::DbTransaction;
@@ -38,7 +38,7 @@ impl MigrateHnswArgs {
 
     let index = load_hnsw(self.dim, &self.path);
 
-    let cfg = CfgRaw {
+    let cfg = SparseCfg {
       max_edges: Some(index.m),
       metric: Some(self.metric),
       query_search_list_cap: Some(index.ef),

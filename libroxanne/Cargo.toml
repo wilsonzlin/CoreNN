@@ -42,5 +42,6 @@ tracing = "0.1.41"
 
 [dev-dependencies]
 ndarray-rand = "0.14.0" # Version 0.15 depends on ndarray 0.16 which we cannot use (see above).
-tokio = { version = "1.41.1", features = ["fs", "macros", "rt", "rt-multi-thread", "sync"] }
+# For testing.
+tokio = { version = "1.41.1", features = ["full"] }
 tracing-subscriber = "0.3.18"

@@ -14,6 +14,13 @@ pub struct PointDist {
   pub dist: f32,
 }
 
+pub fn dist_l1(a: &ArrayView1<f16>, b: &ArrayView1<f16>) -> f32 {
+  let a = a.mapv(f16::to_f32);
+  let b = b.mapv(f16::to_f32);
+  let diff = a - b;
+  diff.mapv(|e| e.abs()).sum()
+}
+
 pub fn dist_l2(a: &ArrayView1<f16>, b: &ArrayView1<f16>) -> f32 {
   // We must convert to f32 to avoid overflow.
   // It's also what most hardware does optimally.
@@ -63,6 +70,7 @@ pub fn nan_to_num<T: num::Float>(v: T) -> T {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Display, EnumString, Serialize, Deserialize)]
 pub enum StdMetric {
+  L1,
   L2,
   Cosine,
 }
@@ -70,6 +78,7 @@ pub enum StdMetric {
 impl StdMetric {
   pub fn get_fn(self) -> fn(&ArrayView1<f16>, &ArrayView1<f16>) -> f32 {
     match self {
+      StdMetric::L1 => dist_l1,
       StdMetric::L2 => dist_l2,
       StdMetric::Cosine => dist_cos,
     }
