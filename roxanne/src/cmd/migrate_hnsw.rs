@@ -1,15 +1,16 @@
 use crate::load_hnsw;
 use ahash::HashMap;
 use clap::Args;
-use half::f16;
 use itertools::Itertools;
-use libroxanne::cfg::SparseCfg;
-use libroxanne::common::StdMetric;
-use libroxanne::db::Db;
-use libroxanne::db::DbTransaction;
-use libroxanne::db::NodeData;
-use ndarray::Array1;
+use libroxanne::cfg::Cfg;
+use libroxanne::metric::StdMetric;
+use libroxanne::store::schema::DbNodeData;
+use libroxanne::store::schema::ID_TO_KEY;
+use libroxanne::store::schema::KEY_TO_ID;
+use libroxanne::store::schema::NODE;
+use libroxanne::Roxanne;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Args)]
 pub struct MigrateHnswArgs {
@@ -32,19 +33,22 @@ pub struct MigrateHnswArgs {
 
 impl MigrateHnswArgs {
   pub async fn exec(self: MigrateHnswArgs) {
-    // Make sure database can be created before we do long expensive work.
-    let db = Db::open(self.out).await;
-    tracing::info!("created database");
-
     let index = load_hnsw(self.dim, &self.path);
 
-    let cfg = SparseCfg {
-      max_edges: Some(index.m),
-      metric: Some(self.metric),
-      query_search_list_cap: Some(index.ef),
-      update_search_list_cap: Some(index.ef_construction),
+    let cfg = Cfg {
+      dim: self.dim,
+      max_add_edges: index.m,
+      max_edges: index.m,
+      metric: self.metric,
+      query_search_list_cap: index.ef,
+      update_search_list_cap: index.ef_construction,
       ..Default::default()
     };
+
+    // Make sure database can be created before we do long expensive work.
+    let rox = Roxanne::create(self.out, cfg);
+    let db = rox.internal_db();
+    tracing::info!("created database");
 
     // In HNSW, "labels" are the external ID that the builder has defined for each vector.
     // To port to Roxanne, they will become the keys. We'll assign each a new internal Roxanne ID.
@@ -77,32 +81,29 @@ impl MigrateHnswArgs {
       .collect::<HashMap<_, _>>();
 
     // TODO Copy deleted markers.
-    let mut txn = DbTransaction::new();
-    txn.write_cfg(&cfg);
     // Offset by 1 as 0 is an additional vector, the clone of the entry point.
-    txn.write_count(vectors.len() + 1);
-    txn.write_next_id(vectors.len() + 1);
     // Write internal entry point clone.
     {
       let entry_label = index.entry_label();
       let entry_id = hnsw_label_to_rox_id[&entry_label];
-      txn.write_node(0, &NodeData {
+      NODE.put(db, 0, DbNodeData {
+        version: 0,
         neighbors: graph[&entry_id].clone(),
-        vector: Array1::from(vectors[&entry_id].clone()).mapv(|x| f16::from_f32(x)),
+        // TODO Allow configuring dtype.
+        vector: Arc::new(vectors[&entry_id].clone().into()),
       });
     };
     for (label, id) in hnsw_label_to_rox_id {
       let key = label.to_string();
-      txn.write_id(&key, id);
-      txn.write_key(id, &key);
-      txn.write_node(id, &NodeData {
+      KEY_TO_ID.put(db, &key, id);
+      ID_TO_KEY.put(db, id, &key);
+      NODE.put(db, id, DbNodeData {
+        version: 0,
         neighbors: graph.remove(&id).unwrap(),
-        vector: Array1::from(vectors.remove(&id).unwrap()).mapv(|x| f16::from_f32(x)),
+        vector: Arc::new(vectors.remove(&id).unwrap().into()),
       });
     }
-    txn.commit(&db).await;
-    db.flush().await;
-    drop(db);
+    drop(rox);
     tracing::info!("all done!");
   }
 }

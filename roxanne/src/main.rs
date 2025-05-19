@@ -1,10 +1,10 @@
 use clap::Parser;
 use clap::Subcommand;
-use jemallocator::Jemalloc;
 use roxanne::cmd::eval::EvalArgs;
 use roxanne::cmd::export_vectors::ExportVectorsArgs;
 use roxanne::cmd::migrate_hnsw::MigrateHnswArgs;
 use roxanne::cmd::serve::ServeArgs;
+use tikv_jemallocator::Jemalloc;
 
 extern crate blas_src;
 

@@ -1,10 +1,10 @@
 use super::Compressor;
-use bytemuck::cast_slice;
-use half::f16;
-use ndarray::s;
-use ndarray::Array1;
-use ndarray::ArrayView1;
+use super::CV;
+use crate::metric::StdMetric;
+use crate::vec::VecData;
+use std::sync::Arc;
 
+#[derive(Debug)]
 pub struct TruncCompressor {
   dim: usize,
 }
@@ -16,16 +16,26 @@ impl TruncCompressor {
 }
 
 impl Compressor for TruncCompressor {
-  fn compress(&self, v: &ArrayView1<f16>) -> Vec<u8> {
-    let s = v.slice(s![..self.dim]);
-    let s = s.as_slice().unwrap();
-    cast_slice(s).to_vec()
+  fn into_compressed(&self, v: VecData) -> CV {
+    macro_rules! trunc {
+      ($a:expr) => {{
+        $a.truncate(self.dim);
+        $a
+      }};
+    }
+    let v = match v {
+      VecData::BF16(mut a) => VecData::BF16(trunc!(a)),
+      VecData::F16(mut a) => VecData::F16(trunc!(a)),
+      VecData::F32(mut a) => VecData::F32(trunc!(a)),
+      VecData::F64(mut a) => VecData::F64(trunc!(a)),
+    };
+    Arc::new(v)
   }
 
-  fn decompress(&self, v: &[u8]) -> Array1<f16> {
-    // Callers should directly compare truncated vectors.
-    // Re-expanding to original dims with padded zeros is unnecessary.
-    let v: &[f16] = cast_slice(v);
-    Array1::from(v.to_vec())
+  fn dist(&self, metric: StdMetric, a: &CV, b: &CV) -> f64 {
+    let a = a.downcast_ref::<VecData>().unwrap();
+    let b = b.downcast_ref::<VecData>().unwrap();
+    let f = metric.get_fn();
+    f(a, b)
   }
 }

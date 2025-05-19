@@ -1,6 +1,5 @@
-use bytemuck::cast_slice;
 use clap::Args;
-use futures::StreamExt;
+use libroxanne::store::schema::NODE;
 use libroxanne::Roxanne;
 use std::path::PathBuf;
 use tokio::fs::create_dir_all;
@@ -21,9 +20,9 @@ pub struct ExportVectorsArgs {
 
 impl ExportVectorsArgs {
   pub async fn exec(self) {
-    let rox = Roxanne::open(self.path).await;
+    let rox = Roxanne::open(self.path);
 
-    let dim = rox.dim();
+    let dim = rox.cfg().dim;
 
     create_dir_all(&self.out).await.unwrap();
 
@@ -32,12 +31,11 @@ impl ExportVectorsArgs {
     let out_vecs = File::create(self.out.join("vecs.bin")).await.unwrap();
     let mut out_vecs = BufWriter::new(out_vecs);
 
-    let mut stream = rox.internal_db().iter_nodes();
-    while let Some((id, node)) = stream.next().await {
+    for (id, node) in NODE.iter(&rox.internal_db()) {
       out_ids.write_u64_le(id.try_into().unwrap()).await.unwrap();
-      assert_eq!(node.vector.len(), dim);
+      assert_eq!(node.vector.dim(), dim);
       out_vecs
-        .write_all(cast_slice(&node.vector.as_slice().unwrap()))
+        .write_all(node.vector.as_raw_bytes())
         .await
         .unwrap();
     }

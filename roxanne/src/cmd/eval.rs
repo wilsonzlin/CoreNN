@@ -5,11 +5,11 @@ use bytemuck::cast_slice;
 use clap::Args;
 use clap::ValueEnum;
 use half::f16;
-use libroxanne::util::AsyncConcurrentIteratorExt;
 use libroxanne::util::AtomUsz;
 use libroxanne::Roxanne;
-use ndarray::Array1;
-use std::iter::zip;
+use rayon::iter::IndexedParallelIterator;
+use rayon::iter::IntoParallelIterator;
+use rayon::iter::ParallelIterator;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::read;
@@ -51,7 +51,8 @@ pub struct EvalArgs {
   results: PathBuf,
 }
 
-async fn read_vecs(path: &PathBuf, dtype: Dtype, dim: usize) -> Vec<Array1<f16>> {
+// TODO Allow configuring dtype.
+async fn read_vecs(path: &PathBuf, dtype: Dtype, dim: usize) -> Vec<Vec<f16>> {
   let raw = read(path).await.unwrap();
   let dtype_size = match dtype {
     Dtype::F16 => size_of::<f16>(),
@@ -67,18 +68,18 @@ async fn read_vecs(path: &PathBuf, dtype: Dtype, dim: usize) -> Vec<Array1<f16>>
           raw_f32.iter().map(|&x| f16::from_f32(x)).collect()
         }
       };
-      Array1::from_vec(raw)
+      raw
     })
     .collect()
 }
 
 impl EvalArgs {
   pub async fn exec(self) {
-    let rox = Arc::new(Roxanne::open(self.path).await);
+    let rox = Arc::new(Roxanne::open(self.path));
     tracing::info!("loaded database");
 
     if let Some(vectors_path) = &self.vectors {
-      let vectors: Vec<Array1<f16>> = read_vecs(vectors_path, self.dtype, self.dim.unwrap()).await;
+      let vectors: Vec<Vec<f16>> = read_vecs(vectors_path, self.dtype, self.dim.unwrap()).await;
       let n = vectors.len();
 
       let pb = new_pb(n);
@@ -86,14 +87,10 @@ impl EvalArgs {
       let mut next_id = 0;
       for batch in vectors.chunks(1000) {
         let batch_len = batch.len();
-        rox
-          .insert(
-            batch
-              .into_iter()
-              .enumerate()
-              .map(|(id, v)| ((next_id + id).to_string(), v.clone())),
-          )
-          .await;
+        batch.into_par_iter().enumerate().for_each(|(id, v)| {
+          let k = (next_id + id).to_string();
+          rox.insert(&k, v);
+        });
         next_id += batch_len;
         pb.inc(batch_len as u64);
       }
@@ -101,7 +98,7 @@ impl EvalArgs {
       tracing::info!(n, "inserted vectors");
     };
 
-    let queries: Vec<Array1<f16>> = read_vecs(&self.queries, self.dtype, rox.dim()).await;
+    let queries: Vec<Vec<f16>> = read_vecs(&self.queries, self.dtype, rox.cfg().dim).await;
     tracing::info!(n = queries.len(), "loaded query vectors");
 
     let knn_ids: Vec<HashSet<u32>> = {
@@ -118,35 +115,23 @@ impl EvalArgs {
     let pb = new_pb_with_msg(queries.len());
     let correct = Arc::new(AtomUsz::new(0));
     let total = Arc::new(AtomUsz::new(0));
-    zip(queries, knn_ids)
-      .map(|(q, k)| {
-        (
-          rox.clone(),
-          pb.clone(),
-          correct.clone(),
-          total.clone(),
-          q,
-          k,
-        )
-      })
-      .spawn_for_each(
-        |(rox, pb, correct, total, query, knn_expected)| async move {
-          let k = knn_expected.len();
-          let knn_got: HashSet<u32> = rox
-            .query(&query.view(), k)
-            .await
-            .into_iter()
-            .map(|e| e.0.parse().unwrap())
-            .collect();
+    queries
+      .into_par_iter()
+      .zip(knn_ids)
+      .for_each(|(query, knn_expected)| {
+        let k = knn_expected.len();
+        let knn_got: HashSet<u32> = rox
+          .query(&query, k)
+          .into_iter()
+          .map(|e| e.0.parse().unwrap())
+          .collect();
 
-          let correct = correct.inc(knn_expected.intersection(&knn_got).count());
-          let total = total.inc(k);
-          let pc = correct as f64 / total as f64 * 100.0;
-          pb.set_message(format!("Correct: {pc:.2}% ({correct}/{total})"));
-          pb.inc(1);
-        },
-      )
-      .await;
+        let correct = correct.add(knn_expected.intersection(&knn_got).count());
+        let total = total.add(k);
+        let pc = correct as f64 / total as f64 * 100.0;
+        pb.set_message(format!("Correct: {pc:.2}% ({correct}/{total})"));
+        pb.inc(1);
+      });
     pb.finish();
 
     let correct = correct.get();

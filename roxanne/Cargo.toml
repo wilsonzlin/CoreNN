@@ -15,7 +15,7 @@ half = "2.4.1"
 hnswlib-rs = { version = "0.2.0", path = "../hnswlib-rs" }
 indicatif = "0.17.9"
 itertools = "0.13.0"
-jemallocator = "0.5.4"
+tikv-jemallocator = { version = "0.6.0", features = ["unprefixed_malloc_on_supported_platforms"] }
 libroxanne = { version = "0.2.0", path = "../libroxanne" }
 ndarray = { version = "0.15", features = ["blas"] } # libroxanne uses 0.15.
 num-traits = "0.2.19"

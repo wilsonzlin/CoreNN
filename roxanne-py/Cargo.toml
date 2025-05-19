@@ -8,8 +8,9 @@ half = "2.4.1"
 itertools = "0.13.0"
 libroxanne = { version = "0.2.0", path = "../libroxanne" }
 ndarray = "0.15.0" # libroxanne requires 0.15.0.
-numpy = { version = "0.23", features = ["half"] }
-pyo3 = { version = "0.23", features = ["extension-module", "generate-import-lib"] }
-pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+numpy = { version = "0.24", features = ["half"] }
+pyo3 = { version = "0.24", features = ["extension-module", "generate-import-lib"] }
 pyo3-log = "0.12.2"
+rayon = "1.10.0"
+serde-pyobject = "0.6.1"
 tracing = { version = "0.1.41", features = ["log-always"] }

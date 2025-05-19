@@ -1,459 +1,651 @@
-#![allow(async_fn_in_trait)]
-#![feature(async_closure)]
+#![feature(avx512_target_feature)]
 #![feature(duration_millis_float)]
-#![feature(extract_if)]
+#![feature(f16)]
 #![feature(path_add_extension)]
-#![warn(clippy::future_not_send)]
+#![feature(stdarch_x86_avx512_f16)]
+#![feature(stdarch_x86_avx512)]
 
-use crate::util::AsyncConcurrentIteratorExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
+use arbitrary_lock::ArbitraryLock;
+use cache::new_cv_cache;
+use cache::new_node_cache;
+use cache::CVCache;
+use cache::NodeCache;
+use cfg::Cfg;
 use cfg::CompressionMode;
-use cfg::EffectiveCfg;
-use cfg::SparseCfg;
 use common::nan_to_num;
 use common::Id;
-use common::Metric;
-use common::PointDist;
+use compaction::compact;
+use compressor::pq::ProductQuantizer;
 use compressor::trunc::TruncCompressor;
 use compressor::Compressor;
+use compressor::CV;
 use dashmap::DashMap;
 use dashmap::DashSet;
-use db::Db;
-use db::DbTransaction;
-use db::NodeData;
-use flume::Sender;
-use futures::stream::iter;
-use futures::StreamExt;
-use half::f16;
 use itertools::Itertools;
-use ndarray::Array1;
-use ndarray::ArrayView1;
+use metric::Metric;
+use metric::StdMetric;
 use ordered_float::OrderedFloat;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
-use signal_future::SignalFuture;
+use std::cmp::max;
 use std::collections::VecDeque;
 use std::convert::identity;
-use std::future::Future;
 use std::iter::zip;
+use std::ops::Deref;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::RwLock as TokioRwLock;
+use std::thread::spawn;
+use store::in_memory::InMemoryStore;
+use store::rocksdb::RocksDBStore;
+use store::schema::DbNodeData;
+use store::schema::ADD_EDGES;
+use store::schema::CFG;
+use store::schema::DELETED;
+use store::schema::ID_TO_KEY;
+use store::schema::KEY_TO_ID;
+use store::schema::NODE;
+use store::schema::PQ_MODEL;
+use store::Store;
 use tracing::debug;
-use updater::updater_thread;
-use updater::Update;
-use util::AsyncConcurrentStreamExt;
 use util::AtomUsz;
+use vec::VecData;
 
+pub mod cache;
 pub mod cfg;
 pub mod common;
+pub mod compaction;
 pub mod compressor;
-pub mod db;
-#[cfg(test)]
-mod tests;
-pub mod updater;
+pub mod metric;
+pub mod store;
 pub mod util;
+pub mod vec;
 
-// This is somewhat complex:
-// - We want to check presence in cache, exclusively to avoid multiple DB fetches for the same thing.
-// - DashMap uses locks that cannot be held across await though, so merely holding Entry and then only fetching if vacant doesn't work.
-// - We don't want exclusive lock over the entire cache, as that prevents concurrent DB reads.
-// So the current simple approach is DashMap<Id, Arc<Lock<Data>>> — the [ArbitraryLock](https://crates.io/crates/arbitrary-lock) pattern except locked data is persisted.
-// For simplicity, data must be Clone to avoid issues around holding locks and returning refs. I'm OK with the theoretical perf hit.
-struct Cache<D: Clone>(DashMap<Id, Arc<TokioMutex<Option<D>>>>);
+enum Mode {
+  // Lazy cache of DbNodeData in-memory.
+  // We don't prepopulate as that makes start time unnecessarily long.
+  // Use Arc or else memcpy dominates CPU time.
+  Uncompressed(NodeCache),
+  // Second element is a cache of compressed vectors.
+  // Caching isn't to save computation, it's to avoid DB roundtrip (same as Uncompressed).
+  // In compressed mode, graph edges are always fetched from DB.
+  Compressed(Arc<dyn Compressor>, CVCache),
+}
 
-impl<D: Clone> Cache<D> {
-  pub fn new() -> Self {
-    Self(DashMap::new())
-  }
+// It's possible to transition to compressed mode during a query.
+// As such, we clone the compressor and make it possible to get distance between compressed and uncompressed vectors.
+// This should almost never happen, but implemented to avoid panicking or giving up entirely (e.g. returning NaN).
+#[derive(Debug)]
+enum PointVec {
+  Uncompressed(Arc<VecData>),
+  Compressed(Arc<dyn Compressor>, CV),
+}
 
-  pub async fn get_or_compute<F: Future<Output = D>>(&self, id: Id, func: impl FnOnce() -> F) -> D {
-    let lock = self.0.entry(id).or_default().clone();
-    let mut g = lock.lock().await;
-    match &mut *g {
-      Some(d) => d.clone(),
-      None => {
-        let d = func().await;
-        g.insert(d).clone()
+// DbNodeData vector + some DB cfg + ergonomic types and helper methods.
+#[derive(Debug)]
+struct Point {
+  id: Id,
+  vec: PointVec,
+  metric_type: StdMetric,
+  metric: Metric,
+  // Optional convenient slot to store distance to something. Not set initially when getting node.
+  dist: OrderedFloat<f64>,
+}
+
+impl Point {
+  pub fn dist(&self, other: &Point) -> f64 {
+    match (&self.vec, &other.vec) {
+      (PointVec::Uncompressed(a), PointVec::Uncompressed(b)) => (self.metric)(a, b),
+      (PointVec::Compressed(c, a), PointVec::Compressed(_c, b)) => c.dist(self.metric_type, a, b),
+      (PointVec::Uncompressed(u), PointVec::Compressed(c, b))
+      | (PointVec::Compressed(c, b), PointVec::Uncompressed(u)) => {
+        c.dist(self.metric_type, &c.compress(u), b)
       }
     }
   }
 
-  /// Returns true if an existing entry was replaced.
-  pub fn insert(&self, id: Id, data: D) -> bool {
-    self
-      .0
-      .insert(id, Arc::new(TokioMutex::new(Some(data))))
-      .is_some()
-  }
-
-  pub fn evict(&self, id: Id) {
-    self.0.remove(&id);
+  pub fn dist_query(&self, query: &VecData) -> f64 {
+    match &self.vec {
+      PointVec::Uncompressed(v) => (self.metric)(v, query),
+      PointVec::Compressed(c, cv) => c.dist(self.metric_type, cv, &c.compress(query)),
+    }
   }
 }
 
-enum Mode {
-  // Lazy cache of NodeData in-memory.
-  // We don't prepopulate as that makes start time unnecessarily long.
-  Uncompressed(Cache<NodeData>),
-  // Second element is a cache of compressed vectors.
-  // Caching isn't to save computation, it's to avoid DB roundtrip (same as Uncompressed).
-  // In compressed mode, graph edges are always fetched from DB.
-  Compressed(Box<dyn Compressor>, Cache<Vec<u8>>),
-}
-
-pub struct Roxanne {
+pub struct State {
   add_edges: DashMap<Id, Vec<Id>>,
-  // Arc for cheap way to clone consistent snapshot.
-  // This is named `cfg_lock` and not `cfg` to discourage directly using to access the config, which doesn't provide a consistent view, and also repeatedly locks. Instead, do a cheap Arc clone.
-  cfg_lock: RwLock<Arc<EffectiveCfg>>,
+  // Cfg is not configurable during runtime (requires a restart).
+  // Otherwise, we'd have to handle at any time: changing metric, compression mode, etc.
+  cfg: Cfg,
+  // True if compaction is currently running.
+  compaction_check: Mutex<bool>,
+  // True if compression is enabled.
+  compression_transition_check: Mutex<bool>,
   count: AtomUsz,
-  // Changes after first insert.
-  dim: AtomUsz,
-  db: Arc<Db>,
+  db: Arc<dyn Store>,
   deleted: DashSet<Id>,
+  first_insert_lock: Mutex<bool>,
+  key_lock: ArbitraryLock<String, Mutex<()>>,
+  // Node reader don't need to check lock, only writers (to the same node) need to synchronize.
+  node_write_lock: ArbitraryLock<Id, Mutex<()>>,
   metric: Metric,
-  mode: TokioRwLock<Mode>,
+  mode: RwLock<Mode>,
   next_id: AtomUsz,
-  update_sender: Sender<Update>,
+}
+
+#[derive(Clone)]
+pub struct Roxanne(Arc<State>);
+
+impl Deref for Roxanne {
+  type Target = State;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
 }
 
 impl Roxanne {
   /// For internal use only. No guarantees about DB schema or state.
-  pub fn internal_db(&self) -> &Db {
+  pub fn internal_db(&self) -> &Arc<dyn Store> {
     &self.db
   }
 
-  pub async fn get_cfg(&self) -> SparseCfg {
-    self.db.read_cfg().await
+  pub fn cfg(&self) -> &Cfg {
+    &self.cfg
   }
 
-  /// If you want to explicitly initialize/change the config, you must also provide the dimensionality of your vectors.
-  pub async fn set_cfg(&self, cfg: SparseCfg, dim: usize) {
-    let mut txn = DbTransaction::new();
-    txn.write_cfg(&cfg);
-    txn.commit(&self.db).await;
-    self.dim.set(dim);
-    *self.cfg_lock.write() = Arc::new(EffectiveCfg::new(cfg, dim));
-  }
-
-  // TODO It's likely all callers of this have race conditions:
-  // - The mode may change during the caller's execution.
-  // - If compression suddenly enables, array dimensions and latent space will change.
-  // - Array dims. changing will cause panics. Latent space changing will cause incorrect distances.
-  async fn get_point(&self, id: Id) -> Array1<f16> {
-    match &*self.mode.read().await {
-      Mode::Uncompressed(cache) => {
-        cache
-          .get_or_compute(id, || self.db.read_node(id))
-          .await
-          .vector
-      }
-      Mode::Compressed(compressor, cache) => {
-        let compressed = cache
-          .get_or_compute(id, async || {
-            let node = self.db.read_node(id).await;
-            compressor.compress(&node.vector.view())
-          })
-          .await;
-        compressor.decompress(&compressed)
-      }
+  /// Some IDs may not be returned, if they don't exist, or due to subtle eventual consistency issues.
+  fn get_nodes(&self, ids: &[Id]) -> Vec<Option<Arc<DbNodeData>>> {
+    match &*self.mode.read() {
+      Mode::Uncompressed(node_cache) => node_cache.multi_get(ids),
+      Mode::Compressed(..) => self
+        .db
+        .read_ents(&NODE, ids.iter())
+        .into_iter()
+        .map(|n| n.map(|n| Arc::new(n)))
+        .collect_vec(),
     }
   }
 
-  async fn get_node(&self, id: Id) -> NodeData {
-    match &*self.mode.read().await {
-      Mode::Uncompressed(cache) => cache.get_or_compute(id, || self.db.read_node(id)).await,
-      Mode::Compressed(..) => self.db.read_node(id).await,
-    }
+  /// Some IDs may not be returned, if they don't exist, or due to subtle eventual consistency issues.
+  fn get_points<'a>(
+    &'a self,
+    ids: &'a [Id],
+    query: Option<&'a VecData>,
+  ) -> impl Iterator<Item = Option<Point>> + 'a {
+    // Hold lock across all reads. Getting some compressed nodes and others uncompressed breaks all code that uses this data.
+    let vecs = match &*self.mode.read() {
+      Mode::Uncompressed(node_cache) => node_cache
+        .multi_get(ids)
+        .into_iter()
+        .map(|raw| {
+          let raw = raw?;
+          Some(PointVec::Uncompressed(raw.vector.clone()))
+        })
+        .collect_vec(),
+      Mode::Compressed(compressor, cache) => cache
+        .multi_get(ids)
+        .into_iter()
+        .map(|cv| Some(PointVec::Compressed(compressor.clone(), cv?)))
+        .collect_vec(),
+    };
+    zip(ids, vecs).map(move |(&id, vec)| {
+      let vec = vec?;
+      let mut node = Point {
+        id,
+        vec,
+        metric: self.metric,
+        metric_type: self.cfg.metric,
+        dist: OrderedFloat(f64::INFINITY),
+      };
+      if let Some(q) = query {
+        node.dist.0 = node.dist_query(q);
+      }
+      Some(node)
+    })
   }
 
-  /// Calculate the distance between two DB nodes.
-  async fn dist(&self, a: Id, b: Id) -> f32 {
-    let (a, b) = tokio::join!(self.get_point(a), self.get_point(b));
-    (self.metric)(&a.view(), &b.view())
+  fn get_point(&self, id: Id, query: Option<&VecData>) -> Option<Point> {
+    self.get_points(&[id], query).exactly_one().ok().unwrap()
   }
 
-  /// Calculate the distance between a DB node and a query.
-  async fn dist2(&self, a: Id, b: &ArrayView1<'_, f16>) -> f32 {
-    (self.metric)(&self.get_point(a).await.view(), b)
-  }
+  fn prune_candidates(&self, node: &VecData, candidate_ids: &[Id]) -> Vec<Id> {
+    let max_edges = self.cfg.max_edges;
+    let dist_thresh = self.cfg.distance_threshold;
 
-  async fn prune_candidates(
-    &self,
-    node: &ArrayView1<'_, f16>,
-    candidate_ids: impl IntoIterator<Item = Id>,
-  ) -> Vec<Id> {
-    let cfg = self.cfg_lock.read().clone();
-    let max_edges = cfg.max_edges;
-    let dist_thresh = cfg.distance_threshold;
-
-    let mut candidates = candidate_ids
-      .into_iter()
-      .map_concurrent_unordered(async |candidate_id| PointDist {
-        id: candidate_id,
-        dist: self.dist2(candidate_id, node).await,
-      })
-      .collect_vec()
-      .await
-      .into_iter()
-      .sorted_unstable_by_key(|s| OrderedFloat(s.dist))
+    let mut candidates = self
+      .get_points(candidate_ids, Some(node))
+      .filter_map(|n| n)
+      .sorted_unstable_by_key(|s| s.dist)
       .collect::<VecDeque<_>>();
 
     let mut new_neighbors = Vec::new();
     // Even though the algorithm in the paper doesn't actually pop, the later pruning of the candidates at the end of the loop guarantees it will always be removed because d(p*, p') will always be zero for itself (p* == p').
-    while let Some(PointDist { id: p_star, .. }) = candidates.pop_front() {
-      new_neighbors.push(p_star);
+    while let Some(p_star) = candidates.pop_front() {
+      new_neighbors.push(p_star.id);
       if new_neighbors.len() == max_edges {
         break;
       }
-      let should_retain = candidates
-        .iter()
-        .map_concurrent(async |s| {
-          let s_to_p = s.dist;
-          let s_to_p_star = self.dist(p_star, s.id).await;
-          s_to_p <= s_to_p_star * dist_thresh
-        })
-        .collect_vec()
-        .await;
-      candidates = (0..candidates.len())
-        .filter(|&i| should_retain[i])
-        .map(|i| candidates[i])
-        .collect();
+      candidates.retain(|s| {
+        let s_to_p = s.dist.0;
+        let s_to_p_star = p_star.dist(s);
+        s_to_p <= s_to_p_star * dist_thresh
+      });
     }
     new_neighbors
   }
 
-  // TODO Ignore deleted.
-  async fn search(
-    &self,
-    query: &ArrayView1<'_, f16>,
-    k: usize,
-    search_list_cap: usize,
-  ) -> (Vec<PointDist>, DashSet<Id>) {
+  fn search(&self, query: &VecData, k: usize, search_list_cap: usize) -> (Vec<Point>, DashSet<Id>) {
     // NOTE: This is intentionally simple over optimized.
     // Not the most optimal data structures or avoiding of malloc/memcpy.
     // And that's OK — simple makes this easier to understand and maintain.
     // The performance is still extremely fast — and probably fits in cache better and branches less.
 
-    let cfg = self.cfg_lock.read().clone();
-
     assert!(
       search_list_cap >= k,
       "search list capacity must be greater than or equal to k"
     );
-    // Our list of seen nodes, always sorted by distance.
+    // Our list of candidate nodes, always sorted by distance.
     // This is our result list, but also the candidate list for expansion.
-    let mut search_list = Vec::<PointDist>::new();
+    let mut search_list = Vec::<Point>::new();
     // Seen != expansion. We just want to prevent duplicate nodes from being added to the search list.
     // Use DashSet as we'll insert from for_each_concurrent.
     let seen = DashSet::new();
-    // There's no need to expand the same node twice.
+    // There's no need to expand the same node more than once.
     let mut expanded = HashSet::new();
 
     // Start with the entry node.
-    search_list.push(PointDist {
-      id: 0,
-      dist: self.dist2(0, query).await,
-    });
+    let Some(entry) = self.get_point(0, Some(query)) else {
+      // No entry node, empty DB.
+      return Default::default();
+    };
+    search_list.push(entry);
     seen.insert(0);
 
     loop {
       // Pop and mark beam_width nodes for expansion.
       // We pop as we'll later re-rank then re-insert with updated dists.
       let to_expand = search_list
-        .extract_if(|p| expanded.insert(p.id))
-        .take(cfg.beam_width)
+        .extract_if(.., |p| expanded.insert(p.id))
+        .take(self.cfg.beam_width)
         .collect_vec();
       if to_expand.is_empty() {
         break;
       };
 
-      // Concurrently fetch all at once — don't block on or serialize I/O.
-      let fetched = to_expand
-        .into_iter()
-        .map_concurrent_unordered(async |node| {
-          let data = self.get_node(node.id).await;
-          (node, data.neighbors, data.vector)
-        })
-        .collect_vec()
-        .await;
+      let fetched = self.get_nodes(&to_expand.iter().map(|p| p.id).collect_vec());
 
       // Add expanded neighbors to search list.
-      let to_add = Mutex::new(Vec::<PointDist>::new());
-      iter(fetched)
-        .for_each_concurrent(None, async |(mut node, mut neighbors, full_vec)| {
-          // Re-rank using full vector.
-          node.dist = (self.metric)(&full_vec.view(), query);
-          to_add.lock().push(node);
+      let mut to_add = Vec::<Point>::new();
+      let mut neighbor_ids = Vec::<Id>::new();
+      for (mut point, node) in zip(to_expand, fetched) {
+        // Node doesn't exist anymore.
+        let Some(node) = node else {
+          continue;
+        };
 
-          // There may be additional neighbors.
-          if let Some(add) = self.add_edges.get(&node.id) {
-            neighbors.extend(add.as_slice());
-          };
-          iter(neighbors)
-            .for_each_concurrent(None, async |neighbor| {
-              // We've seen this node in a previous search iteration,
-              // or in this iteration — but from another node's expansion.
-              if !seen.insert(neighbor) {
-                return;
-              }
-              let dist = self.dist2(neighbor, query).await;
-              to_add.lock().push(PointDist { id: neighbor, dist });
-            })
-            .await;
-        })
-        .await;
+        // Collect its neighbors to total set of neighbors.
+        for &neighbor in node.neighbors.iter() {
+          // We've seen this node in a previous search iteration,
+          // or in this iteration — but from another node's expansion.
+          if !seen.insert(neighbor) {
+            continue;
+          }
+          neighbor_ids.push(neighbor);
+        }
+        // There may be additional neighbors.
+        if let Some(add) = self.add_edges.get(&point.id) {
+          for &neighbor in add.iter() {
+            if !seen.insert(neighbor) {
+              continue;
+            }
+            neighbor_ids.push(neighbor);
+          }
+        };
+
+        // Re-rank using full vector.
+        point.dist.0 = (self.metric)(&node.vector, query);
+        to_add.push(point);
+      }
+      // Get all neighbors at once.
+      for p in self.get_points(&neighbor_ids, Some(query)) {
+        if let Some(p) = p {
+          to_add.push(p);
+        }
+      }
+
       // WARNING: If you want to optimize by batching inserts, be careful:
       // Two source values to add could be inserted at the same position but between themselves are not sorted.
       // Remember to handle this scenario.
-      for node in to_add.into_inner() {
+      for point in to_add {
+        // Remove soft-deleted if already expanded. We still need to expand soft-deleted to traverse the graph accurately.
+        if self.deleted.contains(&point.id) && expanded.contains(&point.id) {
+          continue;
+        }
         let pos = search_list
-          .binary_search_by_key(&OrderedFloat(node.dist), |s| OrderedFloat(s.dist))
+          .binary_search_by_key(&point.dist, |s| s.dist)
           .map_or_else(identity, identity);
-        search_list.insert(pos, node);
+        search_list.insert(pos, point);
       }
 
-      // Without truncation, we'll search the entire graph.
+      // Without truncation each iteration, we'll search the entire graph.
       search_list.truncate(search_list_cap);
     }
 
     search_list.truncate(k);
+    // We use `seen` as candidates for new neighbors, so we should remove soft-deleted here too to avoid new edges to them.
+    // It's not necessary for correctness, but good to have. (We'll have to prune these edges later during compaction if we don't.)
+    seen.retain(|id| !self.deleted.contains(id));
     (search_list, seen)
   }
 
-  pub async fn open(dir: impl AsRef<Path>) -> Arc<Roxanne> {
-    let db = Arc::new(Db::open(dir).await);
+  fn new(
+    dir: Option<impl AsRef<Path>>,
+    init_cfg: Option<Cfg>,
+    create_if_missing: bool,
+    error_if_exists: bool,
+  ) -> Roxanne {
+    let db: Arc<dyn Store> = match dir {
+      Some(dir) => Arc::new(RocksDBStore::open(dir, create_if_missing, error_if_exists)),
+      None => Arc::new(InMemoryStore::new()),
+    };
     debug!("opened database");
 
-    let dim = AtomUsz::new(0);
-    if let Some(n) = db.iter_nodes().next().await {
-      dim.set(n.1.vector.len());
+    let is_empty = NODE.iter(&db).next().is_none();
+
+    let cfg = if let Some(cfg) = init_cfg {
+      CFG.put(&db, (), &cfg);
+      cfg
+    } else {
+      CFG.read(&db, ()).unwrap()
     };
 
-    let cfg_raw: SparseCfg = db.read_cfg().await;
-    let cfg = EffectiveCfg::new(cfg_raw, dim.get());
-    debug!("loaded config");
+    debug!(
+      beam_width = cfg.beam_width,
+      max_edges = cfg.max_edges,
+      max_add_edges = cfg.max_add_edges,
+      metric = ?cfg.metric,
+      query_search_list_cap = cfg.query_search_list_cap,
+      update_search_list_cap = cfg.update_search_list_cap,
+      "loaded config"
+    );
 
     let deleted = DashSet::new();
-    db.iter_deleted()
-      .for_each(async |id| {
-        deleted.insert(id);
-      })
-      .await;
+    DELETED.iter(&db).for_each(|(id, _)| {
+      deleted.insert(id);
+    });
     debug!(count = deleted.len(), "loaded deleted");
 
     let add_edges = DashMap::new();
-    db.iter_add_edges()
-      .for_each(async |(id, add)| {
-        add_edges.insert(id, add);
-      })
-      .await;
-    debug!(nodes = add_edges.len(), "loaded additional edges");
+    // 0 is reserved for the internal entry node.
+    let mut next_id = 1;
+    // Including soft-deleted.
+    let mut count = 0;
+    // All nodes must have an ADD_EDGES entry, even if empty.
+    // Since we iterate over all it, we also use it to track next_id and count.
+    // Soft-deleted nodes still have ADD_EDGES. Truly deleted nodes aren't mentioned anywhere. Therefore, scanning ADD_EDGES is enough for correct next_id.
+    ADD_EDGES.iter(&db).for_each(|(id, add)| {
+      add_edges.insert(id, add);
+      next_id = next_id.max(id + 1);
+      count += 1;
+    });
 
-    let count: AtomUsz = db.read_count().await.into();
-    let next_id: AtomUsz = db.read_next_id().await.into();
     let metric = cfg.metric.get_fn();
-    debug!(
-      dim = dim.get(),
-      count = count.get(),
-      next_id = next_id.get(),
-      "loaded state"
-    );
+    debug!(next_id, count, "loaded state");
 
-    let mode = if count.get() > cfg.compression_threshold {
-      let compressor: Option<Box<dyn Compressor>> = match cfg.compression_mode {
-        CompressionMode::PQ => db.maybe_read_pq_model().await.map(|pq| {
-          let compressor: Box<dyn Compressor> = Box::new(pq);
+    let mode = if count > cfg.compression_threshold {
+      let compressor: Option<Arc<dyn Compressor>> = match cfg.compression_mode {
+        CompressionMode::PQ => PQ_MODEL.read(&db, ()).map(|pq| {
+          let compressor: Arc<dyn Compressor> = Arc::new(pq);
           compressor
         }),
-        CompressionMode::Trunc => Some(Box::new(TruncCompressor::new(cfg.trunc_dims))),
+        CompressionMode::Trunc => Some(Arc::new(TruncCompressor::new(cfg.trunc_dims))),
       };
       match compressor {
-        Some(c) => Mode::Compressed(c, Cache::new()),
-        None => Mode::Uncompressed(Cache::new()),
+        Some(c) => Mode::Compressed(c.clone(), new_cv_cache(db.clone(), c)),
+        None => Mode::Uncompressed(new_node_cache(db.clone())),
       }
     } else {
-      Mode::Uncompressed(Cache::new())
+      Mode::Uncompressed(new_node_cache(db.clone()))
     };
 
-    let (update_sender, update_receiver) = flume::unbounded();
-    let rox = Arc::new(Roxanne {
+    Roxanne(Arc::new(State {
       add_edges,
-      cfg_lock: RwLock::new(Arc::new(cfg)),
-      count,
-      dim,
-      db: db.clone(),
+      cfg,
+      compaction_check: Mutex::new(false),
+      compression_transition_check: Mutex::new(matches!(mode, Mode::Compressed(..))),
+      count: count.into(),
+      db,
       deleted,
+      first_insert_lock: Mutex::new(is_empty),
+      key_lock: ArbitraryLock::new(),
       metric,
-      next_id,
-      update_sender,
-      mode: TokioRwLock::new(mode),
-    });
-
-    // Spawn updater thread.
-    let (oneshot_tx, oneshot_rx) = tokio::sync::oneshot::channel::<Arc<Roxanne>>();
-    tokio::spawn({
-      async move {
-        let roxanne = oneshot_rx.await.unwrap();
-        updater_thread(roxanne, update_receiver).await;
-      }
-    });
-    let Ok(_) = oneshot_tx.send(rox.clone()) else {
-      unreachable!();
-    };
-    debug!("spawned updater thread");
-
-    rox
+      mode: RwLock::new(mode),
+      next_id: next_id.into(),
+      node_write_lock: ArbitraryLock::new(),
+    }))
   }
 
-  pub async fn query<'ref_, 'array>(
-    &self,
-    query: &'ref_ ArrayView1<'array, f16>,
-    k: usize,
-  ) -> Vec<(String, f32)> {
-    let cfg = self.cfg_lock.read().clone();
-    let res = self.search(query, k, cfg.query_search_list_cap).await.0;
-    let keys = res
-      .iter()
-      .map_concurrent(|r| self.db.maybe_read_key(r.id))
-      .collect::<Vec<_>>()
-      .await;
+  pub fn create(dir: impl AsRef<Path>, cfg: Cfg) -> Roxanne {
+    Self::new(Some(dir), Some(cfg), true, true)
+  }
+
+  pub fn open(dir: impl AsRef<Path>) -> Roxanne {
+    Self::new(Some(dir), None, false, false)
+  }
+
+  pub fn new_in_memory() -> Roxanne {
+    Self::new(None::<PathBuf>, None, false, true)
+  }
+
+  pub fn query<D>(&self, query: &[D], k: usize) -> Vec<(String, f64)>
+  where
+    D: num::Float,
+    VecData: From<Vec<D>>,
+  {
+    let query = VecData::from(nan_to_num(query));
+    self.query_vec(query, k)
+  }
+
+  /// WARNING: `query` must not contain any NaN values.
+  /// It's possible to get less than k results due to data changes during the query.
+  pub fn query_vec(&self, query: VecData, k: usize) -> Vec<(String, f64)> {
+    let res = self
+      .search(&query, k, max(k, self.cfg.query_search_list_cap))
+      .0;
+    let keys = self.db.read_ents(&ID_TO_KEY, res.iter().map(|r| r.id));
     zip(keys, res)
-      // A node may have been deleted during the query (already collected, so didn't get filtered), or literally just after the end of the query but before here.
-      // TODO DOCUMENT: it's possible to get less than k for the above reason.
-      .filter_map(|(k, r)| k.map(|k| (k, r.dist)))
+      .filter_map(|(k, r)| k.map(|k| (k, r.dist.0)))
       .collect()
   }
 
-  pub async fn insert(&self, entries: impl IntoIterator<Item = (String, Array1<f16>)>) {
-    iter(entries)
-      .for_each_concurrent(None, async |(k, v)| {
-        let (signal, ctl) = SignalFuture::new();
-        self
-          .update_sender
-          // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
-          .send_async(Update::Insert(k, v.mapv(|e| nan_to_num(e)), ctl))
-          .await
-          .unwrap();
-        signal.await;
-      })
-      .await;
+  fn maybe_compact(&self) {
+    if self.deleted.len() < self.cfg.compaction_threshold_deletes {
+      return;
+    };
+
+    let mut is_compacting = self.compaction_check.lock();
+    if *is_compacting {
+      return;
+    };
+    *is_compacting = true;
+    drop(is_compacting);
+
+    let rox = self.clone();
+    spawn(move || {
+      compact(&rox);
+      let mut is_compacting = rox.compaction_check.lock();
+      *is_compacting = false;
+    });
   }
 
-  pub async fn delete(&self, key: &str) {
-    let (signal, ctl) = SignalFuture::new();
-    self
-      .update_sender
-      .send_async(Update::Delete(key.to_string(), ctl))
-      .await
-      .unwrap();
-    signal.await;
+  fn maybe_enable_compression(&self) {
+    if self.count.get() <= self.cfg.compression_threshold {
+      return;
+    };
+
+    let mut is_enabled = self.compression_transition_check.lock();
+    if *is_enabled {
+      // Already enabled or in process of being enabled.
+      return;
+    };
+    *is_enabled = true;
+    // Don't block subsequent calls to `maybe_enable_compression`.
+    drop(is_enabled);
+
+    let rox = self.clone();
+    spawn(move || {
+      tracing::warn!(
+        threshold = rox.cfg.compression_threshold,
+        n = rox.count.get(),
+        "enabling compression"
+      );
+      let compressor: Arc<dyn Compressor> = match rox.cfg.compression_mode {
+        CompressionMode::PQ => {
+          let pq = ProductQuantizer::<f32>::train_from_roxanne(&rox);
+          PQ_MODEL.put(&rox.db, (), &pq);
+          Arc::new(pq)
+        }
+        CompressionMode::Trunc => Arc::new(TruncCompressor::new(rox.cfg.trunc_dims)),
+      };
+      *rox.mode.write() =
+        Mode::Compressed(compressor.clone(), new_cv_cache(rox.db.clone(), compressor));
+      tracing::info!("enabled compression");
+    });
   }
 
-  pub fn dim(&self) -> usize {
-    self.dim.get()
+  pub fn insert<D>(&self, key: &String, vec: &[D])
+  where
+    D: num::Float,
+    VecData: From<Vec<D>>,
+  {
+    // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
+    let vec = VecData::from(nan_to_num(vec));
+    self.insert_vec(key, vec)
+  }
+
+  /// WARNING: `vec` must not contain any NaN values.
+  pub fn insert_vec(&self, key: &String, vec: VecData) {
+    let vec = Arc::new(vec);
+    let id = self.next_id.inc();
+    // Lock during the entire insert. Correctness is much more complex otherwise.
+    // Inserting a key multiple times in parallel is rare/a sign of a bug.
+    let lock = self.key_lock.get(key.to_string());
+    let _g = lock.lock();
+    let mut txn = Vec::new();
+    if let Some(existing_id) = KEY_TO_ID.read(&self.db, key) {
+      ID_TO_KEY.batch_delete(&mut txn, existing_id);
+      DELETED.batch_put(&mut txn, existing_id, ());
+      self.deleted.insert(existing_id);
+    }
+    ID_TO_KEY.batch_put(&mut txn, id, key);
+    KEY_TO_ID.batch_put(&mut txn, key, id);
+    // All nodes must have an ADD_EDGES entry, even if empty.
+    // (See `Roxanne::open`.)
+    ADD_EDGES.batch_put(&mut txn, id, &vec![]);
+
+    {
+      let mut is_first = self.first_insert_lock.lock();
+      if *is_first {
+        *is_first = false;
+        // We need to continue holding the lock throughout the whole insert, as otherwise other inserts will be expecting a 0 node but it won't exist, and will be detached.
+        debug!("first graph update");
+
+        // Insert internal copy as permanent entry node.
+        NODE.batch_put(&mut txn, 0usize, DbNodeData {
+          version: 0,
+          neighbors: vec![id],
+          vector: vec.clone(),
+        });
+        ADD_EDGES.batch_put(&mut txn, 0, vec![]);
+        // Insert node.
+        NODE.batch_put(&mut txn, id, DbNodeData {
+          version: 0,
+          neighbors: vec![0],
+          vector: vec.clone(),
+        });
+        ADD_EDGES.batch_put(&mut txn, id, vec![]);
+
+        self.db.write(txn);
+        return;
+      };
+    };
+
+    let candidates = self.search(&vec, 1, self.cfg.update_search_list_cap).1;
+    let neighbors = self.prune_candidates(&vec, &candidates.into_iter().collect_vec());
+    NODE.batch_put(&mut txn, id, DbNodeData {
+      version: 0,
+      neighbors: neighbors.clone(),
+      vector: vec.clone(),
+    });
+
+    // Backedges.
+    for j in neighbors {
+      // We lock one at a time (instead of across all) to avoid deadlocks.
+      // If we don't manage to commit the insert, but do commit some backedges, that's safe, since our code is resilient to edges to non-existent nodes.
+      let lock = self.node_write_lock.get(j);
+      let _g = lock.lock();
+      // We intentionally prune before, not after, adding new backneighbors.
+      // Otherwise, we'd have to handle these add_edges to new nodes that aren't yet available in the DB.
+      // From experience, that makes the system much more complex, subtle, and error-prone, as it breaks the simple source-of-truth and consistency invariants.
+      // This keeps the code and design simple and correct, a worthwhile trade-off.
+      // It may seem wasteful to not prune with new neighbors together in one go, but the next time this node's touched will just add more add_edges again anyway.
+      let mut add_edges = self
+        .add_edges
+        .get(&j)
+        .map(|e| e.clone())
+        .unwrap_or_default();
+      if add_edges.len() + 1 >= self.cfg.max_add_edges {
+        // We need to prune this neighbor.
+        // TODO For now, we always read from DB to avoid any subtle cache stale race conditions, since we hold a write lock so we are the only writer + we are always reading from DB so we'll always get the latest version. Is it necessary?
+        let Some(DbNodeData {
+          version,
+          mut neighbors,
+          vector,
+        }) = NODE.read(&self.db, j)
+        else {
+          // Eventual consistency: node is gone.
+          continue;
+        };
+        neighbors.extend_from_slice(&add_edges);
+        neighbors = self.prune_candidates(&vector, &neighbors);
+        let new_node = DbNodeData {
+          version: version + 1,
+          neighbors,
+          vector,
+        };
+        NODE.batch_put(&mut txn, j, &new_node);
+        if let Mode::Uncompressed(cache) = &*self.mode.read() {
+          cache.insert(j, Arc::new(new_node));
+        };
+        add_edges.clear();
+      }
+      add_edges.push(id);
+      ADD_EDGES.batch_put(&mut txn, j, &add_edges);
+      self.add_edges.insert(j, add_edges);
+    }
+
+    self.db.write(txn);
+
+    self.maybe_enable_compression();
+    self.maybe_compact();
+  }
+
+  pub fn delete(&self, key: &String) {
+    let lock = self.key_lock.get(key.to_string());
+    let _g = lock.lock();
+    let mut txn = Vec::new();
+    let Some(existing_id) = KEY_TO_ID.read(&self.db, key) else {
+      return;
+    };
+    ID_TO_KEY.batch_delete(&mut txn, existing_id);
+    KEY_TO_ID.batch_delete(&mut txn, key);
+    DELETED.batch_put(&mut txn, existing_id, ());
+    self.deleted.insert(existing_id);
+    self.db.write(txn);
+
+    self.maybe_compact();
   }
 }

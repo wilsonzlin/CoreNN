@@ -1,8 +1,7 @@
+use half::bf16;
 use half::f16;
-use itertools::Itertools;
+use libroxanne::cfg::Cfg;
 use libroxanne::Roxanne as RoxanneNative;
-use ndarray::Array1;
-use numpy::PyReadonlyArray1;
 use numpy::PyReadonlyArray2;
 use pyo3::pyclass;
 use pyo3::pymethods;
@@ -12,7 +11,10 @@ use pyo3::types::PyModuleMethods;
 use pyo3::Bound;
 use pyo3::PyAny;
 use pyo3::PyResult;
-use pyo3::Python;
+use rayon::iter::ParallelBridge;
+use rayon::iter::ParallelIterator;
+use serde_pyobject::from_pyobject;
+use std::iter::zip;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,51 +24,100 @@ struct Roxanne(Arc<RoxanneNative>);
 #[pymethods]
 impl Roxanne {
   #[staticmethod]
-  pub fn open(py: Python, dir: PathBuf) -> PyResult<Bound<PyAny>> {
-    // We must use pyo3_async_runtimes as we need to have the Tokio runtime running, as libroxanne uses tokio::spawn.
-    // (PyO3 does support async methods, but won't start a Rust runtime.)
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-      let db = RoxanneNative::open(dir).await;
-      Ok(Roxanne(db))
-    })
+  pub fn create(dir: PathBuf, cfg: Bound<PyAny>) -> PyResult<Roxanne> {
+    let cfg: Cfg = from_pyobject(cfg).unwrap();
+    let db = Arc::new(RoxanneNative::create(dir, cfg));
+    Ok(Roxanne(db))
   }
 
-  pub fn insert<'a>(
-    &self,
-    py: Python<'a>,
-    keys: Vec<String>,
-    vectors: PyReadonlyArray2<'a, f16>,
-  ) -> PyResult<Bound<'a, PyAny>> {
-    let db = self.0.clone();
-    // We must clone as PyReadonlyArray2 (borrowed Python value) cannot be sent between threads safely.
-    let entries = keys
+  #[staticmethod]
+  pub fn open(dir: PathBuf) -> PyResult<Roxanne> {
+    let db = Arc::new(RoxanneNative::open(dir));
+    Ok(Roxanne(db))
+  }
+
+  #[staticmethod]
+  pub fn new_in_memory() -> PyResult<Roxanne> {
+    let db = Arc::new(RoxanneNative::new_in_memory());
+    Ok(Roxanne(db))
+  }
+
+  pub fn insert_bf16(&self, keys: Vec<String>, vectors: PyReadonlyArray2<bf16>) {
+    zip(keys, vectors.as_array().rows())
+      .par_bridge()
+      .for_each(|(k, v)| {
+        self.0.insert(&k, v.as_slice().unwrap());
+      });
+  }
+
+  pub fn insert_f16(&self, keys: Vec<String>, vectors: PyReadonlyArray2<f16>) {
+    zip(keys, vectors.as_array().rows())
+      .par_bridge()
+      .for_each(|(k, v)| {
+        self.0.insert(&k, v.as_slice().unwrap());
+      });
+  }
+
+  pub fn insert_f32(&self, keys: Vec<String>, vectors: PyReadonlyArray2<f32>) {
+    zip(keys, vectors.as_array().rows())
+      .par_bridge()
+      .for_each(|(k, v)| {
+        self.0.insert(&k, v.as_slice().unwrap());
+      });
+  }
+
+  pub fn insert_f64(&self, keys: Vec<String>, vectors: PyReadonlyArray2<f64>) {
+    zip(keys, vectors.as_array().rows())
+      .par_bridge()
+      .for_each(|(k, v)| {
+        self.0.insert(&k, v.as_slice().unwrap());
+      });
+  }
+
+  pub fn query_bf16(&self, queries: PyReadonlyArray2<bf16>, k: usize) -> Vec<Vec<(String, f64)>> {
+    queries
+      .as_array()
+      .rows()
       .into_iter()
-      .enumerate()
-      .map(|(i, k)| {
-        let v = vectors.as_array().row(i).to_vec();
-        (k, Array1::from(v))
-      })
-      .collect_vec();
-    pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(db.insert(entries).await) })
+      .par_bridge()
+      .map(|q| self.0.query(q.as_slice().unwrap(), k))
+      .collect()
   }
 
-  pub fn query<'a>(
-    &self,
-    py: Python<'a>,
-    query: PyReadonlyArray1<'a, f16>,
-    k: usize,
-  ) -> PyResult<Bound<'a, PyAny>> {
-    let db = self.0.clone();
-    // We must clone as PyReadonlyArray1 (borrowed Python value) cannot be sent between threads safely.
-    let query = query.as_slice().unwrap().to_vec();
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-      Ok(db.query(&Array1::from(query).view(), k).await)
-    })
+  pub fn query_f16(&self, queries: PyReadonlyArray2<f16>, k: usize) -> Vec<Vec<(String, f64)>> {
+    queries
+      .as_array()
+      .rows()
+      .into_iter()
+      .par_bridge()
+      .map(|q| self.0.query(q.as_slice().unwrap(), k))
+      .collect()
+  }
+
+  pub fn query_f32(&self, queries: PyReadonlyArray2<f32>, k: usize) -> Vec<Vec<(String, f64)>> {
+    queries
+      .as_array()
+      .rows()
+      .into_iter()
+      .par_bridge()
+      .map(|q| self.0.query(q.as_slice().unwrap(), k))
+      .collect()
+  }
+
+  pub fn query_f64(&self, queries: PyReadonlyArray2<f64>, k: usize) -> Vec<Vec<(String, f64)>> {
+    queries
+      .as_array()
+      .rows()
+      .into_iter()
+      .par_bridge()
+      .map(|q| self.0.query(q.as_slice().unwrap(), k))
+      .collect()
   }
 }
 
 #[pymodule]
 fn roxanne_py(m: &Bound<PyModule>) -> PyResult<()> {
+  // Sends tracing messages to Python logging.
   pyo3_log::init();
   m.add_class::<Roxanne>()?;
   Ok(())

@@ -1,8 +1,10 @@
 use super::Compressor;
-use crate::util::AsyncConcurrentIteratorExt;
+use super::CV;
+use crate::metric::StdMetric;
+use crate::vec::VecData;
+use crate::Mode;
 use crate::Roxanne;
-use futures::StreamExt;
-use half::f16;
+use itertools::Itertools;
 use linfa::traits::FitWith;
 use linfa::traits::Predict;
 use linfa::DatasetBase;
@@ -12,18 +14,19 @@ use linfa_clustering::KMeans;
 use linfa_clustering::KMeansInit;
 use linfa_nn::distance::L2Dist;
 use ndarray::s;
-use ndarray::Array1;
 use ndarray::Array2;
 use ndarray::ArrayView1;
 use ndarray::ArrayView2;
+use rand::seq::IteratorRandom;
 use rand::thread_rng;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::min;
+use std::sync::Arc;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ProductQuantizer<T: Float> {
   dims: usize,
   subspace_codebooks: Vec<KMeans<T, L2Dist>>,
@@ -76,59 +79,40 @@ impl<T: Float> ProductQuantizer<T> {
     }
   }
 
-  pub async fn train_from_roxanne(rox: &Roxanne) -> ProductQuantizer<f32> {
-    // In-memory cache doesn't contain all vectors, and may be skewed.
-    // Reservoir sampling from DB would require full disk read.
-    // So we sample by ID, and assume there aren't many gaps (deletions).
-    // TODO Handle gaps better.
-    let cfg = rox.cfg_lock.read().clone();
-    let samp_sz = min(rox.count.get(), cfg.pq_sample_size);
-    let ids = rand::seq::index::sample(&mut thread_rng(), rox.count.get(), samp_sz);
-    let samp_nodes = ids
+  pub fn train_from_roxanne(rox: &Roxanne) -> ProductQuantizer<f32> {
+    let samp_sz = min(rox.cfg.pq_sample_size, rox.count.get());
+    // TODO Handle many gaps (i.e. deleted).
+    let ids = (0..rox.count.get()).choose_multiple(&mut thread_rng(), samp_sz);
+    let Mode::Uncompressed(nodes) = &*rox.mode.read() else {
+      unreachable!();
+    };
+    let samp_nodes = nodes
+      .multi_get(&ids)
       .into_iter()
-      .filter_map_concurrent(|id| rox.db.maybe_read_node(id))
-      .collect::<Vec<_>>()
-      .await;
+      .filter_map(|n| n)
+      .collect_vec();
     let actual_samp_sz = samp_nodes.len();
 
-    let mut mat = Array2::zeros((actual_samp_sz, rox.dim.get()));
+    let mut mat = Array2::zeros((actual_samp_sz, rox.cfg.dim));
     for (i, node) in samp_nodes.into_iter().enumerate() {
-      mat.row_mut(i).assign(&node.vector.mapv(|x| x.to_f32()));
+      mat.row_mut(i).assign(&node.vector.to_f32());
     }
-    let pq = ProductQuantizer::train(&mat.view(), cfg.pq_subspaces);
+    let pq = ProductQuantizer::train(&mat.view(), rox.cfg.pq_subspaces);
 
     tracing::info!(
       sample_inputs = actual_samp_sz,
-      subspaces = cfg.pq_subspaces,
+      subspaces = rox.cfg.pq_subspaces,
       "trained PQ"
     );
 
     pq
   }
 
-  pub fn encode(&self, mat: &ArrayView2<T>) -> Array2<u8> {
-    assert_eq!(mat.shape()[1], self.dims);
-    let n = mat.shape()[0];
-    let subspaces = self.subspace_codebooks.len();
-    let subdims = self.dims / subspaces;
-    let mut codes = Array2::zeros((n, subspaces));
-    for (i, codebook) in self.subspace_codebooks.iter().enumerate() {
-      let submat = mat.slice(s![.., i * subdims..(i + 1) * subdims]);
-      let obs = DatasetBase::new(submat, ());
-      let labels = codebook.predict(&obs);
-      assert_eq!(labels.shape(), &[n]);
-      codes
-        .slice_mut(s![.., i])
-        .assign(&labels.mapv(|x| u8::try_from(x).unwrap()));
-    }
-    codes
-  }
-
-  pub fn encode_1(&self, vec: &ArrayView1<T>) -> Array1<u8> {
+  pub fn encode(&self, vec: &ArrayView1<T>) -> Vec<u8> {
     assert_eq!(vec.shape()[0], self.dims);
     let subspaces = self.subspace_codebooks.len();
     let subdims = self.dims / subspaces;
-    let mut code = Array1::zeros(subspaces);
+    let mut code = vec![0; subspaces];
     for (i, codebook) in self.subspace_codebooks.iter().enumerate() {
       let subvec = vec.slice(s![i * subdims..(i + 1) * subdims]);
       let obs = DatasetBase::new(subvec, ());
@@ -137,124 +121,96 @@ impl<T: Float> ProductQuantizer<T> {
     }
     code
   }
-
-  pub fn decode(&self, codes: &ArrayView2<u8>) -> Array2<T> {
-    let n = codes.shape()[0];
-    let subspaces = self.subspace_codebooks.len();
-    let subdims = self.dims / subspaces;
-    assert_eq!(codes.shape()[1], subspaces);
-    let mut mat = Array2::<T>::zeros((n, self.dims));
-    for (i, codebook) in self.subspace_codebooks.iter().enumerate() {
-      let dec = codes
-        .column(i)
-        .mapv(|idx| codebook.centroids().row(idx.into()).to_owned());
-      for j in 0..n {
-        mat
-          .slice_mut(s![j, i * subdims..(i + 1) * subdims])
-          .assign(&dec[j]);
-      }
-    }
-    mat
-  }
-
-  pub fn decode_1(&self, code: &ArrayView1<u8>) -> Array1<T> {
-    let subspaces = self.subspace_codebooks.len();
-    let subdims = self.dims / subspaces;
-    assert_eq!(code.dim(), subspaces);
-    let mut mat = Array1::<T>::zeros(self.dims);
-    for (i, codebook) in self.subspace_codebooks.iter().enumerate() {
-      let dec = codebook.centroids().row(code[i].into()).to_owned();
-      mat
-        .slice_mut(s![i * subdims..(i + 1) * subdims])
-        .assign(&dec);
-    }
-    mat
-  }
 }
 
 impl Compressor for ProductQuantizer<f32> {
-  fn compress(&self, v: &ArrayView1<f16>) -> Vec<u8> {
-    self.encode_1(&v.mapv(|x| x.to_f32()).view()).to_vec()
+  fn into_compressed(&self, v: VecData) -> CV {
+    let v = v.into_f32();
+    let view = ArrayView1::from(&v);
+    Arc::new(self.encode(&view))
   }
 
-  fn decompress(&self, v: &[u8]) -> Array1<f16> {
-    let v = ArrayView1::from(v);
-    self.decode_1(&v).mapv(|x| f16::from_f32(x))
-  }
-}
+  fn dist(&self, metric: StdMetric, a: &CV, b: &CV) -> f64 {
+    let a_codes = a.downcast_ref::<Vec<u8>>().unwrap();
+    let b_codes = b.downcast_ref::<Vec<u8>>().unwrap();
+    assert_eq!(a_codes.len(), b_codes.len());
 
-#[cfg(test)]
-mod tests {
-  use super::ProductQuantizer;
-  use crate::common::dist_l2;
-  use ahash::HashSet;
-  use half::f16;
-  use itertools::Itertools;
-  use ndarray::Array;
-  use ndarray::Array2;
-  use ndarray::Axis;
-  use ordered_float::OrderedFloat;
-  use rand::distributions::Uniform;
-  use rand::prelude::Distribution;
-  use rand::thread_rng;
-  use std::iter::zip;
+    let num_subspaces = a_codes.len();
 
-  fn pairwise_euclidean_distance(matrix: &Array2<f16>) -> Array2<f32> {
-    let n = matrix.nrows();
-    let mut distances = Array2::zeros((n, n));
+    match metric {
+      StdMetric::L2 => {
+        // Calculate L2 distance: sqrt(sum_i(||centroid_a_i - centroid_b_i||^2))
+        // This is the sum of squared Euclidean distances between corresponding sub-centroids.
+        let mut total_dist_sq_f64 = 0.0_f64;
 
-    // Compute squared Euclidean distances
-    for i in 0..n {
-      for j in i + 1..n {
-        let squared_dist = dist_l2(&matrix.row(i), &matrix.row(j));
-        distances[[i, j]] = squared_dist;
-        distances[[j, i]] = squared_dist; // Distance matrix is symmetric
+        for i in 0..num_subspaces {
+          let codebook = &self.subspace_codebooks[i]; // KMeans<f32, L2Dist>
+          let centroids = codebook.centroids(); // &Array2<f32>
+                                                // a_codes[i] and b_codes[i] are u8, representing centroid indices.
+          let centroid_a_sub = centroids.row(a_codes[i].into()); // ArrayView1<f32>
+          let centroid_b_sub = centroids.row(b_codes[i].into()); // ArrayView1<f32>
+
+          let mut sub_dist_sq_f64 = 0.0_f64;
+          // Assuming centroid_a_sub and centroid_b_sub have the same length (subdims)
+          for k in 0..centroid_a_sub.len() {
+            let diff_f32 = centroid_a_sub[k] - centroid_b_sub[k];
+            let diff_f64: f64 = diff_f32.into(); // Promote to f64 for sum of squares
+            sub_dist_sq_f64 += diff_f64 * diff_f64;
+          }
+          total_dist_sq_f64 += sub_dist_sq_f64;
+        }
+        total_dist_sq_f64.sqrt()
+      }
+      StdMetric::Cosine => {
+        // Calculate Cosine distance: 1 - (A_hat . B_hat) / (||A_hat|| * ||B_hat||)
+        // A_hat and B_hat are reconstructed vectors from centroids.
+        // A_hat . B_hat = sum_i (centroid_a_sub_i . centroid_b_sub_i)
+        // ||A_hat||^2 = sum_i ||centroid_a_sub_i||^2
+        let mut total_dot_product_f64 = 0.0_f64;
+        let mut total_norm_sq_a_f64 = 0.0_f64;
+        let mut total_norm_sq_b_f64 = 0.0_f64;
+
+        for i in 0..num_subspaces {
+          let codebook = &self.subspace_codebooks[i];
+          let centroids = codebook.centroids();
+          let centroid_a_sub = centroids.row(a_codes[i] as usize);
+          let centroid_b_sub = centroids.row(b_codes[i] as usize);
+
+          // .dot() on ArrayView1<f32> returns f32. Cast to f64 for accumulation.
+          total_dot_product_f64 += (centroid_a_sub.dot(&centroid_b_sub)) as f64;
+          total_norm_sq_a_f64 += (centroid_a_sub.dot(&centroid_a_sub)) as f64; // ||ca_j||^2
+          total_norm_sq_b_f64 += (centroid_b_sub.dot(&centroid_b_sub)) as f64; // ||cb_j||^2
+        }
+
+        // Handle cases with zero vectors using a small epsilon for squared norms.
+        // A squared norm being less than EPSILON_SQ_NORM means the norm itself is very small.
+        const EPSILON_SQ_NORM: f64 = 1e-12;
+
+        if total_norm_sq_a_f64 < EPSILON_SQ_NORM && total_norm_sq_b_f64 < EPSILON_SQ_NORM {
+          return 0.0; // Both reconstructed vectors are effectively zero. Cosine distance is 0.
+        }
+        if total_norm_sq_a_f64 < EPSILON_SQ_NORM || total_norm_sq_b_f64 < EPSILON_SQ_NORM {
+          // One vector is effectively zero, the other is not. Cosine similarity is 0, distance is 1.
+          return 1.0;
+        }
+
+        let norm_a_f64 = total_norm_sq_a_f64.sqrt();
+        let norm_b_f64 = total_norm_sq_b_f64.sqrt();
+
+        // It's highly unlikely norm_a_f64 or norm_b_f64 are zero if total_norm_sq_... were not,
+        // but as a robust step, ensure denominator is not zero.
+        // Using a slightly larger epsilon for norms themselves (sqrt of EPSILON_SQ_NORM).
+        const EPSILON_NORM: f64 = 1e-6; // sqrt(1e-12)
+        if norm_a_f64 < EPSILON_NORM || norm_b_f64 < EPSILON_NORM {
+          return 1.0; // Denominator is effectively zero.
+        }
+
+        let cosine_similarity = total_dot_product_f64 / (norm_a_f64 * norm_b_f64);
+
+        // Clamp cosine_similarity to [-1.0, 1.0] due to potential floating point inaccuracies.
+        let clamped_similarity = cosine_similarity.max(-1.0).min(1.0);
+        1.0 - clamped_similarity
       }
     }
-
-    // Take square root to get Euclidean distances
-    distances.mapv_inplace(|x| x.sqrt());
-
-    distances
-  }
-
-  fn top_k_per_row(matrix: &Array2<f32>, k: usize) -> Vec<HashSet<usize>> {
-    matrix
-      .axis_iter(Axis(0))
-      .map(|row| {
-        row
-          .iter()
-          .enumerate()
-          .sorted_by_key(|(_, &x)| OrderedFloat(x))
-          .take(k)
-          .map(|(i, _)| i.try_into().unwrap())
-          .collect::<HashSet<_>>()
-      })
-      .collect()
-  }
-
-  #[test]
-  fn test_pq() {
-    let mut rng = thread_rng();
-    let dist = Uniform::new(-10.0f32, 10.0f32);
-    let n = 1000;
-    let mat = Array::from_shape_fn((n, 128), |_| dist.sample(&mut rng));
-
-    let pq = ProductQuantizer::train(&mat.view(), 64);
-    let mat_pq = pq.encode(&mat.view());
-
-    let k = 10;
-    let dists = pairwise_euclidean_distance(&mat.mapv(f16::from_f32));
-    let dists_pq = pairwise_euclidean_distance(&pq.decode(&mat_pq.view()).mapv(f16::from_f32));
-    let mut correct = 0;
-    for (top, top_pq) in zip(top_k_per_row(&dists, k), top_k_per_row(&dists_pq, k)) {
-      correct += top.intersection(&top_pq).count();
-    }
-    println!(
-      "[PQ] Correct: {}/{} ({:.2}%)",
-      correct,
-      k * n,
-      correct as f64 / (k * n) as f64 * 100.0
-    );
   }
 }
