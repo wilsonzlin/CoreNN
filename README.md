@@ -1,8 +1,8 @@
 # CoreNN
 
-Database for [querying **billions** of vectors and embeddings](https://en.wikipedia.org/wiki/Nearest_neighbor_search) in sublinear time on commodity machines.
+Database for querying **billions** of vectors and embeddings in sublinear time on commodity machines.
 
-Read the [accompanying blog post](https://blog.wilsonl.in/corenn) for an accessible introduction and in-depth technical report.
+Read the [accompanying blog post](https://blog.wilsonl.in/corenn/) for details and an accessible deep dive and in-depth technical report.
 
 ## Getting started
 
