@@ -1,12 +1,16 @@
 use crate::vec::VecData;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use half::bf16;
 use half::f16;
 use ndarray::ArrayView1;
 use ndarray::ArrayView1 as AV;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+#[cfg(target_arch = "aarch64")]
+use std::arch::is_aarch64_feature_detected;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::arch::x86_64::*;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::mem::transmute;
 
 #[target_feature(enable = "avx512f,avx512bf16")]
@@ -225,140 +229,149 @@ unsafe fn dist_l2_f64_avx512(a_slice: &[f64], b_slice: &[f64]) -> f64 {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "sve,bf16")]
-unsafe fn dist_l2_bf16_sve(a_slice: &[bf16], b_slice: &[bf16]) -> f64 {
+#[target_feature(enable = "neon,fp16")]
+unsafe fn dist_l2_f16_neon(a_slice: &[f16], b_slice: &[f16]) -> f64 {
   let len = a_slice.len();
   if len == 0 {
     return 0.0;
   }
 
-  let mut p_a = a_slice.as_ptr();
-  let mut p_b = b_slice.as_ptr();
+  let ptr_a = a_slice.as_ptr();
+  let ptr_b = b_slice.as_ptr();
 
-  let mut acc_vec_f32 = svdup_n_f32(0.0f32);
-  let mut count = len as u64;
+  let mut acc_sum_f32 = vdupq_n_f32(0.0);
+  let mut i = 0;
 
-  while svptest_first(svptrue_b16(), svwhilelt_b16_u64(0, count)) {
-    let pg: svbool_t = svwhilelt_b16_u64(0, count);
-    let current_vl = svcnth_pat(SV_ALL) as u64; // Number of active 16-bit elements
+  // Process 8 f16 elements at a time
+  let limit_neon = len - (len % 8);
 
-    let v_a_bf16 = svld1_bf16(pg, p_a as *const _);
-    let v_b_bf16 = svld1_bf16(pg, p_b as *const _);
+  while i < limit_neon {
+    // Load 8 f16 values
+    let a_f16 = vld1q_f16(ptr_a.add(i) as *const _);
+    let b_f16 = vld1q_f16(ptr_b.add(i) as *const _);
 
-    let v_diff_bf16 = svsub_bf16_z(pg, v_a_bf16, v_b_bf16);
+    // Convert to f32 (lower and upper halves)
+    let a_f32_low = vcvt_f32_f16(vget_low_f16(a_f16));
+    let a_f32_high = vcvt_f32_f16(vget_high_f16(a_f16));
+    let b_f32_low = vcvt_f32_f16(vget_low_f16(b_f16));
+    let b_f32_high = vcvt_f32_f16(vget_high_f16(b_f16));
 
-    acc_vec_f32 = svdot_bf16_f32_z(pg, acc_vec_f32, v_diff_bf16, v_diff_bf16);
+    // Compute differences
+    let diff_low = vsubq_f32(a_f32_low, b_f32_low);
+    let diff_high = vsubq_f32(a_f32_high, b_f32_high);
 
-    p_a = p_a.add(current_vl as usize);
-    p_b = p_b.add(current_vl as usize);
-    count -= current_vl;
+    // Square and accumulate
+    acc_sum_f32 = vfmaq_f32(acc_sum_f32, diff_low, diff_low);
+    acc_sum_f32 = vfmaq_f32(acc_sum_f32, diff_high, diff_high);
+
+    i += 8;
   }
 
-  let total_sum_f32: f32 = svaddv_f32(svptrue_b32(), acc_vec_f32);
-  (total_sum_f32 as f64).sqrt()
+  // Horizontal sum
+  let total_sum = vaddvq_f32(acc_sum_f32);
+
+  // Handle remainder
+  let mut scalar_sum = 0.0f32;
+  for k in i..len {
+    let a_f32 = (*ptr_a.add(k)).to_f32();
+    let b_f32 = (*ptr_b.add(k)).to_f32();
+    let diff = a_f32 - b_f32;
+    scalar_sum += diff * diff;
+  }
+
+  ((total_sum + scalar_sum) as f64).sqrt()
 }
 
 #[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "sve,sve2,fp16")] // "sve2-fp16" for svfmlalb_f32_f16_z
-unsafe fn dist_l2_f16_sve(a_slice: &[f16], b_slice: &[f16]) -> f64 {
+#[target_feature(enable = "neon")]
+unsafe fn dist_l2_f32_neon(a_slice: &[f32], b_slice: &[f32]) -> f64 {
   let len = a_slice.len();
   if len == 0 {
     return 0.0;
   }
 
-  let mut p_a = a_slice.as_ptr();
-  let mut p_b = b_slice.as_ptr();
+  let ptr_a = a_slice.as_ptr();
+  let ptr_b = b_slice.as_ptr();
 
-  let mut acc_vec_f32 = svdup_n_f32(0.0f32);
-  let mut count = len as u64;
+  let mut acc_sum_f32 = vdupq_n_f32(0.0);
+  let mut i = 0;
 
-  while svptest_first(svptrue_b16(), svwhilelt_b16_u64(0, count)) {
-    let pg: svbool_t = svwhilelt_b16_u64(0, count);
-    let current_vl = svcnth_pat(SV_ALL) as u64;
+  // Process 4 f32 elements at a time
+  let limit_neon = len - (len % 4);
 
-    let v_a_f16 = svld1_f16(pg, p_a as *const _);
-    let v_b_f16 = svld1_f16(pg, p_b as *const _);
+  while i < limit_neon {
+    // Load 4 f32 values
+    let a_f32 = vld1q_f32(ptr_a.add(i));
+    let b_f32 = vld1q_f32(ptr_b.add(i));
 
-    let v_diff_f16 = svsub_f16_z(pg, v_a_f16, v_b_f16);
+    // Compute difference
+    let diff = vsubq_f32(a_f32, b_f32);
 
-    // acc_f32 += v_diff_f16 * v_diff_f16 (element-wise, widened)
-    acc_vec_f32 = svfmlalb_f32_f16_z(pg, acc_vec_f32, v_diff_f16, v_diff_f16);
+    // Square and accumulate
+    acc_sum_f32 = vfmaq_f32(acc_sum_f32, diff, diff);
 
-    p_a = p_a.add(current_vl as usize);
-    p_b = p_b.add(current_vl as usize);
-    count -= current_vl;
+    i += 4;
   }
 
-  let total_sum_f32: f32 = svaddv_f32(svptrue_b32(), acc_vec_f32);
-  (total_sum_f32 as f64).sqrt()
+  // Horizontal sum
+  let total_sum = vaddvq_f32(acc_sum_f32);
+
+  // Handle remainder
+  let mut scalar_sum = 0.0f32;
+  for k in i..len {
+    let a_val = *ptr_a.add(k);
+    let b_val = *ptr_b.add(k);
+    let diff = a_val - b_val;
+    scalar_sum += diff * diff;
+  }
+
+  ((total_sum + scalar_sum) as f64).sqrt()
 }
 
 #[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "sve")]
-unsafe fn dist_l2_f32_sve(a_slice: &[f32], b_slice: &[f32]) -> f64 {
+#[target_feature(enable = "neon")]
+unsafe fn dist_l2_f64_neon(a_slice: &[f64], b_slice: &[f64]) -> f64 {
   let len = a_slice.len();
   if len == 0 {
     return 0.0;
   }
 
-  let mut p_a = a_slice.as_ptr();
-  let mut p_b = b_slice.as_ptr();
+  let ptr_a = a_slice.as_ptr();
+  let ptr_b = b_slice.as_ptr();
 
-  let mut acc_vec_f32 = svdup_n_f32(0.0f32);
-  let mut count = len as u64;
+  let mut acc_sum_f64 = vdupq_n_f64(0.0);
+  let mut i = 0;
 
-  while svptest_first(svptrue_b32(), svwhilelt_b32_u64(0, count)) {
-    let pg: svbool_t = svwhilelt_b32_u64(0, count);
-    let current_vl = svcntw_pat(SV_ALL) as u64; // Number of active 32-bit elements
+  // Process 2 f64 elements at a time
+  let limit_neon = len - (len % 2);
 
-    let v_a_f32 = svld1_f32(pg, p_a);
-    let v_b_f32 = svld1_f32(pg, p_b);
+  while i < limit_neon {
+    // Load 2 f64 values
+    let a_f64 = vld1q_f64(ptr_a.add(i));
+    let b_f64 = vld1q_f64(ptr_b.add(i));
 
-    let v_diff_f32 = svsub_f32_z(pg, v_a_f32, v_b_f32);
+    // Compute difference
+    let diff = vsubq_f64(a_f64, b_f64);
 
-    acc_vec_f32 = svfmad_f32_z(pg, acc_vec_f32, v_diff_f32, v_diff_f32);
+    // Square and accumulate
+    acc_sum_f64 = vfmaq_f64(acc_sum_f64, diff, diff);
 
-    p_a = p_a.add(current_vl as usize);
-    p_b = p_b.add(current_vl as usize);
-    count -= current_vl;
+    i += 2;
   }
 
-  let total_sum_f32: f32 = svaddv_f32(svptrue_b32(), acc_vec_f32);
-  (total_sum_f32 as f64).sqrt()
-}
+  // Horizontal sum
+  let total_sum = vaddvq_f64(acc_sum_f64);
 
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "sve")]
-unsafe fn dist_l2_f64_sve(a_slice: &[f64], b_slice: &[f64]) -> f64 {
-  let len = a_slice.len();
-  if len == 0 {
-    return 0.0;
+  // Handle remainder
+  let mut scalar_sum = 0.0f64;
+  for k in i..len {
+    let a_val = *ptr_a.add(k);
+    let b_val = *ptr_b.add(k);
+    let diff = a_val - b_val;
+    scalar_sum += diff * diff;
   }
 
-  let mut p_a = a_slice.as_ptr();
-  let mut p_b = b_slice.as_ptr();
-
-  let mut acc_vec_f64 = svdup_n_f64(0.0f64);
-  let mut count = len as u64;
-
-  while svptest_first(svptrue_b64(), svwhilelt_b64_u64(0, count)) {
-    let pg: svbool_t = svwhilelt_b64_u64(0, count);
-    let current_vl = svcntd_pat(SV_ALL) as u64; // Number of active 64-bit elements
-
-    let v_a_f64 = svld1_f64(pg, p_a);
-    let v_b_f64 = svld1_f64(pg, p_b);
-
-    let v_diff_f64 = svsub_f64_z(pg, v_a_f64, v_b_f64);
-
-    acc_vec_f64 = svfmad_f64_z(pg, acc_vec_f64, v_diff_f64, v_diff_f64);
-
-    p_a = p_a.add(current_vl as usize);
-    p_b = p_b.add(current_vl as usize);
-    count -= current_vl;
-  }
-
-  let total_sum_f64: f64 = svaddv_f64(svptrue_b64(), acc_vec_f64);
-  total_sum_f64.sqrt()
+  (total_sum + scalar_sum).sqrt()
 }
 
 fn dist_l2_scalar<T: num::Float>(a: &ArrayView1<T>, b: &ArrayView1<T>) -> f64 {
@@ -382,14 +395,6 @@ pub fn dist_l2(a: &VecData, b: &VecData) -> f64 {
           }
         }
       }
-      #[cfg(target_arch = "aarch64")]
-      {
-        if is_aarch64_feature_detected!("sve") && is_aarch64_feature_detected!("bf16") {
-          unsafe {
-            return dist_l2_bf16_sve(a_arr, b_arr);
-          }
-        }
-      }
       dist_l2_scalar(&AV::from(a_arr), &AV::from(b_arr))
     }
     (VecData::F16(a_arr), VecData::F16(b_arr)) => {
@@ -403,13 +408,9 @@ pub fn dist_l2(a: &VecData, b: &VecData) -> f64 {
       }
       #[cfg(target_arch = "aarch64")]
       {
-        // svfmlalb_f32_f16_z requires SVE2 and FP16 extensions
-        if is_aarch64_feature_detected!("sve")
-          && is_aarch64_feature_detected!("sve2")
-          && is_aarch64_feature_detected!("fp16")
-        {
+        if is_aarch64_feature_detected!("neon") && is_aarch64_feature_detected!("fp16") {
           unsafe {
-            return dist_l2_f16_sve(a_arr, b_arr);
+            return dist_l2_f16_neon(a_arr, b_arr);
           }
         }
       }
@@ -426,9 +427,9 @@ pub fn dist_l2(a: &VecData, b: &VecData) -> f64 {
       }
       #[cfg(target_arch = "aarch64")]
       {
-        if is_aarch64_feature_detected!("sve") {
+        if is_aarch64_feature_detected!("neon") {
           unsafe {
-            return dist_l2_f32_sve(a_arr, b_arr);
+            return dist_l2_f32_neon(a_arr, b_arr);
           }
         }
       }
@@ -445,9 +446,9 @@ pub fn dist_l2(a: &VecData, b: &VecData) -> f64 {
       }
       #[cfg(target_arch = "aarch64")]
       {
-        if is_aarch64_feature_detected!("sve") {
+        if is_aarch64_feature_detected!("neon") {
           unsafe {
-            return dist_l2_f64_sve(a_arr, b_arr);
+            return dist_l2_f64_neon(a_arr, b_arr);
           }
         }
       }

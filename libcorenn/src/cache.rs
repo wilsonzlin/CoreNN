@@ -71,6 +71,7 @@ impl<T: Cacheable> Cache<T> {
   }
 }
 
+// Use Arc or else memcpy dominates CPU time.
 pub type NodeCache = Cache<Arc<DbNodeData>>;
 pub type CVCache = Cache<CV>;
 

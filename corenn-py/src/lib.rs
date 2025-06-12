@@ -1,7 +1,7 @@
 use half::bf16;
 use half::f16;
-use libroxanne::cfg::Cfg;
-use libroxanne::Roxanne as RoxanneNative;
+use libcorenn::cfg::Cfg;
+use libcorenn::CoreNN as CoreNNNative;
 use numpy::PyReadonlyArray2;
 use pyo3::pyclass;
 use pyo3::pymethods;
@@ -19,27 +19,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[pyclass]
-struct Roxanne(Arc<RoxanneNative>);
+struct CoreNN(Arc<CoreNNNative>);
 
 #[pymethods]
-impl Roxanne {
+impl CoreNN {
   #[staticmethod]
-  pub fn create(dir: PathBuf, cfg: Bound<PyAny>) -> PyResult<Roxanne> {
-    let cfg: Cfg = from_pyobject(cfg).unwrap();
-    let db = Arc::new(RoxanneNative::create(dir, cfg));
-    Ok(Roxanne(db))
+  pub fn create(dir: PathBuf, cfg: Bound<PyAny>) -> PyResult<CoreNN> {
+    let cfg: Cfg = from_pyobject(cfg)?;
+    let db = Arc::new(CoreNNNative::create(dir, cfg));
+    Ok(CoreNN(db))
   }
 
   #[staticmethod]
-  pub fn open(dir: PathBuf) -> PyResult<Roxanne> {
-    let db = Arc::new(RoxanneNative::open(dir));
-    Ok(Roxanne(db))
+  pub fn open(dir: PathBuf) -> PyResult<CoreNN> {
+    let db = Arc::new(CoreNNNative::open(dir));
+    Ok(CoreNN(db))
   }
 
   #[staticmethod]
-  pub fn new_in_memory() -> PyResult<Roxanne> {
-    let db = Arc::new(RoxanneNative::new_in_memory());
-    Ok(Roxanne(db))
+  pub fn new_in_memory(cfg: Bound<PyAny>) -> PyResult<CoreNN> {
+    let cfg: Cfg = from_pyobject(cfg)?;
+    let db = Arc::new(CoreNNNative::new_in_memory(cfg));
+    Ok(CoreNN(db))
   }
 
   pub fn insert_bf16(&self, keys: Vec<String>, vectors: PyReadonlyArray2<bf16>) {
@@ -116,9 +117,9 @@ impl Roxanne {
 }
 
 #[pymodule]
-fn roxanne_py(m: &Bound<PyModule>) -> PyResult<()> {
+fn corenn_py(m: &Bound<PyModule>) -> PyResult<()> {
   // Sends tracing messages to Python logging.
   pyo3_log::init();
-  m.add_class::<Roxanne>()?;
+  m.add_class::<CoreNN>()?;
   Ok(())
 }

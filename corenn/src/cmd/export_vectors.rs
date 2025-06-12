@@ -1,6 +1,6 @@
 use clap::Args;
-use libroxanne::store::schema::NODE;
-use libroxanne::Roxanne;
+use libcorenn::store::schema::NODE;
+use libcorenn::CoreNN;
 use std::path::PathBuf;
 use tokio::fs::create_dir_all;
 use tokio::fs::File;
@@ -9,20 +9,20 @@ use tokio::io::BufWriter;
 
 #[derive(Args)]
 pub struct ExportVectorsArgs {
-  /// Path to a Roxanne DB.
+  /// Path to a CoreNN DB.
   #[arg()]
   path: PathBuf,
 
-  /// Output directory to write Roxanne index to.
+  /// Output directory to write CoreNN index to.
   #[arg(long)]
   out: PathBuf,
 }
 
 impl ExportVectorsArgs {
   pub async fn exec(self) {
-    let rox = Roxanne::open(self.path);
+    let corenn = CoreNN::open(self.path);
 
-    let dim = rox.cfg().dim;
+    let dim = corenn.cfg().dim;
 
     create_dir_all(&self.out).await.unwrap();
 
@@ -31,7 +31,7 @@ impl ExportVectorsArgs {
     let out_vecs = File::create(self.out.join("vecs.bin")).await.unwrap();
     let mut out_vecs = BufWriter::new(out_vecs);
 
-    for (id, node) in NODE.iter(&rox.internal_db()) {
+    for (id, node) in NODE.iter(&corenn.internal_db()) {
       out_ids.write_u64_le(id.try_into().unwrap()).await.unwrap();
       assert_eq!(node.vector.dim(), dim);
       out_vecs

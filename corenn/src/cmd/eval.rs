@@ -5,8 +5,8 @@ use bytemuck::cast_slice;
 use clap::Args;
 use clap::ValueEnum;
 use half::f16;
-use libroxanne::util::AtomUsz;
-use libroxanne::Roxanne;
+use libcorenn::util::AtomUsz;
+use libcorenn::CoreNN;
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
@@ -22,7 +22,7 @@ enum Dtype {
 
 #[derive(Args)]
 pub struct EvalArgs {
-  /// Path to a Roxanne DB.
+  /// Path to a CoreNN DB.
   #[arg()]
   path: PathBuf,
 
@@ -75,7 +75,7 @@ async fn read_vecs(path: &PathBuf, dtype: Dtype, dim: usize) -> Vec<Vec<f16>> {
 
 impl EvalArgs {
   pub async fn exec(self) {
-    let rox = Arc::new(Roxanne::open(self.path));
+    let corenn = Arc::new(CoreNN::open(self.path));
     tracing::info!("loaded database");
 
     if let Some(vectors_path) = &self.vectors {
@@ -89,7 +89,7 @@ impl EvalArgs {
         let batch_len = batch.len();
         batch.into_par_iter().enumerate().for_each(|(id, v)| {
           let k = (next_id + id).to_string();
-          rox.insert(&k, v);
+          corenn.insert(&k, v);
         });
         next_id += batch_len;
         pb.inc(batch_len as u64);
@@ -98,7 +98,7 @@ impl EvalArgs {
       tracing::info!(n, "inserted vectors");
     };
 
-    let queries: Vec<Vec<f16>> = read_vecs(&self.queries, self.dtype, rox.cfg().dim).await;
+    let queries: Vec<Vec<f16>> = read_vecs(&self.queries, self.dtype, corenn.cfg().dim).await;
     tracing::info!(n = queries.len(), "loaded query vectors");
 
     let knn_ids: Vec<HashSet<u32>> = {
@@ -120,7 +120,7 @@ impl EvalArgs {
       .zip(knn_ids)
       .for_each(|(query, knn_expected)| {
         let k = knn_expected.len();
-        let knn_got: HashSet<u32> = rox
+        let knn_got: HashSet<u32> = corenn
           .query(&query, k)
           .into_iter()
           .map(|e| e.0.parse().unwrap())

@@ -1,0 +1,10 @@
+{
+  "include": ["src/**/*.ts"],
+  "compilerOptions": {
+    "declaration": true,
+    "module": "nodenext",
+    "outDir": "dist",
+    "strict": true,
+    "target": "esnext",
+  }
+}

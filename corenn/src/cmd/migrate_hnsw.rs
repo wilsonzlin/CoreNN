@@ -2,13 +2,13 @@ use crate::load_hnsw;
 use ahash::HashMap;
 use clap::Args;
 use itertools::Itertools;
-use libroxanne::cfg::Cfg;
-use libroxanne::metric::StdMetric;
-use libroxanne::store::schema::DbNodeData;
-use libroxanne::store::schema::ID_TO_KEY;
-use libroxanne::store::schema::KEY_TO_ID;
-use libroxanne::store::schema::NODE;
-use libroxanne::Roxanne;
+use libcorenn::cfg::Cfg;
+use libcorenn::metric::StdMetric;
+use libcorenn::store::schema::DbNodeData;
+use libcorenn::store::schema::ID_TO_KEY;
+use libcorenn::store::schema::KEY_TO_ID;
+use libcorenn::store::schema::NODE;
+use libcorenn::CoreNN;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ pub struct MigrateHnswArgs {
   #[arg()]
   path: PathBuf,
 
-  /// Output directory to write Roxanne index to.
+  /// Output directory to write CoreNN index to.
   #[arg(long)]
   out: PathBuf,
 
@@ -46,14 +46,14 @@ impl MigrateHnswArgs {
     };
 
     // Make sure database can be created before we do long expensive work.
-    let rox = Roxanne::create(self.out, cfg);
-    let db = rox.internal_db();
+    let corenn = CoreNN::create(self.out, cfg);
+    let db = corenn.internal_db();
     tracing::info!("created database");
 
     // In HNSW, "labels" are the external ID that the builder has defined for each vector.
-    // To port to Roxanne, they will become the keys. We'll assign each a new internal Roxanne ID.
+    // To port to CoreNN, they will become the keys. We'll assign each a new internal CoreNN ID.
     // We offset by 1 as 0 is reserved for the clone of the entry point.
-    let hnsw_label_to_rox_id = index
+    let hnsw_label_to_corenn_id = index
       .labels()
       .enumerate()
       .map(|(id, l)| (l, id + 1))
@@ -62,7 +62,7 @@ impl MigrateHnswArgs {
       .labels()
       .map(|hnsw_label| {
         (
-          hnsw_label_to_rox_id[&hnsw_label],
+          hnsw_label_to_corenn_id[&hnsw_label],
           index.get_data_by_label(hnsw_label).to_vec(),
         )
       })
@@ -73,10 +73,10 @@ impl MigrateHnswArgs {
         let neighbors = index
           .get_merged_neighbors(label, 0)
           .into_iter()
-          .map(|hnsw_label| hnsw_label_to_rox_id[&hnsw_label])
+          .map(|hnsw_label| hnsw_label_to_corenn_id[&hnsw_label])
           .collect_vec();
-        let rox_id = hnsw_label_to_rox_id[&label];
-        (rox_id, neighbors)
+        let corenn_id = hnsw_label_to_corenn_id[&label];
+        (corenn_id, neighbors)
       })
       .collect::<HashMap<_, _>>();
 
@@ -85,7 +85,7 @@ impl MigrateHnswArgs {
     // Write internal entry point clone.
     {
       let entry_label = index.entry_label();
-      let entry_id = hnsw_label_to_rox_id[&entry_label];
+      let entry_id = hnsw_label_to_corenn_id[&entry_label];
       NODE.put(db, 0, DbNodeData {
         version: 0,
         neighbors: graph[&entry_id].clone(),
@@ -93,7 +93,7 @@ impl MigrateHnswArgs {
         vector: Arc::new(vectors[&entry_id].clone().into()),
       });
     };
-    for (label, id) in hnsw_label_to_rox_id {
+    for (label, id) in hnsw_label_to_corenn_id {
       let key = label.to_string();
       KEY_TO_ID.put(db, &key, id);
       ID_TO_KEY.put(db, id, &key);
@@ -103,7 +103,7 @@ impl MigrateHnswArgs {
         vector: Arc::new(vectors.remove(&id).unwrap().into()),
       });
     }
-    drop(rox);
+    drop(corenn);
     tracing::info!("all done!");
   }
 }

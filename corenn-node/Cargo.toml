@@ -1,0 +1,11 @@
+[package]
+name = "corenn-node"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libcorenn = { version = "0.2.0", path = "../libcorenn" }
+neon = "1.1.1"

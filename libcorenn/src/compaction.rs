@@ -4,8 +4,8 @@ use crate::store::schema::DELETED;
 use crate::store::schema::ID_TO_KEY;
 use crate::store::schema::NODE;
 use crate::util::AtomUsz;
+use crate::CoreNN;
 use crate::Mode;
-use crate::Roxanne;
 use ahash::HashSet;
 use dashmap::DashSet;
 use itertools::Itertools;
@@ -13,9 +13,9 @@ use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
 use std::sync::Arc;
 
-pub fn compact(rox: &Roxanne) {
+pub fn compact(corenn: &CoreNN) {
   // From now on, we must work with a consistent snapshot of deleted elements.
-  let deleted = rox.deleted.iter().map(|e| *e).collect::<HashSet<_>>();
+  let deleted = corenn.deleted.iter().map(|e| *e).collect::<HashSet<_>>();
 
   tracing::warn!(deleted = deleted.len(), "compacting");
 
@@ -25,15 +25,15 @@ pub fn compact(rox: &Roxanne) {
   // However, for the same reason, we don't iterate nodes, so we can:
   // - Get the latest node at the time of traversal (it may have been a while since the start of the iterator, but RocksDB will give us the stale snapshot value).
   // - Acquire a lock *before* reading the node, to avoid data races.
-  ID_TO_KEY.iter(&rox.db).par_bridge().for_each(|(id, _)| {
+  ID_TO_KEY.iter(&corenn.db).par_bridge().for_each(|(id, _)| {
     if deleted.contains(&id) {
       return;
     };
 
-    let lock = rox.node_write_lock.get(id);
+    let lock = corenn.node_write_lock.get(id);
     let _g = lock.lock();
 
-    let Some(node) = NODE.read(&rox.db, id) else {
+    let Some(node) = NODE.read(&corenn.db, id) else {
       return;
     };
 
@@ -46,7 +46,7 @@ pub fn compact(rox: &Roxanne) {
         new_neighbors.insert(n);
       };
     }
-    let add = rox.add_edges.remove(&id).map(|e| e.1);
+    let add = corenn.add_edges.remove(&id).map(|e| e.1);
     if add.is_none() && deleted_neighbors.is_empty() {
       // Node is untouched.
       return;
@@ -59,7 +59,7 @@ pub fn compact(rox: &Roxanne) {
         };
       }
     }
-    for dn in rox.get_nodes(&deleted_neighbors) {
+    for dn in corenn.get_nodes(&deleted_neighbors) {
       let Some(dn) = dn else {
         continue;
       };
@@ -71,7 +71,7 @@ pub fn compact(rox: &Roxanne) {
     }
 
     let new_neighbors =
-      rox.prune_candidates(&node.vector, &new_neighbors.into_iter().collect_vec());
+      corenn.prune_candidates(&node.vector, &new_neighbors.into_iter().collect_vec());
 
     let mut txn = Vec::new();
     let new_node = DbNodeData {
@@ -80,12 +80,12 @@ pub fn compact(rox: &Roxanne) {
       vector: node.vector,
     };
     NODE.batch_put(&mut txn, id, &new_node);
-    if let Mode::Uncompressed(cache) = &*rox.mode.read() {
+    if let Mode::Uncompressed(cache) = &*corenn.mode.read() {
       cache.insert(id, Arc::new(new_node));
     };
     ADD_EDGES.batch_put(&mut txn, id, Vec::new());
     // We've already removed the add_edges entry.
-    rox.db.write(txn);
+    corenn.db.write(txn);
   });
 
   let mut txn = Vec::new();
@@ -94,12 +94,12 @@ pub fn compact(rox: &Roxanne) {
     DELETED.batch_delete(&mut txn, id);
     NODE.batch_delete(&mut txn, id);
   }
-  rox.db.write(txn);
+  corenn.db.write(txn);
 
   for &id in deleted.iter() {
-    rox.add_edges.remove(&id);
+    corenn.add_edges.remove(&id);
     // This is to free memory, not for correctness.
-    match &*rox.mode.read() {
+    match &*corenn.mode.read() {
       Mode::Compressed(_, cache) => {
         cache.remove(id);
       }
@@ -107,7 +107,7 @@ pub fn compact(rox: &Roxanne) {
         cache.remove(id);
       }
     };
-    rox.deleted.remove(&id);
+    corenn.deleted.remove(&id);
   }
   tracing::info!(
     touched = touched.get(),

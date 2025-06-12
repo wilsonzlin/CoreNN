@@ -1,9 +1,9 @@
 use clap::Parser;
 use clap::Subcommand;
-use roxanne::cmd::eval::EvalArgs;
-use roxanne::cmd::export_vectors::ExportVectorsArgs;
-use roxanne::cmd::migrate_hnsw::MigrateHnswArgs;
-use roxanne::cmd::serve::ServeArgs;
+use corenn::cmd::eval::EvalArgs;
+use corenn::cmd::export_vectors::ExportVectorsArgs;
+use corenn::cmd::migrate_hnsw::MigrateHnswArgs;
+use corenn::cmd::serve::ServeArgs;
 use tikv_jemallocator::Jemalloc;
 
 extern crate blas_src;
@@ -14,13 +14,13 @@ static ALLOC: Jemalloc = Jemalloc;
 
 #[derive(Subcommand)]
 enum Commands {
-  /// Evaluate queries against a Roxanne database.
+  /// Evaluate queries against a CoreNN database.
   Eval(EvalArgs),
-  /// Export all vectors from a Roxanne database.
+  /// Export all vectors from a CoreNN database.
   ExportVectors(ExportVectorsArgs),
-  /// Create a new Roxanne database from an existing HNSW index.
+  /// Create a new CoreNN database from an existing HNSW index.
   MigrateHnsw(MigrateHnswArgs),
-  /// Serve a Roxanne database over HTTP.
+  /// Serve a CoreNN database over HTTP.
   Serve(ServeArgs),
 }
 

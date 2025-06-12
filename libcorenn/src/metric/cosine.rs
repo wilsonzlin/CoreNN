@@ -1,11 +1,15 @@
 use crate::vec::VecData;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use half::bf16;
 use ndarray::ArrayView1;
 use ndarray::ArrayView1 as AV;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+#[cfg(target_arch = "aarch64")]
+use std::arch::is_aarch64_feature_detected;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::arch::x86_64::*;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::mem::transmute;
 
 fn dist_cosine_scalar<T: num::Float + 'static>(a: &ArrayView1<T>, b: &ArrayView1<T>) -> f64 {
@@ -237,43 +241,44 @@ unsafe fn dist_cosine_f64_avx512(a: &[f64], b: &[f64]) -> f64 {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "sve,bf16")]
-unsafe fn dist_cosine_bf16_sve(a: &[bf16], b: &[bf16]) -> f64 {
+#[target_feature(enable = "neon")]
+unsafe fn dist_cosine_f32_neon(a: &[f32], b: &[f32]) -> f64 {
   let len = a.len();
   if len == 0 {
     return 0.0;
   }
 
-  let mut dot_product_acc_vec = svdup_n_f32(0.0f32);
-  let mut a_norm_sq_acc_vec = svdup_n_f32(0.0f32);
-  let mut b_norm_sq_acc_vec = svdup_n_f32(0.0f32);
+  let mut dot_product_acc = vdupq_n_f32(0.0);
+  let mut a_norm_sq_acc = vdupq_n_f32(0.0);
+  let mut b_norm_sq_acc = vdupq_n_f32(0.0);
 
-  let mut i: usize = 0;
-  let p_true_f32 = svptrue_b32(); // For svbfdot predicate and svaddv
+  let mut i = 0;
+  let vec_width = 4; // 4 f32 elements per NEON vector
 
-  // svcnth() gives the number of 16-bit elements (bf16) in an SVE vector.
-  // svbfdot processes pairs of bf16 to produce f32, effectively consuming svcnth() bf16s.
-  let step = svcnth() as usize;
+  while i + vec_width <= len {
+    let a_vec = vld1q_f32(a.as_ptr().add(i));
+    let b_vec = vld1q_f32(b.as_ptr().add(i));
 
-  while i < len {
-    let p_active_bf16 = svwhilelt_b16(i as u32, len as u32);
+    dot_product_acc = vmlaq_f32(dot_product_acc, a_vec, b_vec);
+    a_norm_sq_acc = vmlaq_f32(a_norm_sq_acc, a_vec, a_vec);
+    b_norm_sq_acc = vmlaq_f32(b_norm_sq_acc, b_vec, b_vec);
 
-    let a_ptr = a.as_ptr() as *const u16;
-    let b_ptr = b.as_ptr() as *const u16;
-
-    let a_vec_bf16: svbfloat16_t = svld1_bf16(p_active_bf16, a_ptr.add(i));
-    let b_vec_bf16: svbfloat16_t = svld1_bf16(p_active_bf16, b_ptr.add(i));
-
-    dot_product_acc_vec = svbfdot_f32_m(p_true_f32, dot_product_acc_vec, a_vec_bf16, b_vec_bf16);
-    a_norm_sq_acc_vec = svbfdot_f32_m(p_true_f32, a_norm_sq_acc_vec, a_vec_bf16, a_vec_bf16);
-    b_norm_sq_acc_vec = svbfdot_f32_m(p_true_f32, b_norm_sq_acc_vec, b_vec_bf16, b_vec_bf16);
-
-    i += step;
+    i += vec_width;
   }
 
-  let dot_product_sum = svaddv_f32(p_true_f32, dot_product_acc_vec) as f64;
-  let a_norm_sq_sum = svaddv_f32(p_true_f32, a_norm_sq_acc_vec) as f64;
-  let b_norm_sq_sum = svaddv_f32(p_true_f32, b_norm_sq_acc_vec) as f64;
+  let mut dot_product_sum = vaddvq_f32(dot_product_acc) as f64;
+  let mut a_norm_sq_sum = vaddvq_f32(a_norm_sq_acc) as f64;
+  let mut b_norm_sq_sum = vaddvq_f32(b_norm_sq_acc) as f64;
+
+  // Remainder loop
+  while i < len {
+    let val_a = a[i] as f64;
+    let val_b = b[i] as f64;
+    dot_product_sum += val_a * val_b;
+    a_norm_sq_sum += val_a * val_a;
+    b_norm_sq_sum += val_b * val_b;
+    i += 1;
+  }
 
   if a_norm_sq_sum == 0.0 || b_norm_sq_sum == 0.0 {
     return 1.0;
@@ -287,136 +292,44 @@ unsafe fn dist_cosine_bf16_sve(a: &[bf16], b: &[bf16]) -> f64 {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "sve,sve2,fp16")]
-unsafe fn dist_cosine_f16_sve(a: &[half::f16], b: &[half::f16]) -> f64 {
+#[target_feature(enable = "neon")]
+unsafe fn dist_cosine_f64_neon(a: &[f64], b: &[f64]) -> f64 {
   let len = a.len();
   if len == 0 {
     return 0.0;
   }
 
-  let zero_f16_bits = half::f16::ZERO.to_bits();
-  let mut dot_product_acc_vec_f16 = svdup_n_f16(zero_f16_bits);
-  let mut a_norm_sq_acc_vec_f16 = svdup_n_f16(zero_f16_bits);
-  let mut b_norm_sq_acc_vec_f16 = svdup_n_f16(zero_f16_bits);
+  let mut dot_product_acc = vdupq_n_f64(0.0);
+  let mut a_norm_sq_acc = vdupq_n_f64(0.0);
+  let mut b_norm_sq_acc = vdupq_n_f64(0.0);
 
-  let mut i: usize = 0;
-  let p_true_b16 = svptrue_b16(); // For svaddv_f16
+  let mut i = 0;
+  let vec_width = 2; // 2 f64 elements per NEON vector
 
-  let step = svcnth() as usize; // Number of f16 elements
+  while i + vec_width <= len {
+    let a_vec = vld1q_f64(a.as_ptr().add(i));
+    let b_vec = vld1q_f64(b.as_ptr().add(i));
 
+    dot_product_acc = vmlaq_f64(dot_product_acc, a_vec, b_vec);
+    a_norm_sq_acc = vmlaq_f64(a_norm_sq_acc, a_vec, a_vec);
+    b_norm_sq_acc = vmlaq_f64(b_norm_sq_acc, b_vec, b_vec);
+
+    i += vec_width;
+  }
+
+  let mut dot_product_sum = vaddvq_f64(dot_product_acc);
+  let mut a_norm_sq_sum = vaddvq_f64(a_norm_sq_acc);
+  let mut b_norm_sq_sum = vaddvq_f64(b_norm_sq_acc);
+
+  // Remainder loop
   while i < len {
-    let p_active_f16 = svwhilelt_b16(i as u32, len as u32);
-
-    let a_ptr = a.as_ptr() as *const u16;
-    let b_ptr = b.as_ptr() as *const u16;
-
-    let a_vec = svld1_f16(p_active_f16, a_ptr.add(i));
-    let b_vec = svld1_f16(p_active_f16, b_ptr.add(i));
-
-    dot_product_acc_vec_f16 = svmla_f16_m(p_active_f16, dot_product_acc_vec_f16, a_vec, b_vec);
-    a_norm_sq_acc_vec_f16 = svmla_f16_m(p_active_f16, a_norm_sq_acc_vec_f16, a_vec, a_vec);
-    b_norm_sq_acc_vec_f16 = svmla_f16_m(p_active_f16, b_norm_sq_acc_vec_f16, b_vec, b_vec);
-
-    i += step;
+    let val_a = a[i];
+    let val_b = b[i];
+    dot_product_sum += val_a * val_b;
+    a_norm_sq_sum += val_a * val_a;
+    b_norm_sq_sum += val_b * val_b;
+    i += 1;
   }
-
-  let dot_sum_f16_bits = svaddv_f16(p_true_b16, dot_product_acc_vec_f16);
-  let a_norm_sq_sum_f16_bits = svaddv_f16(p_true_b16, a_norm_sq_acc_vec_f16);
-  let b_norm_sq_sum_f16_bits = svaddv_f16(p_true_b16, b_norm_sq_acc_vec_f16);
-
-  let dot_product_sum = half::f16::from_bits(dot_sum_f16_bits).to_f64();
-  let a_norm_sq_sum = half::f16::from_bits(a_norm_sq_sum_f16_bits).to_f64();
-  let b_norm_sq_sum = half::f16::from_bits(b_norm_sq_sum_f16_bits).to_f64();
-
-  if a_norm_sq_sum == 0.0 || b_norm_sq_sum == 0.0 {
-    return 1.0;
-  }
-  let denominator = (a_norm_sq_sum * b_norm_sq_sum).sqrt();
-  if denominator == 0.0 {
-    1.0
-  } else {
-    1.0 - dot_product_sum / denominator
-  }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "sve")]
-unsafe fn dist_cosine_f32_sve(a: &[f32], b: &[f32]) -> f64 {
-  let len = a.len();
-  if len == 0 {
-    return 0.0;
-  }
-
-  let mut dot_product_acc_vec = svdup_n_f32(0.0f32);
-  let mut a_norm_sq_acc_vec = svdup_n_f32(0.0f32);
-  let mut b_norm_sq_acc_vec = svdup_n_f32(0.0f32);
-
-  let mut i: usize = 0;
-  let p_true_b32 = svptrue_b32(); // For svaddv_f32
-
-  let step = svcntw() as usize; // Number of f32 elements
-
-  while i < len {
-    let p_active_f32 = svwhilelt_b32(i as u32, len as u32);
-
-    let a_vec = svld1_f32(p_active_f32, a.as_ptr().add(i));
-    let b_vec = svld1_f32(p_active_f32, b.as_ptr().add(i));
-
-    dot_product_acc_vec = svmla_f32_m(p_active_f32, dot_product_acc_vec, a_vec, b_vec);
-    a_norm_sq_acc_vec = svmla_f32_m(p_active_f32, a_norm_sq_acc_vec, a_vec, a_vec);
-    b_norm_sq_acc_vec = svmla_f32_m(p_active_f32, b_norm_sq_acc_vec, b_vec, b_vec);
-
-    i += step;
-  }
-
-  let dot_product_sum = svaddv_f32(p_true_b32, dot_product_acc_vec) as f64;
-  let a_norm_sq_sum = svaddv_f32(p_true_b32, a_norm_sq_acc_vec) as f64;
-  let b_norm_sq_sum = svaddv_f32(p_true_b32, b_norm_sq_acc_vec) as f64;
-
-  if a_norm_sq_sum == 0.0 || b_norm_sq_sum == 0.0 {
-    return 1.0;
-  }
-  let denominator = (a_norm_sq_sum * b_norm_sq_sum).sqrt();
-  if denominator == 0.0 {
-    1.0
-  } else {
-    1.0 - dot_product_sum / denominator
-  }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "sve")]
-unsafe fn dist_cosine_f64_sve(a: &[f64], b: &[f64]) -> f64 {
-  let len = a.len();
-  if len == 0 {
-    return 0.0;
-  }
-
-  let mut dot_product_acc_vec = svdup_n_f64(0.0f64);
-  let mut a_norm_sq_acc_vec = svdup_n_f64(0.0f64);
-  let mut b_norm_sq_acc_vec = svdup_n_f64(0.0f64);
-
-  let mut i: usize = 0;
-  let p_true_b64 = svptrue_b64(); // For svaddv_f64
-
-  let step = svcntd() as usize; // Number of f64 elements
-
-  while i < len {
-    let p_active_f64 = svwhilelt_b64(i as u64, len as u64);
-
-    let a_vec = svld1_f64(p_active_f64, a.as_ptr().add(i));
-    let b_vec = svld1_f64(p_active_f64, b.as_ptr().add(i));
-
-    dot_product_acc_vec = svmla_f64_m(p_active_f64, dot_product_acc_vec, a_vec, b_vec);
-    a_norm_sq_acc_vec = svmla_f64_m(p_active_f64, a_norm_sq_acc_vec, a_vec, a_vec);
-    b_norm_sq_acc_vec = svmla_f64_m(p_active_f64, b_norm_sq_acc_vec, b_vec, b_vec);
-
-    i += step;
-  }
-
-  let dot_product_sum = svaddv_f64(p_true_b64, dot_product_acc_vec);
-  let a_norm_sq_sum = svaddv_f64(p_true_b64, a_norm_sq_acc_vec);
-  let b_norm_sq_sum = svaddv_f64(p_true_b64, b_norm_sq_acc_vec);
 
   if a_norm_sq_sum == 0.0 || b_norm_sq_sum == 0.0 {
     return 1.0;
@@ -443,14 +356,6 @@ pub fn dist_cosine(a: &VecData, b: &VecData) -> f64 {
           }
         }
       }
-      #[cfg(target_arch = "aarch64")]
-      {
-        if is_aarch64_feature_detected!("sve") && is_aarch64_feature_detected!("bf16") {
-          unsafe {
-            return dist_cosine_bf16_sve(a_arr, b_arr);
-          }
-        }
-      }
       dist_cosine_scalar(&AV::from(a_arr), &AV::from(b_arr))
     }
     (VecData::F16(a_arr), VecData::F16(b_arr)) => {
@@ -459,18 +364,6 @@ pub fn dist_cosine(a: &VecData, b: &VecData) -> f64 {
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512fp16") {
           unsafe {
             return dist_cosine_f16_avx512(a_arr, b_arr);
-          }
-        }
-      }
-      #[cfg(target_arch = "aarch64")]
-      {
-        // svfmlalb_f32_f16_z requires SVE2 and FP16 extensions
-        if is_aarch64_feature_detected!("sve")
-          && is_aarch64_feature_detected!("sve2")
-          && is_aarch64_feature_detected!("fp16")
-        {
-          unsafe {
-            return dist_cosine_f16_sve(a_arr, b_arr);
           }
         }
       }
@@ -487,9 +380,9 @@ pub fn dist_cosine(a: &VecData, b: &VecData) -> f64 {
       }
       #[cfg(target_arch = "aarch64")]
       {
-        if is_aarch64_feature_detected!("sve") {
+        if is_aarch64_feature_detected!("neon") {
           unsafe {
-            return dist_cosine_f32_sve(a_arr, b_arr);
+            return dist_cosine_f32_neon(a_arr, b_arr);
           }
         }
       }
@@ -506,9 +399,9 @@ pub fn dist_cosine(a: &VecData, b: &VecData) -> f64 {
       }
       #[cfg(target_arch = "aarch64")]
       {
-        if is_aarch64_feature_detected!("sve") {
+        if is_aarch64_feature_detected!("neon") {
           unsafe {
-            return dist_cosine_f64_sve(a_arr, b_arr);
+            return dist_cosine_f64_neon(a_arr, b_arr);
           }
         }
       }

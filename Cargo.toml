@@ -2,9 +2,10 @@
 resolver = "2"
 members = [
   "hnswlib-rs",
-  "libroxanne",
-  "roxanne",
-  "roxanne-py",
+  "libcorenn",
+  "corenn",
+  "corenn-py",
+  "corenn-node",
 ]
 
 [profile.release]

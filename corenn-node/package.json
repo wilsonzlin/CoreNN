@@ -1,0 +1,14 @@
+{
+  "scripts": {
+    "build": "tsc && cargo-cp-artifact --artifact cdylib corenn-node dist/index.node -- cargo build --message-format=json-render-diagnostics",
+    "build-debug": "npm run build --",
+    "build-release": "npm run build -- --release",
+    "clean": "shx rm -rf target index.node"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.1",
+    "cargo-cp-artifact": "^0.1.9",
+    "shx": "^0.4.0",
+    "typescript": "^5.8.3"
+  }
+}

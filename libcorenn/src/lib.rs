@@ -2,8 +2,15 @@
 #![feature(duration_millis_float)]
 #![feature(f16)]
 #![feature(path_add_extension)]
-#![feature(stdarch_x86_avx512_f16)]
-#![feature(stdarch_x86_avx512)]
+#![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_f16))]
+#![cfg_attr(
+  any(target_arch = "x86", target_arch = "x86_64"),
+  feature(stdarch_x86_avx512_f16)
+)]
+#![cfg_attr(
+  any(target_arch = "x86", target_arch = "x86_64"),
+  feature(stdarch_x86_avx512)
+)]
 
 use ahash::HashSet;
 use ahash::HashSetExt;
@@ -66,7 +73,6 @@ pub mod vec;
 enum Mode {
   // Lazy cache of DbNodeData in-memory.
   // We don't prepopulate as that makes start time unnecessarily long.
-  // Use Arc or else memcpy dominates CPU time.
   Uncompressed(NodeCache),
   // Second element is a cache of compressed vectors.
   // Caching isn't to save computation, it's to avoid DB roundtrip (same as Uncompressed).
@@ -136,9 +142,9 @@ pub struct State {
 }
 
 #[derive(Clone)]
-pub struct Roxanne(Arc<State>);
+pub struct CoreNN(Arc<State>);
 
-impl Deref for Roxanne {
+impl Deref for CoreNN {
   type Target = State;
 
   fn deref(&self) -> &Self::Target {
@@ -146,7 +152,7 @@ impl Deref for Roxanne {
   }
 }
 
-impl Roxanne {
+impl CoreNN {
   /// For internal use only. No guarantees about DB schema or state.
   pub fn internal_db(&self) -> &Arc<dyn Store> {
     &self.db
@@ -229,9 +235,9 @@ impl Roxanne {
         break;
       }
       candidates.retain(|s| {
-        let s_to_p = s.dist.0;
-        let s_to_p_star = p_star.dist(s);
-        s_to_p <= s_to_p_star * dist_thresh
+        let cand_dist_to_node = s.dist.0;
+        let cand_dist_to_pick = p_star.dist(s);
+        cand_dist_to_node <= cand_dist_to_pick * dist_thresh
       });
     }
     new_neighbors
@@ -334,10 +340,10 @@ impl Roxanne {
       search_list.truncate(search_list_cap);
     }
 
-    search_list.truncate(k);
     // We use `seen` as candidates for new neighbors, so we should remove soft-deleted here too to avoid new edges to them.
     // It's not necessary for correctness, but good to have. (We'll have to prune these edges later during compaction if we don't.)
     seen.retain(|id| !self.deleted.contains(id));
+    search_list.truncate(k);
     (search_list, seen)
   }
 
@@ -346,7 +352,7 @@ impl Roxanne {
     init_cfg: Option<Cfg>,
     create_if_missing: bool,
     error_if_exists: bool,
-  ) -> Roxanne {
+  ) -> CoreNN {
     let db: Arc<dyn Store> = match dir {
       Some(dir) => Arc::new(RocksDBStore::open(dir, create_if_missing, error_if_exists)),
       None => Arc::new(InMemoryStore::new()),
@@ -411,7 +417,7 @@ impl Roxanne {
       Mode::Uncompressed(new_node_cache(db.clone()))
     };
 
-    Roxanne(Arc::new(State {
+    CoreNN(Arc::new(State {
       add_edges,
       cfg,
       compaction_check: Mutex::new(false),
@@ -428,16 +434,16 @@ impl Roxanne {
     }))
   }
 
-  pub fn create(dir: impl AsRef<Path>, cfg: Cfg) -> Roxanne {
+  pub fn create(dir: impl AsRef<Path>, cfg: Cfg) -> CoreNN {
     Self::new(Some(dir), Some(cfg), true, true)
   }
 
-  pub fn open(dir: impl AsRef<Path>) -> Roxanne {
+  pub fn open(dir: impl AsRef<Path>) -> CoreNN {
     Self::new(Some(dir), None, false, false)
   }
 
-  pub fn new_in_memory() -> Roxanne {
-    Self::new(None::<PathBuf>, None, false, true)
+  pub fn new_in_memory(cfg: Cfg) -> CoreNN {
+    Self::new(None::<PathBuf>, Some(cfg), false, true)
   }
 
   pub fn query<D>(&self, query: &[D], k: usize) -> Vec<(String, f64)>
@@ -473,10 +479,10 @@ impl Roxanne {
     *is_compacting = true;
     drop(is_compacting);
 
-    let rox = self.clone();
+    let corenn = self.clone();
     spawn(move || {
-      compact(&rox);
-      let mut is_compacting = rox.compaction_check.lock();
+      compact(&corenn);
+      let mut is_compacting = corenn.compaction_check.lock();
       *is_compacting = false;
     });
   }
@@ -495,23 +501,25 @@ impl Roxanne {
     // Don't block subsequent calls to `maybe_enable_compression`.
     drop(is_enabled);
 
-    let rox = self.clone();
+    let corenn = self.clone();
     spawn(move || {
       tracing::warn!(
-        threshold = rox.cfg.compression_threshold,
-        n = rox.count.get(),
+        threshold = corenn.cfg.compression_threshold,
+        n = corenn.count.get(),
         "enabling compression"
       );
-      let compressor: Arc<dyn Compressor> = match rox.cfg.compression_mode {
+      let compressor: Arc<dyn Compressor> = match corenn.cfg.compression_mode {
         CompressionMode::PQ => {
-          let pq = ProductQuantizer::<f32>::train_from_roxanne(&rox);
-          PQ_MODEL.put(&rox.db, (), &pq);
+          let pq = ProductQuantizer::<f32>::train_from_corenn(&corenn);
+          PQ_MODEL.put(&corenn.db, (), &pq);
           Arc::new(pq)
         }
-        CompressionMode::Trunc => Arc::new(TruncCompressor::new(rox.cfg.trunc_dims)),
+        CompressionMode::Trunc => Arc::new(TruncCompressor::new(corenn.cfg.trunc_dims)),
       };
-      *rox.mode.write() =
-        Mode::Compressed(compressor.clone(), new_cv_cache(rox.db.clone(), compressor));
+      *corenn.mode.write() = Mode::Compressed(
+        compressor.clone(),
+        new_cv_cache(corenn.db.clone(), compressor),
+      );
       tracing::info!("enabled compression");
     });
   }
@@ -543,7 +551,7 @@ impl Roxanne {
     ID_TO_KEY.batch_put(&mut txn, id, key);
     KEY_TO_ID.batch_put(&mut txn, key, id);
     // All nodes must have an ADD_EDGES entry, even if empty.
-    // (See `Roxanne::open`.)
+    // (See `CoreNN::open`.)
     ADD_EDGES.batch_put(&mut txn, id, &vec![]);
 
     {

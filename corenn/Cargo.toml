@@ -1,5 +1,5 @@
 [package]
-name = "roxanne"
+name = "corenn"
 version = "0.1.0"
 edition = "2021"
 
@@ -16,8 +16,8 @@ hnswlib-rs = { version = "0.2.0", path = "../hnswlib-rs" }
 indicatif = "0.17.9"
 itertools = "0.13.0"
 tikv-jemallocator = { version = "0.6.0", features = ["unprefixed_malloc_on_supported_platforms"] }
-libroxanne = { version = "0.2.0", path = "../libroxanne" }
-ndarray = { version = "0.15", features = ["blas"] } # libroxanne uses 0.15.
+libcorenn = { version = "0.2.0", path = "../libcorenn" }
+ndarray = { version = "0.15", features = ["blas"] } # libcorenn uses 0.15.
 num-traits = "0.2.19"
 parking_lot = "0.12.3"
 rayon = "1.10.0"

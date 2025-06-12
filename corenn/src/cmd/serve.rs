@@ -7,8 +7,8 @@ use clap::Args;
 use clap::ValueEnum;
 use half::bf16;
 use half::f16;
-use libroxanne::vec::VecData;
-use libroxanne::Roxanne;
+use libcorenn::vec::VecData;
+use libcorenn::CoreNN;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use serde::Deserialize;
@@ -27,7 +27,7 @@ pub enum Dtype {
 
 #[derive(Args)]
 pub struct ServeArgs {
-  /// Path to a Roxanne DB.
+  /// Path to a CoreNN DB.
   #[arg()]
   path: PathBuf,
 
@@ -45,7 +45,7 @@ pub struct ServeArgs {
 }
 
 struct Ctx {
-  db: Arc<Roxanne>,
+  db: Arc<CoreNN>,
   dtype: Dtype,
 }
 
@@ -100,7 +100,7 @@ async fn handle_post_query(
 
 impl ServeArgs {
   pub async fn exec(self) {
-    let db = Arc::new(Roxanne::open(self.path));
+    let db = Arc::new(CoreNN::open(self.path));
 
     let ctx = Ctx {
       db,

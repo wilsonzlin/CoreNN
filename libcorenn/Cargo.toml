@@ -1,9 +1,9 @@
 [package]
-name = "libroxanne"
-description = "Library for RoxanneDB"
+name = "libcorenn"
+description = "Library for CoreNN"
 license = "Apache-2.0"
-homepage = "https://github.com/wilsonzlin/roxanne"
-repository = "https://github.com/wilsonzlin/roxanne.git"
+homepage = "https://github.com/wilsonzlin/corenn"
+repository = "https://github.com/wilsonzlin/corenn.git"
 version = "0.2.0"
 edition = "2021"
 

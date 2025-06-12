@@ -2,8 +2,8 @@ use super::Compressor;
 use super::CV;
 use crate::metric::StdMetric;
 use crate::vec::VecData;
+use crate::CoreNN;
 use crate::Mode;
-use crate::Roxanne;
 use itertools::Itertools;
 use linfa::traits::FitWith;
 use linfa::traits::Predict;
@@ -79,11 +79,11 @@ impl<T: Float> ProductQuantizer<T> {
     }
   }
 
-  pub fn train_from_roxanne(rox: &Roxanne) -> ProductQuantizer<f32> {
-    let samp_sz = min(rox.cfg.pq_sample_size, rox.count.get());
+  pub fn train_from_corenn(corenn: &CoreNN) -> ProductQuantizer<f32> {
+    let samp_sz = min(corenn.cfg.pq_sample_size, corenn.count.get());
     // TODO Handle many gaps (i.e. deleted).
-    let ids = (0..rox.count.get()).choose_multiple(&mut thread_rng(), samp_sz);
-    let Mode::Uncompressed(nodes) = &*rox.mode.read() else {
+    let ids = (0..corenn.count.get()).choose_multiple(&mut thread_rng(), samp_sz);
+    let Mode::Uncompressed(nodes) = &*corenn.mode.read() else {
       unreachable!();
     };
     let samp_nodes = nodes
@@ -93,15 +93,15 @@ impl<T: Float> ProductQuantizer<T> {
       .collect_vec();
     let actual_samp_sz = samp_nodes.len();
 
-    let mut mat = Array2::zeros((actual_samp_sz, rox.cfg.dim));
+    let mut mat = Array2::zeros((actual_samp_sz, corenn.cfg.dim));
     for (i, node) in samp_nodes.into_iter().enumerate() {
       mat.row_mut(i).assign(&node.vector.to_f32());
     }
-    let pq = ProductQuantizer::train(&mat.view(), rox.cfg.pq_subspaces);
+    let pq = ProductQuantizer::train(&mat.view(), corenn.cfg.pq_subspaces);
 
     tracing::info!(
       sample_inputs = actual_samp_sz,
-      subspaces = rox.cfg.pq_subspaces,
+      subspaces = corenn.cfg.pq_subspaces,
       "trained PQ"
     );
 
