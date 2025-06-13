@@ -1,9 +1,37 @@
 {
+  "name": "@corenn/node",
+  "description": "Billion-scale vector database",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "tsconfig.json"
+  ],
   "scripts": {
     "build": "tsc && cargo-cp-artifact --artifact cdylib corenn-node dist/index.node -- cargo build --message-format=json-render-diagnostics",
     "build-debug": "npm run build --",
     "build-release": "npm run build -- --release",
     "clean": "shx rm -rf target index.node"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wilsonzlin/corenn.git"
+  },
+  "author": {
+    "email": "npm@wilsonl.in",
+    "name": "Wilson Lin",
+    "url": "https://wilsonl.in/"
+  },
+  "bugs": {
+    "url": "https://github.com/wilsonzlin/corenn/issues"
+  },
+  "homepage": "https://github.com/wilsonzlin/corenn#readme",
+  "optionalDependencies": {
+    "@corenn/node-darwin-arm64": "0.1.0",
+    "@corenn/node-darwin-x64": "0.1.0",
+    "@corenn/node-linux-arm64": "0.1.0",
+    "@corenn/node-linux-x64": "0.1.0",
+    "@corenn/node-win32-x64": "0.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.1",
