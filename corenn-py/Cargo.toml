@@ -1,5 +1,6 @@
 [package]
-name = "corenn-py"
+# Maturin: The module name must not contain a minus `-`
+name = "corenn_py"
 publish = false
 version = "0.2.1"
 edition = "2021"
