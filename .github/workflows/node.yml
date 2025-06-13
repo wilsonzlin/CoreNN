@@ -37,10 +37,11 @@ jobs:
           node-version: 17.x
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
           toolchain: nightly
+          components: rustfmt
 
       - name: Set up cross compiler
         if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
