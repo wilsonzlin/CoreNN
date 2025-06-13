@@ -45,6 +45,21 @@ jobs:
           # https://github.com/PyO3/maturin-action/issues/49#issuecomment-1166242843
           args: --release --sdist --strip -m ./corenn-py/Cargo.toml -i ${{ matrix.python }}
           sccache: true
+          rust-toolchain: nightly
+          rustup-components: rustfmt
+          before-script-linux: |
+            # Install gcc, g++, and clang for both Debian/Ubuntu and RHEL/CentOS
+            if command -v apt-get &>/dev/null; then
+              sudo apt-get update
+              sudo apt-get -yq install gcc g++ clang
+            elif command -v dnf &>/dev/null; then
+              sudo dnf -y install gcc gcc-c++ clang
+            elif command -v yum &>/dev/null; then
+              sudo yum -y install gcc gcc-c++ clang
+            else
+              echo "No supported package manager found for installing gcc, g++, and clang." >&2
+              exit 1
+            fi
 
       - name: Install Python build tools (macOS)
         if: runner.os == 'macOS'
