@@ -1,4 +1,10 @@
-const internal = require("./index.node");
+let internal: any;
+try {
+  // Prioritise any local built binary.
+  internal = require("./index.node");
+} catch {
+  internal = require(`@corenn/node-${process.platform}-${process.arch}`);
+}
 
 export type Cfg = {
   dim: number;
