@@ -1,7 +1,7 @@
 {
   "name": "@corenn/node",
   "description": "Billion-scale vector database",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "main": "dist/index.js",
   "license": "Apache-2.0",
   "files": [
@@ -28,11 +28,11 @@
   },
   "homepage": "https://github.com/wilsonzlin/corenn#readme",
   "optionalDependencies": {
-    "@corenn/node-darwin-arm64": "0.1.0",
-    "@corenn/node-darwin-x64": "0.1.0",
-    "@corenn/node-linux-arm64": "0.1.0",
-    "@corenn/node-linux-x64": "0.1.0",
-    "@corenn/node-win32-x64": "0.1.0"
+    "@corenn/node-darwin-arm64": "0.2.1",
+    "@corenn/node-darwin-x64": "0.2.1",
+    "@corenn/node-linux-arm64": "0.2.1",
+    "@corenn/node-linux-x64": "0.2.1",
+    "@corenn/node-win32-x64": "0.2.1"
   },
   "devDependencies": {
     "@types/node": "^24.0.1",
