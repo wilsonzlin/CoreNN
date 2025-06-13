@@ -1,5 +1,6 @@
 [package]
 name = "corenn_py"
+publish = false
 version = "0.1.0"
 edition = "2021"
 

@@ -3,6 +3,7 @@
   "description": "Billion-scale vector database",
   "version": "0.1.0",
   "main": "dist/index.js",
+  "license": "Apache-2.0",
   "files": [
     "dist",
     "tsconfig.json"
