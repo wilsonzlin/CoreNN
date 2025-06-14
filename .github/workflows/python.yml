@@ -37,6 +37,8 @@ jobs:
           # TODO For now, disable aarch64 Linux cross compilation, due to issues around Clang, rust-rocksdb, and the manylinux container.
           - os: ubuntu-latest
             target: aarch64
+          - os: macos-15
+            target: x86_64
 
     steps:
       - uses: actions/checkout@v1
