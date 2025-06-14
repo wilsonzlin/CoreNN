@@ -98,6 +98,7 @@ for (const f of [
   "corenn-node/Cargo.toml",
   "corenn-py/Cargo.toml",
   "corenn/Cargo.toml",
+  "libcorenn/Cargo.toml",
 ]) {
   replaceInFile(
     f,
@@ -106,8 +107,8 @@ for (const f of [
   );
   replaceInFile(
     f,
-    /^corenn = \{ version = "\d+\.\d+\.\d+"/m,
-    `corenn = { version = "${NEW_VERSION}"`
+    /^libcorenn = \{ version = "\d+\.\d+\.\d+"/m,
+    `libcorenn = { version = "${NEW_VERSION}"`
   );
 }
 
