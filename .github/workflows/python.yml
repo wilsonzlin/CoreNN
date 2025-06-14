@@ -61,6 +61,10 @@ jobs:
               echo "No supported package manager found for installing gcc, g++, and clang." >&2
               exit 1
             fi
+            
+            # point Clang/bindgen at the aarch64 sysroot headers
+            export C_INCLUDE_PATH="$TARGET_C_INCLUDE_PATH"
+            export CPLUS_INCLUDE_PATH="$TARGET_C_INCLUDE_PATH"
 
       - name: Install Python build tools (macOS)
         if: runner.os == 'macOS'
