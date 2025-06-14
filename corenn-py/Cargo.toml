@@ -2,13 +2,13 @@
 # Maturin: The module name must not contain a minus `-`
 name = "corenn_py"
 publish = false
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
 half = "2.4.1"
 itertools = "0.13.0"
-libcorenn = { version = "0.2.0", path = "../libcorenn" }
+libcorenn = { version = "0.3.0", path = "../libcorenn" }
 ndarray = "0.15.0" # libcorenn requires 0.15.0.
 numpy = { version = "0.24", features = ["half"] }
 pyo3 = { version = "0.24", features = ["extension-module", "generate-import-lib"] }
