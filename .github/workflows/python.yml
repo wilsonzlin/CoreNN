@@ -52,6 +52,19 @@ jobs:
           manylinux: 2_28
           rust-toolchain: nightly
           rustup-components: rustfmt
+          before-script-linux: |
+            # Install clang for both Debian/Ubuntu and RHEL/CentOS
+            if command -v apt-get &>/dev/null; then
+              apt-get update
+              apt-get -yq install clang
+            elif command -v dnf &>/dev/null; then
+              dnf -y install clang
+            elif command -v yum &>/dev/null; then
+              yum -y install clang
+            else
+              echo "No supported package manager found for installing clang." >&2
+              exit 1
+            fi
 
       - name: Install Python build tools (macOS)
         if: runner.os == 'macOS'
