@@ -34,6 +34,10 @@ jobs:
           # Building for Windows aarch64 isn't ready yet.
           - os: windows-2022
             target: aarch64
+          # TODO For now, disable aarch64 Linux cross compilation, due to issues around Clang, rust-rocksdb, and the manylinux container.
+          - os: ubuntu-latest
+            target: aarch64
+
     steps:
       - uses: actions/checkout@v1
 
@@ -48,23 +52,6 @@ jobs:
           manylinux: 2_28
           rust-toolchain: nightly
           rustup-components: rustfmt
-          before-script-linux: |
-            # Install gcc, g++, and clang for both Debian/Ubuntu and RHEL/CentOS
-            if command -v apt-get &>/dev/null; then
-              apt-get update
-              apt-get -yq install gcc g++ clang
-            elif command -v dnf &>/dev/null; then
-              dnf -y install gcc gcc-c++ clang
-            elif command -v yum &>/dev/null; then
-              yum -y install gcc gcc-c++ clang
-            else
-              echo "No supported package manager found for installing gcc, g++, and clang." >&2
-              exit 1
-            fi
-            
-            # point Clang/bindgen at the aarch64 sysroot headers
-            export C_INCLUDE_PATH="$TARGET_C_INCLUDE_PATH"
-            export CPLUS_INCLUDE_PATH="$TARGET_C_INCLUDE_PATH"
 
       - name: Install Python build tools (macOS)
         if: runner.os == 'macOS'
