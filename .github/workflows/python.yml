@@ -45,6 +45,8 @@ jobs:
           # https://github.com/PyO3/maturin-action/issues/49#issuecomment-1166242843
           args: --release --sdist --strip -m ./corenn-py/Cargo.toml -i ${{ matrix.python }}
           sccache: true
+          # Use more modern baseline.
+          manylinux: 2_28
           rust-toolchain: nightly
           rustup-components: rustfmt
           before-script-linux: |
