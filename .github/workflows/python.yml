@@ -41,7 +41,6 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          manylinux: auto
           # https://github.com/PyO3/maturin-action/issues/49#issuecomment-1166242843
           args: --release --sdist --strip -m ./corenn-py/Cargo.toml -i ${{ matrix.python }}
           sccache: true
