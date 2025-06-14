@@ -42,8 +42,8 @@ export class CoreNN {
     return new CoreNN(db);
   }
 
-  insert(key: string, vector: Float32Array | Float64Array) {
-    internal.insert(this.db, key, vector);
+  insert(entries: Array<{key: string, vector: Float32Array | Float64Array}>) {
+    internal.insert(this.db, entries);
   }
 
   query(query: Float32Array | Float64Array, k: number): Array<{ key: string; distance: number }> {

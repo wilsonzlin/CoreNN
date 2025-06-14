@@ -89,16 +89,20 @@ fn new_in_memory(mut cx: FunctionContext) -> NeonResult<Handle<JsBox<CoreNNWrapp
 
 fn insert(mut cx: FunctionContext) -> NeonResult<Handle<JsUndefined>> {
   let db = &cx.argument::<JsBox<CoreNNWrapper>>(0)?.0;
-  let key = cx.argument::<JsString>(1)?.value(&mut cx);
-  let vector = cx.argument::<JsObject>(2)?;
-  if let Ok(as_f32) = vector.downcast::<JsTypedArray<f32>, _>(&mut cx) {
-    let vector = as_f32.as_slice(&mut cx);
-    db.insert(&key, vector);
-  } else if let Ok(as_f64) = vector.downcast::<JsTypedArray<f64>, _>(&mut cx) {
-    let vector = as_f64.as_slice(&mut cx);
-    db.insert(&key, vector);
-  } else {
-    cx.throw_type_error("Expected a Float32Array or Float64Array")?;
+  let entries = cx.argument::<JsArray>(1)?;
+  for entry in entries.to_vec(&mut cx)? {
+    let entry = entry.downcast_or_throw::<JsObject, _>(&mut cx)?;
+    let key = entry.get::<JsString, _, _>(&mut cx, "key")?.value(&mut cx);
+    let vector = entry.get::<JsObject, _, _>(&mut cx, "vector")?;
+    if let Ok(as_f32) = vector.downcast::<JsTypedArray<f32>, _>(&mut cx) {
+      let vector = as_f32.as_slice(&mut cx);
+      db.insert(&key, vector);
+    } else if let Ok(as_f64) = vector.downcast::<JsTypedArray<f64>, _>(&mut cx) {
+      let vector = as_f64.as_slice(&mut cx);
+      db.insert(&key, vector);
+    } else {
+      cx.throw_type_error("Expected a Float32Array or Float64Array")?;
+    }
   }
   Ok(cx.undefined())
 }
