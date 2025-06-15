@@ -4,7 +4,7 @@ description = "Billion-scale vector database"
 license = "Apache-2.0"
 homepage = "https://github.com/wilsonzlin/corenn"
 repository = "https://github.com/wilsonzlin/corenn.git"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 
 [dependencies]
@@ -20,7 +20,7 @@ hnswlib-rs = { version = "0.2.0", path = "../hnswlib-rs" }
 indicatif = "0.17.9"
 itertools = "0.13.0"
 tikv-jemallocator = { version = "0.6.0", features = ["unprefixed_malloc_on_supported_platforms"] }
-libcorenn = { version = "0.3.0", path = "../libcorenn" }
+libcorenn = { version = "0.3.1", path = "../libcorenn" }
 ndarray = { version = "0.15", features = ["blas"] } # libcorenn uses 0.15.
 num-traits = "0.2.19"
 parking_lot = "0.12.3"
