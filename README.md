@@ -59,10 +59,13 @@ db.insert_f32(keys, vectors)
 
 # Later...
 db = CoreNN.open("/path/to/db")
-queries = np.array([
-  [1.0, 1.3, 1.7],
-  [7.3, 2.5, 0.0],
-])
+queries = np.array(
+    [
+        [1.0, 1.3, 1.7],
+        [7.3, 2.5, 0.0],
+    ],
+    dtype=np.float32,
+)
 # Returns a list of (key, distance) tuples
 # for each query vector
 # (so returns a list of lists).
