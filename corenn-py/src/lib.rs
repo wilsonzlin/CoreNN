@@ -13,6 +13,7 @@ use pyo3::PyAny;
 use pyo3::PyResult;
 use rayon::iter::ParallelBridge;
 use rayon::iter::ParallelIterator;
+use rayon::iter::IntoParallelIterator;
 use serde_pyobject::from_pyobject;
 use std::iter::zip;
 use std::path::PathBuf;
@@ -76,43 +77,47 @@ impl CoreNN {
   }
 
   pub fn query_bf16(&self, queries: PyReadonlyArray2<bf16>, k: usize) -> Vec<Vec<(String, f64)>> {
-    queries
-      .as_array()
-      .rows()
-      .into_iter()
-      .par_bridge()
-      .map(|q| self.0.query(q.as_slice().unwrap(), k))
-      .collect()
+    let array = queries.as_array();
+    let n_rows = array.nrows(); // Get number of rows from the array directly
+    let rows: Vec<_> = array.rows().into_iter().collect();
+    
+    (0..n_rows)
+        .into_par_iter()
+        .map(|i| self.0.query(rows[i].as_slice().unwrap(), k))
+        .collect()
   }
 
   pub fn query_f16(&self, queries: PyReadonlyArray2<f16>, k: usize) -> Vec<Vec<(String, f64)>> {
-    queries
-      .as_array()
-      .rows()
-      .into_iter()
-      .par_bridge()
-      .map(|q| self.0.query(q.as_slice().unwrap(), k))
-      .collect()
+      let array = queries.as_array();
+      let n_rows = array.nrows();
+      let rows: Vec<_> = array.rows().into_iter().collect();
+      
+      (0..n_rows)
+          .into_par_iter()
+          .map(|i| self.0.query(rows[i].as_slice().unwrap(), k))
+          .collect()
   }
 
   pub fn query_f32(&self, queries: PyReadonlyArray2<f32>, k: usize) -> Vec<Vec<(String, f64)>> {
-    queries
-      .as_array()
-      .rows()
-      .into_iter()
-      .par_bridge()
-      .map(|q| self.0.query(q.as_slice().unwrap(), k))
-      .collect()
+      let array = queries.as_array();
+      let n_rows = array.nrows();
+      let rows: Vec<_> = array.rows().into_iter().collect();
+      
+      (0..n_rows)
+          .into_par_iter()
+          .map(|i| self.0.query(rows[i].as_slice().unwrap(), k))
+          .collect()
   }
 
   pub fn query_f64(&self, queries: PyReadonlyArray2<f64>, k: usize) -> Vec<Vec<(String, f64)>> {
-    queries
-      .as_array()
-      .rows()
-      .into_iter()
-      .par_bridge()
-      .map(|q| self.0.query(q.as_slice().unwrap(), k))
-      .collect()
+      let array = queries.as_array();
+      let n_rows = array.nrows();
+      let rows: Vec<_> = array.rows().into_iter().collect();
+      
+      (0..n_rows)
+          .into_par_iter()
+          .map(|i| self.0.query(rows[i].as_slice().unwrap(), k))
+          .collect()
   }
 }
 
