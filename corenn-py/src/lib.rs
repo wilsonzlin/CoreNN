@@ -119,6 +119,14 @@ impl CoreNN {
           .map(|i| self.0.query(rows[i].as_slice().unwrap(), k))
           .collect()
   }
+
+  pub fn delete(&self, keys: Vec<String>) {
+    keys
+      .into_par_iter()
+      .for_each(|k| {
+        self.0.delete(&k)
+      })
+  }
 }
 
 #[pymodule]
