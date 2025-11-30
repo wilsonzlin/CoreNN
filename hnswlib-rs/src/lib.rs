@@ -283,7 +283,6 @@ impl HnswIndex {
     query: &[f32],
     metric: Metric,
     ef: usize,
-    hop_count: &mut usize,
   ) -> MaxHeap {
     let mut visited = HashSet::<TableInt>::new();
 
@@ -303,7 +302,6 @@ impl HnswIndex {
       if candidate_dist > lower_bound {
         break;
       }
-      *hop_count += 1;
 
       let current_node_id = p.1;
       let data = self.get_link_list(current_node_id, 0);
@@ -336,7 +334,6 @@ impl HnswIndex {
     query: &[f32],
     k: usize,
     metric: Metric,
-    hop_count: &mut usize,
   ) -> Vec<(LabelType, f64)> {
     let mut curr_obj = self.enter_point_node;
     let mut cur_dist = metric(query, &self.get_data_by_internal_id(curr_obj));
@@ -345,7 +342,6 @@ impl HnswIndex {
       let mut changed = true;
       while changed {
         changed = false;
-        *hop_count += 1;
 
         let data = self.get_link_list(curr_obj, level);
         for &cand in data {
@@ -361,7 +357,7 @@ impl HnswIndex {
     }
 
     let mut top_candidates =
-      self.search_base_layer_st_bare_bone(curr_obj, query, metric, max(self.ef, k), hop_count);
+      self.search_base_layer_st_bare_bone(curr_obj, query, metric, max(self.ef, k));
 
     while top_candidates.len() > k {
       top_candidates.pop();
