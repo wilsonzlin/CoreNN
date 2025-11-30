@@ -3,13 +3,9 @@ use ahash::HashMapExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
 use bytemuck::cast_slice;
-use byteorder::LittleEndian;
-use byteorder::ReadBytesExt;
 use ordered_float::OrderedFloat;
 use std::cmp::max;
 use std::collections::BinaryHeap;
-use std::io;
-use std::io::Read;
 use std::mem::size_of;
 use std::ops::Range;
 
@@ -46,16 +42,34 @@ impl MaxHeap {
   }
 }
 
-trait ReadExt {
-  fn read_usize(&mut self) -> io::Result<usize>;
+fn consume_usize(rd: &mut &[u8]) -> usize {
+  let (bytes, rest) = rd.split_at(size_of::<usize>());
+  *rd = rest;
+  usize::from_le_bytes(bytes.try_into().unwrap())
 }
 
-impl<T: Read> ReadExt for T {
-  fn read_usize(&mut self) -> io::Result<usize> {
-    let mut buf = vec![0u8; size_of::<usize>()];
-    self.read_exact(&mut buf)?;
-    Ok(usize::from_le_bytes(buf.try_into().unwrap()))
-  }
+fn consume_u32(rd: &mut &[u8]) -> u32 {
+  let (bytes, rest) = rd.split_at(4);
+  *rd = rest;
+  u32::from_le_bytes(bytes.try_into().unwrap())
+}
+
+fn consume_i32(rd: &mut &[u8]) -> i32 {
+  let (bytes, rest) = rd.split_at(4);
+  *rd = rest;
+  i32::from_le_bytes(bytes.try_into().unwrap())
+}
+
+fn consume_f64(rd: &mut &[u8]) -> f64 {
+  let (bytes, rest) = rd.split_at(8);
+  *rd = rest;
+  f64::from_le_bytes(bytes.try_into().unwrap())
+}
+
+fn consume_bytes<'a>(rd: &mut &'a [u8], n: usize) -> &'a [u8] {
+  let (bytes, rest) = rd.split_at(n);
+  *rd = rest;
+  bytes
 }
 
 fn get_external_label(
@@ -65,13 +79,12 @@ fn get_external_label(
   label_offset: usize,
 ) -> LabelType {
   let mut ptr = &data_level_0_memory[internal_id as usize * size_data_per_element + label_offset..];
-  let return_label: LabelType = ptr.read_usize().unwrap();
-  return_label
+  consume_usize(&mut ptr)
 }
 
 #[allow(unused)]
 #[derive(Debug)]
-pub struct HnswIndex {
+pub struct HnswIndex<'a> {
   pub dim: usize,
 
   pub max_elements: usize,
@@ -95,31 +108,32 @@ pub struct HnswIndex {
   pub offset_level_0: usize,
   pub label_offset: usize,
 
-  pub data_level_0_memory: Vec<u8>,
-  pub link_lists: Vec<Option<Vec<u8>>>,
+  pub data_level_0_memory: &'a [u8],
+  pub link_lists: Vec<Option<&'a [u8]>>,
   pub element_levels: Vec<usize>, // These are stored as i32 in the original hnswlib, but we store as usize for convenience.
 
   pub label_lookup: HashMap<LabelType, TableInt>,
 }
 
-impl HnswIndex {
-  pub fn load(dim: usize, mut rd: impl Read) -> Self {
-    let offset_level_0 = rd.read_usize().unwrap();
-    let max_elements = rd.read_usize().unwrap();
-    let cur_element_count = rd.read_usize().unwrap();
-    let size_data_per_element = rd.read_usize().unwrap();
-    let label_offset = rd.read_usize().unwrap();
-    let offset_data = rd.read_usize().unwrap();
-    let max_level = rd.read_i32::<LittleEndian>().unwrap().try_into().unwrap();
-    let enter_point_node: TableInt = rd.read_u32::<LittleEndian>().unwrap();
-    let max_m = rd.read_usize().unwrap();
-    let max_m_0 = rd.read_usize().unwrap();
-    let m = rd.read_usize().unwrap();
-    let mult = rd.read_f64::<LittleEndian>().unwrap();
-    let ef_construction = rd.read_usize().unwrap();
+impl<'a> HnswIndex<'a> {
+  pub fn load(dim: usize, data: &'a [u8]) -> Self {
+    let rd = &mut &*data;
 
-    let mut data_level_0_memory = vec![0u8; max_elements * size_data_per_element];
-    rd.read_exact(&mut data_level_0_memory[..cur_element_count * size_data_per_element]).unwrap();
+    let offset_level_0 = consume_usize(rd);
+    let max_elements = consume_usize(rd);
+    let cur_element_count = consume_usize(rd);
+    let size_data_per_element = consume_usize(rd);
+    let label_offset = consume_usize(rd);
+    let offset_data = consume_usize(rd);
+    let max_level = consume_i32(rd).try_into().unwrap();
+    let enter_point_node: TableInt = consume_u32(rd);
+    let max_m = consume_usize(rd);
+    let max_m_0 = consume_usize(rd);
+    let m = consume_usize(rd);
+    let mult = consume_f64(rd);
+    let ef_construction = consume_usize(rd);
+
+    let data_level_0_memory = consume_bytes(rd, cur_element_count * size_data_per_element);
 
     let size_links_per_element = max_m * size_of::<TableInt>() + size_of::<LinkListSizeInt>();
     let size_links_level_0 = max_m_0 * size_of::<TableInt>() + size_of::<LinkListSizeInt>();
@@ -131,7 +145,7 @@ impl HnswIndex {
     let ef = 10;
     for i in 0..cur_element_count {
       let external_label = get_external_label(
-        &data_level_0_memory,
+        data_level_0_memory,
         i as TableInt,
         size_data_per_element,
         label_offset,
@@ -139,18 +153,15 @@ impl HnswIndex {
       assert!(label_lookup
         .insert(external_label, i.try_into().unwrap())
         .is_none());
-      let link_list_size: usize = rd.read_u32::<LittleEndian>().unwrap().try_into().unwrap();
+      let link_list_size: usize = consume_u32(rd).try_into().unwrap();
       if link_list_size > 0 {
         element_levels[i] = link_list_size / size_links_per_element;
-        let mut link_list = vec![0u8; link_list_size];
-        rd.read_exact(&mut link_list).unwrap();
+        let link_list = consume_bytes(rd, link_list_size);
         link_lists[i] = Some(link_list);
       };
     }
 
-    let mut eof = Vec::new();
-    rd.read_to_end(&mut eof).unwrap();
-    assert_eq!(eof, vec![]);
+    assert!(rd.is_empty());
 
     Self {
       dim,

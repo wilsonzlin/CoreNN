@@ -1,6 +1,6 @@
-use crate::load_hnsw;
 use ahash::HashMap;
 use clap::Args;
+use hnswlib_rs::HnswIndex;
 use itertools::Itertools;
 use libcorenn::cfg::Cfg;
 use libcorenn::metric::StdMetric;
@@ -11,6 +11,7 @@ use libcorenn::store::schema::NODE;
 use libcorenn::CoreNN;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::fs::read;
 
 #[derive(Args)]
 pub struct MigrateHnswArgs {
@@ -33,7 +34,8 @@ pub struct MigrateHnswArgs {
 
 impl MigrateHnswArgs {
   pub async fn exec(self: MigrateHnswArgs) {
-    let index = load_hnsw(self.dim, &self.path);
+    let hnsw_raw = read(&self.path).await.unwrap();
+    let index = HnswIndex::load(self.dim, &hnsw_raw);
 
     let cfg = Cfg {
       dim: self.dim,

@@ -1,8 +1,6 @@
-use hnswlib_rs::HnswIndex;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use num_traits::ToPrimitive;
-use std::path::Path;
 
 pub mod cmd;
 
@@ -31,10 +29,4 @@ pub fn new_pb(len: impl ToPrimitive) -> ProgressBar {
     len,
     "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
   )
-}
-
-pub fn load_hnsw(dim: usize, path: impl AsRef<Path>) -> HnswIndex {
-  let raw = std::fs::File::open(path).unwrap();
-  let mut rd = std::io::BufReader::new(raw);
-  HnswIndex::load(dim, &mut rd)
 }
