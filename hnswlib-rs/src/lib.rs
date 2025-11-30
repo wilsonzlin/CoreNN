@@ -119,7 +119,8 @@ impl HnswIndex {
     let ef_construction = rd.read_usize().unwrap();
 
     let mut data_level_0_memory = vec![0u8; max_elements * size_data_per_element];
-    rd.read_exact(&mut data_level_0_memory).unwrap();
+    rd.read_exact(&mut data_level_0_memory[..cur_element_count * size_data_per_element])
+      .unwrap();
 
     let size_links_per_element = max_m * size_of::<TableInt>() + size_of::<LinkListSizeInt>();
     let size_links_level_0 = max_m_0 * size_of::<TableInt>() + size_of::<LinkListSizeInt>();
