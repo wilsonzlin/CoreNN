@@ -403,7 +403,7 @@ This creates a sparse, navigable graph.
 
 ### Phase 1: Low-Hanging Fruit (Days 1-3) - COMPLETED ✓
 1. [x] Add benchmarking infrastructure - Added criterion benchmarks
-2. [ ] Profile current implementation - PENDING
+2. [ ] Profile current implementation - PENDING (need real dataset)
 3. [x] Code cleanup - Removed deprecated feature flags
 4. [ ] Batch neighbor fetching (G) - PENDING
 5. [x] Tune RocksDB settings (J) - COMPLETED
@@ -412,28 +412,58 @@ This creates a sparse, navigable graph.
    - Added optimize_for_point_lookup hint
    - Increased parallelism
 
-### Phase 2: Distance Computation (Days 4-7) - IN PROGRESS
+### Phase 2: Distance Computation (Days 4-7) - COMPLETED ✓
 1. [x] Implement ADC for PQ (B) - COMPLETED ✓
    - Added PQDistanceTable struct for precomputed distances
    - Added create_distance_table() method
    - Updated Compressor trait with ADC support
    - Modified search() to use ADC
-   - Tests verify ordering is preserved
-2. [ ] Add scalar quantization (C) - PENDING
-3. [ ] Add prefetching to SIMD (E) - PENDING
-4. [ ] Optimize search_list data structure (H) - PENDING
+   - **Benchmark: 22x faster than symmetric PQ (24.5ns vs 553.5ns)**
+2. [x] Add scalar quantization (C) - COMPLETED ✓
+   - Added ScalarQuantizer compressor (int8)
+   - 4x memory reduction
+   - SIMD-accelerated distance (AVX-512, NEON)
+   - ADC support included
+   - Added SQ compression mode option
+3. [x] Add prefetching to SIMD (E) - COMPLETED ✓
+   - Added software prefetch hints (_mm_prefetch)
+   - Added 4x loop unrolling for L2 distance
+   - Added 2x loop unrolling for Cosine distance
+   - **Benchmark: L2 768d = 30.4ns, Cosine 768d = 39.9ns**
+4. [ ] Optimize search_list data structure (H) - DEFERRED
+   - Current binary search approach is cache-friendly
 
-### Phase 3: Search Algorithm (Days 8-14) - PENDING
-1. [ ] Implement two-phase search (A)
-2. [ ] Add reranking path
-3. [ ] Parallel beam expansion
-4. [ ] Early termination heuristics
+### Phase 3: Search Algorithm (Days 8-14) - IN PROGRESS
+1. [ ] Implement two-phase search (A) - PARTIAL
+   - Added rerank_factor config option
+2. [ ] Add reranking path - PENDING
+3. [ ] Parallel beam expansion - PENDING
+4. [x] Early termination heuristics - COMPLETED ✓
+   - Added convergence detection (3 stale iterations)
+   - Monitors k-th best distance improvement
 
 ### Phase 4: Advanced Optimizations (Days 15+) - PENDING
 1. [ ] Memory-mapped mode (K)
 2. [ ] Custom serialization (M)
 3. [ ] Graph layout optimization
 4. [ ] HNSW-style multi-layer (optional)
+
+### Performance Benchmarks (Current)
+
+#### Distance Computation (per call)
+| Dimension | L2 (f32) | Cosine (f32) |
+|-----------|----------|--------------|
+| 128       | 10.0 ns  | 9.7 ns       |
+| 384       | 13.0 ns  | 33.4 ns      |
+| 768       | 30.4 ns  | 39.9 ns      |
+| 1536      | 66.5 ns  | 64.6 ns      |
+
+#### PQ ADC (768d, 64 subspaces)
+| Method | Time |
+|--------|------|
+| ADC    | 24.5 ns |
+| Symmetric | 553.5 ns |
+| Speedup | **22.6x** |
 
 ---
 

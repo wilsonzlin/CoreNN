@@ -20,6 +20,7 @@ use common::nan_to_num;
 use common::Id;
 use compaction::compact;
 use compressor::pq::ProductQuantizer;
+use compressor::scalar::ScalarQuantizer;
 use compressor::trunc::TruncCompressor;
 use compressor::Compressor;
 use compressor::DistanceTable;
@@ -51,6 +52,7 @@ use store::schema::ID_TO_KEY;
 use store::schema::KEY_TO_ID;
 use store::schema::NODE;
 use store::schema::PQ_MODEL;
+use store::schema::SQ_MODEL;
 use store::Store;
 use tracing::debug;
 use util::AtomUsz;
@@ -108,6 +110,7 @@ impl Point {
     }
   }
 
+  #[allow(dead_code)]
   pub fn dist_query(&self, query: &VecData) -> f64 {
     self.dist_query_with_table(query, None)
   }
@@ -224,6 +227,7 @@ impl CoreNN {
     })
   }
 
+  #[allow(dead_code)]
   fn get_point(&self, id: Id, query: Option<&VecData>) -> Option<Point> {
     self.get_points(&[id], query).exactly_one().ok().unwrap()
   }
@@ -281,6 +285,12 @@ impl CoreNN {
     let seen = DashSet::new();
     // There's no need to expand the same node more than once.
     let mut expanded = HashSet::new();
+    
+    // Early termination tracking: if the best k results haven't improved in
+    // several iterations, we can stop early.
+    let mut stale_iterations = 0;
+    let max_stale_iterations = 3; // Stop if no improvement for 3 iterations
+    let mut prev_best_dist = f64::INFINITY;
 
     // Start with the entry node.
     let Some(entry) = self.get_points_with_table(&[0], Some(query), dist_table_ref).next().flatten() else {
@@ -356,6 +366,22 @@ impl CoreNN {
 
       // Without truncation each iteration, we'll search the entire graph.
       search_list.truncate(search_list_cap);
+      
+      // Early termination check: has the k-th best distance improved?
+      if search_list.len() >= k {
+        let current_kth_dist = search_list[k - 1].dist.0;
+        // Check if we've made meaningful progress (at least 0.1% improvement)
+        if current_kth_dist >= prev_best_dist * 0.999 {
+          stale_iterations += 1;
+          if stale_iterations >= max_stale_iterations {
+            // No improvement - terminate early
+            break;
+          }
+        } else {
+          stale_iterations = 0;
+          prev_best_dist = current_kth_dist;
+        }
+      }
     }
 
     // We use `seen` as candidates for new neighbors, so we should remove soft-deleted here too to avoid new edges to them.
@@ -423,6 +449,10 @@ impl CoreNN {
       let compressor: Option<Arc<dyn Compressor>> = match cfg.compression_mode {
         CompressionMode::PQ => PQ_MODEL.read(&db, ()).map(|pq| {
           let compressor: Arc<dyn Compressor> = Arc::new(pq);
+          compressor
+        }),
+        CompressionMode::SQ => SQ_MODEL.read(&db, ()).map(|sq| {
+          let compressor: Arc<dyn Compressor> = Arc::new(sq);
           compressor
         }),
         CompressionMode::Trunc => Some(Arc::new(TruncCompressor::new(cfg.trunc_dims))),
@@ -531,6 +561,11 @@ impl CoreNN {
           let pq = ProductQuantizer::<f32>::train_from_corenn(&corenn);
           PQ_MODEL.put(&corenn.db, (), &pq);
           Arc::new(pq)
+        }
+        CompressionMode::SQ => {
+          let sq = ScalarQuantizer::train_from_corenn(&corenn);
+          SQ_MODEL.put(&corenn.db, (), &sq);
+          Arc::new(sq)
         }
         CompressionMode::Trunc => Arc::new(TruncCompressor::new(corenn.cfg.trunc_dims)),
       };

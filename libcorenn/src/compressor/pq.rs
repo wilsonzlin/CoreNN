@@ -49,37 +49,100 @@ impl PQDistanceTable {
   #[inline]
   pub fn distance(&self, codes: &[u8]) -> f64 {
     match self.metric {
-      StdMetric::L2 => {
-        let mut total_sq: f32 = 0.0;
-        for (i, &code) in codes.iter().enumerate() {
-          total_sq += self.squared_distances[i][code as usize];
-        }
-        (total_sq as f64).sqrt()
-      }
-      StdMetric::Cosine => {
-        let mut total_dot: f32 = 0.0;
-        let mut total_query_norm_sq: f32 = 0.0;
-        let mut total_centroid_norm_sq: f32 = 0.0;
-        for (i, &code) in codes.iter().enumerate() {
-          total_dot += self.dot_products[i][code as usize];
-          total_query_norm_sq += self.query_norms_sq[i];
-          total_centroid_norm_sq += self.centroid_norms_sq[i][code as usize];
-        }
-        
-        const EPSILON: f32 = 1e-12;
-        if total_query_norm_sq < EPSILON || total_centroid_norm_sq < EPSILON {
-          return if total_query_norm_sq < EPSILON && total_centroid_norm_sq < EPSILON {
-            0.0
-          } else {
-            1.0
-          };
-        }
-        
-        let denom = (total_query_norm_sq * total_centroid_norm_sq).sqrt();
-        let cosine_sim = (total_dot / denom) as f64;
-        1.0 - cosine_sim.clamp(-1.0, 1.0)
-      }
+      StdMetric::L2 => self.distance_l2(codes),
+      StdMetric::Cosine => self.distance_cosine(codes),
     }
+  }
+  
+  /// L2 distance using table lookup. Uses loop unrolling for better performance.
+  #[inline]
+  fn distance_l2(&self, codes: &[u8]) -> f64 {
+    let n = codes.len();
+    let mut total_sq: f32 = 0.0;
+    let mut i = 0;
+    
+    // Unroll by 4 for better ILP
+    let limit_unrolled = n - (n % 4);
+    while i < limit_unrolled {
+      let c0 = codes[i] as usize;
+      let c1 = codes[i + 1] as usize;
+      let c2 = codes[i + 2] as usize;
+      let c3 = codes[i + 3] as usize;
+      
+      total_sq += self.squared_distances[i][c0];
+      total_sq += self.squared_distances[i + 1][c1];
+      total_sq += self.squared_distances[i + 2][c2];
+      total_sq += self.squared_distances[i + 3][c3];
+      
+      i += 4;
+    }
+    
+    // Handle remainder
+    while i < n {
+      total_sq += self.squared_distances[i][codes[i] as usize];
+      i += 1;
+    }
+    
+    (total_sq as f64).sqrt()
+  }
+  
+  /// Cosine distance using table lookup.
+  #[inline]
+  fn distance_cosine(&self, codes: &[u8]) -> f64 {
+    let n = codes.len();
+    let mut total_dot: f32 = 0.0;
+    let mut total_query_norm_sq: f32 = 0.0;
+    let mut total_centroid_norm_sq: f32 = 0.0;
+    
+    let mut i = 0;
+    let limit_unrolled = n - (n % 4);
+    
+    // Unroll by 4
+    while i < limit_unrolled {
+      let c0 = codes[i] as usize;
+      let c1 = codes[i + 1] as usize;
+      let c2 = codes[i + 2] as usize;
+      let c3 = codes[i + 3] as usize;
+      
+      total_dot += self.dot_products[i][c0];
+      total_dot += self.dot_products[i + 1][c1];
+      total_dot += self.dot_products[i + 2][c2];
+      total_dot += self.dot_products[i + 3][c3];
+      
+      total_query_norm_sq += self.query_norms_sq[i];
+      total_query_norm_sq += self.query_norms_sq[i + 1];
+      total_query_norm_sq += self.query_norms_sq[i + 2];
+      total_query_norm_sq += self.query_norms_sq[i + 3];
+      
+      total_centroid_norm_sq += self.centroid_norms_sq[i][c0];
+      total_centroid_norm_sq += self.centroid_norms_sq[i + 1][c1];
+      total_centroid_norm_sq += self.centroid_norms_sq[i + 2][c2];
+      total_centroid_norm_sq += self.centroid_norms_sq[i + 3][c3];
+      
+      i += 4;
+    }
+    
+    // Handle remainder
+    while i < n {
+      let code = codes[i] as usize;
+      total_dot += self.dot_products[i][code];
+      total_query_norm_sq += self.query_norms_sq[i];
+      total_centroid_norm_sq += self.centroid_norms_sq[i][code];
+      i += 1;
+    }
+    
+    const EPSILON: f32 = 1e-12;
+    if total_query_norm_sq < EPSILON || total_centroid_norm_sq < EPSILON {
+      return if total_query_norm_sq < EPSILON && total_centroid_norm_sq < EPSILON {
+        0.0
+      } else {
+        1.0
+      };
+    }
+    
+    let denom = (total_query_norm_sq * total_centroid_norm_sq).sqrt();
+    let cosine_sim = (total_dot / denom) as f64;
+    1.0 - cosine_sim.clamp(-1.0, 1.0)
   }
 }
 

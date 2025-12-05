@@ -44,3 +44,7 @@ criterion = "0.5"
 [[bench]]
 name = "distance"
 harness = false
+
+[[bench]]
+name = "query"
+harness = false

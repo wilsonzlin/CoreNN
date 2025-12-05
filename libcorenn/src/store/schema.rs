@@ -3,6 +3,7 @@ use super::WriteOp;
 use crate::cfg::Cfg;
 use crate::common::Id;
 use crate::compressor::pq::ProductQuantizer;
+use crate::compressor::scalar::ScalarQuantizer;
 use crate::vec::VecData;
 use rmp_serde::to_vec_named;
 use serde::de::DeserializeOwned;
@@ -140,6 +141,7 @@ db_ent!(KEY_TO_ID, 4, String, Id);
 db_ent!(ID_TO_KEY, 5, Id, String);
 db_ent!(NODE, 6, Id, DbNodeData);
 db_ent!(PQ_MODEL, 7, (), ProductQuantizer<f32>);
+db_ent!(SQ_MODEL, 8, (), ScalarQuantizer);
 
 // We store both in one DB entry to leverage one disk page read to get both, as specified in the DiskANN paper. (If we store them as separate DB entries, they are unlikely to be stored in the same disk page.)
 #[derive(Clone, Debug, Deserialize, Serialize)]

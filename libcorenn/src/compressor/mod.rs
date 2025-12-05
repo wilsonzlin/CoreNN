@@ -7,6 +7,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 pub mod pq;
+pub mod scalar;
 pub mod trunc;
 
 // Compressed vector.
