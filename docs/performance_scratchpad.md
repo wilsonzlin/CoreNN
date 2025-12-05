@@ -6,10 +6,10 @@
 | Timestamp (UTC) | Activity | Notes / Findings |
 | --- | --- | --- |
 | 2025-12-05T00:00 | Session start | Set up comprehensive plan + scratchpad.
-|  |  |  |
+| 2025-12-05T00:45 | Repo audit | No historical benchmark data or metrics in tree.
 
 ## Immediate Next Actions
-- [ ] Catalog existing benchmarks / gather any historical numbers.
+- [x] Catalog existing benchmarks / gather any historical numbers. *(None checked in.)*
 - [ ] Stand up reproducible dataset pipeline (SIFT1M + Deep1B) using `tools/` scripts.
 - [ ] Run baseline `corenn cmd eval` to capture recall + latency.
 - [ ] Profile query hot path with `cargo flamegraph -p corenn --bin corenn -- eval ...`.
