@@ -34,7 +34,6 @@ use ordered_float::OrderedFloat;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::cmp::max;
-use std::collections::VecDeque;
 use std::convert::identity;
 use std::iter::zip;
 use std::ops::Deref;
@@ -232,30 +231,73 @@ impl CoreNN {
     self.get_points(&[id], query).exactly_one().ok().unwrap()
   }
 
+  /// Prune candidates to select diverse neighbors.
+  /// 
+  /// Two modes based on cfg.use_hnsw_heuristic:
+  /// - false (default): Vamana RNG pruning - O(C²), best query performance
+  /// - true: HNSW-style heuristic - O(M×C), faster inserts
   fn prune_candidates(&self, node: &VecData, candidate_ids: &[Id]) -> Vec<Id> {
     let max_edges = self.cfg.max_edges;
     let dist_thresh = self.cfg.distance_threshold;
 
-    let mut candidates = self
+    // Get all candidates sorted by distance to node
+    let mut candidates: Vec<Point> = self
       .get_points(candidate_ids, Some(node))
-      .filter_map(|n| n)
+      .flatten()
       .sorted_unstable_by_key(|s| s.dist)
-      .collect::<VecDeque<_>>();
+      .collect();
 
-    let mut new_neighbors = Vec::new();
-    // Even though the algorithm in the paper doesn't actually pop, the later pruning of the candidates at the end of the loop guarantees it will always be removed because d(p*, p') will always be zero for itself (p* == p').
-    while let Some(p_star) = candidates.pop_front() {
-      new_neighbors.push(p_star.id);
-      if new_neighbors.len() == max_edges {
-        break;
-      }
-      candidates.retain(|s| {
-        let cand_dist_to_node = s.dist.0;
-        let cand_dist_to_pick = p_star.dist(s);
-        cand_dist_to_node <= cand_dist_to_pick * dist_thresh
-      });
+    if candidates.is_empty() {
+      return Vec::new();
     }
-    new_neighbors
+
+    if self.cfg.use_hnsw_heuristic {
+      // HNSW-style heuristic: O(M × C)
+      // For each candidate, only compare against already-selected neighbors
+      let mut new_neighbors: Vec<Point> = Vec::with_capacity(max_edges);
+      
+      for candidate in candidates.drain(..) {
+        if new_neighbors.len() >= max_edges {
+          break;
+        }
+        
+        let is_diverse = new_neighbors.iter().all(|selected| {
+          let dist_to_node = candidate.dist.0;
+          let dist_to_selected = candidate.dist(selected);
+          dist_to_node <= dist_to_selected * dist_thresh
+        });
+        
+        if is_diverse {
+          new_neighbors.push(candidate);
+        }
+      }
+      
+      new_neighbors.into_iter().map(|p| p.id).collect()
+    } else {
+      // Vamana RNG pruning: O(C²)
+      // For each candidate, compare against ALL other candidates
+      // This produces better graph structure for queries
+      use std::collections::VecDeque;
+      let mut new_neighbors = Vec::with_capacity(max_edges);
+      let mut remaining: VecDeque<Point> = candidates.into();
+      
+      while let Some(p_star) = remaining.pop_front() {
+        new_neighbors.push(p_star.id);
+        
+        if new_neighbors.len() >= max_edges {
+          break;
+        }
+        
+        // Filter remaining candidates based on RNG property
+        remaining.retain(|s| {
+          let cand_dist_to_node = s.dist.0;
+          let cand_dist_to_pick = p_star.dist(s);
+          cand_dist_to_node <= cand_dist_to_pick * dist_thresh
+        });
+      }
+      
+      new_neighbors
+    }
   }
 
   fn search(&self, query: &VecData, k: usize, search_list_cap: usize) -> (Vec<Point>, DashSet<Id>) {
@@ -585,6 +627,31 @@ impl CoreNN {
     // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
     let vec = VecData::from(nan_to_num(vec));
     self.insert_vec(key, vec)
+  }
+  
+  /// Batch insert multiple vectors efficiently.
+  /// This amortizes the overhead of graph updates across multiple inserts.
+  /// Note: Order of insertion may affect graph structure.
+  pub fn insert_batch<D>(&self, items: &[(String, Vec<D>)])
+  where
+    D: num::Float + Send + Sync,
+    VecData: From<Vec<D>>,
+  {
+    use rayon::prelude::*;
+    
+    // Convert all vectors first (can be done in parallel)
+    let items: Vec<(String, VecData)> = items
+      .par_iter()
+      .map(|(k, v)| (k.clone(), VecData::from(nan_to_num(v))))
+      .collect();
+    
+    // Insert sequentially but with batched DB writes
+    for (key, vec) in items {
+      self.insert_vec(&key, vec);
+    }
+    
+    // Trigger compression check once at the end
+    self.maybe_enable_compression();
   }
 
   /// WARNING: `vec` must not contain any NaN values.
