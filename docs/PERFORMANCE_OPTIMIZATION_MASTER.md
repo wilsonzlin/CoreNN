@@ -159,19 +159,25 @@ The search implements a **greedy beam search** with HNSW-style optimizations:
 5. Write transaction to DB
 ```
 
-### Pruning Algorithm (lib.rs) - HNSW Heuristic
-Uses **HNSW-style neighbor selection** (O(M×C) complexity):
+### Pruning Algorithm (lib.rs) - Vamana RobustPrune
+Uses **Vamana's RobustPrune** algorithm (Algorithm 2 from DiskANN paper):
 ```
-For each candidate c sorted by distance to node (closest first):
-  If no selected neighbor is closer to c than c is to node:
-    Add c to selected neighbors
-  (Early exit when found a closer neighbor)
+RobustPrune(p, V, α, R):
+  while V ≠ ∅ do
+    p* ← closest remaining candidate to p
+    Add p* to p's neighbors
+    if |neighbors| = R then break
+    for p' ∈ V do
+      if α · d(p*, p') ≤ d(p, p') then
+        remove p' from V  // p' is "covered" by p*
 ```
-This is the exact algorithm from hnswlib's `getNeighborsByHeuristic2`.
 
-**Key difference from original Vamana RNG**:
-- HNSW: O(M×C) - compare to selected neighbors only, early exit
-- Vamana RNG: O(C²) - compare to all candidates with threshold
+**Key insight**: The α parameter (distance_threshold, default 1.2) is CRUCIAL:
+- α = 1.0: Standard RNG, sparser graph, larger diameter
+- α > 1.0: Denser graph, **guarantees O(log n) diameter for disk-based search**
+
+**Complexity**: O(R × |V|) where R = max_edges, |V| = candidates
+(NOT O(V²) - only compare to already-selected neighbors)
 
 ---
 
@@ -441,15 +447,15 @@ This is the exact algorithm from hnswlib's `getNeighborsByHeuristic2`.
 4. [ ] Optimize search_list data structure (H) - DEFERRED
    - Current binary search approach is cache-friendly
 
-### Phase 3: HNSW Algorithm Integration (Days 8-14) - COMPLETED ✓
-1. [x] HNSW-style neighbor selection - COMPLETED ✓
-   - Replaced O(C²) Vamana RNG with O(M×C) HNSW heuristic
-   - Exact algorithm from hnswlib's `getNeighborsByHeuristic2`
-   - Strict `<` comparison with early exit
-2. [x] HNSW-style early stopping - COMPLETED ✓
+### Phase 3: Search & Pruning Optimizations (Days 8-14) - COMPLETED ✓
+1. [x] Vamana RobustPrune with α parameter - VERIFIED ✓
+   - Kept original O(R×|V|) α-RNG pruning (NOT HNSW heuristic!)
+   - α parameter (distance_threshold) controls density/diameter tradeoff
+   - Default α = 1.2 guarantees O(log n) search paths (DiskANN paper)
+2. [x] HNSW-style early stopping in search - COMPLETED ✓
    - Added `lower_bound` tracking (worst result distance)
    - Stop when best unexplored > lower_bound AND list is full
-   - Replaced "stale iterations" heuristic
+   - This is a safe optimization compatible with Vamana
 3. [x] Only add improving candidates - COMPLETED ✓
    - Skip candidates that can't improve results (dist >= lower_bound)
 4. [ ] Implement two-phase search (A) - PARTIAL

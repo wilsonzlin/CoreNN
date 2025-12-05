@@ -47,6 +47,7 @@ fn cfg_from_js(cx: &mut FunctionContext, cfg_js: &JsObject) -> NeonResult<Cfg> {
   prop!(compression_mode, JsString, |cx, v| compression_mode_from_str(cx, v));
   prop!(compression_threshold, JsNumber, |cx, v| as_usize(cx, v));
   prop!(dim, JsNumber, |cx, v| as_usize(cx, v));
+  prop!(distance_threshold, JsNumber, |cx, v| Ok(v.value(cx)));
   prop!(max_add_edges, JsNumber, |cx, v| as_usize(cx, v));
   prop!(max_edges, JsNumber, |cx, v| as_usize(cx, v));
   prop!(metric, JsString, |cx, v| metric_from_str(cx, v));

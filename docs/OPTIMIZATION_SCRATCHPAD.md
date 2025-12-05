@@ -392,7 +392,20 @@ k=100: 1.92 ms  (520 QPS)
 10000 vectors: 1.54 ms  (650 QPS)
 ```
 
-#### TODO (Remaining HNSW Optimizations)
+#### IMPORTANT LESSON: Vamana ≠ HNSW
+
+After reading the DiskANN paper carefully, discovered that:
+
+1. **Vamana RobustPrune uses α parameter** - HNSW doesn't
+2. **α guarantees O(log n) diameter** - critical for disk-based search
+3. **The pruning condition is different**:
+   - Vamana: `α · d(selected, p') ≤ d(node, p')`
+   - HNSW: `d(selected, p') < d(query, p')`
+
+**Action taken**: Reverted to original Vamana RobustPrune with α = 1.2 default.
+See `/workspace/docs/VAMANA_RNG_ANALYSIS.md` for full analysis.
+
+#### TODO (Remaining Optimizations)
 
 - [ ] Visited list pool (avoid DashSet allocation per search)
 - [ ] Lazy backedge updates (only prune when neighbor is truly full)

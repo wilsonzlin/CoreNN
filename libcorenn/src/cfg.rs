@@ -24,6 +24,12 @@ pub struct Cfg {
   pub compression_mode: CompressionMode,
   pub compression_threshold: usize,
   pub dim: usize,
+  /// Alpha parameter for Vamana's RobustPrune (α in the DiskANN paper).
+  /// Controls the tradeoff between graph sparsity and search path length:
+  /// - α = 1.0: Standard RNG pruning, sparser graph, potentially longer paths
+  /// - α > 1.0 (e.g., 1.2): More edges kept, guarantees O(log n) diameter
+  /// The paper recommends α = 1.2 for disk-based systems.
+  pub distance_threshold: f64,
   pub max_add_edges: usize,
   pub max_edges: usize,
   pub metric: StdMetric,
@@ -47,6 +53,8 @@ impl Default for Cfg {
       compaction_threshold_deletes: 1_000_000,
       compression_mode: CompressionMode::PQ,
       compression_threshold: 10_000_000,
+      // α = 1.2 as recommended in DiskANN paper for disk-based systems
+      distance_threshold: 1.2,
       // Lazy pruning: allow 2x edges before triggering pruning.
       // This amortizes the cost of expensive pruning operations.
       max_add_edges: max_edges * 2,

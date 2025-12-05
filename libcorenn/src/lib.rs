@@ -231,19 +231,32 @@ impl CoreNN {
     self.get_points(&[id], query).exactly_one().ok().unwrap()
   }
 
-  /// Select diverse neighbors using HNSW-style heuristic.
+  /// Select diverse neighbors using Vamana's RobustPrune algorithm.
   /// 
-  /// This is the exact algorithm from hnswlib's `getNeighborsByHeuristic2`:
-  /// - O(M × C) complexity where M = max_edges, C = candidates
-  /// - Strict `<` comparison (no threshold parameter)
-  /// - Early exit when a closer selected neighbor is found
+  /// This is Algorithm 2 from the DiskANN paper (Subramanya et al., NeurIPS 2019):
   /// 
-  /// For each candidate (closest first):
-  /// - Check if candidate is closer to query than to ANY selected neighbor
-  /// - If so, add to selected neighbors
-  /// - Otherwise, skip (it's "covered" by an existing neighbor)
+  /// ```text
+  /// RobustPrune(p, V, α, R):
+  ///   V ← (V ∪ Nout(p)) \ {p}
+  ///   Nout(p) ← ∅
+  ///   while V ≠ ∅ do
+  ///     p* ← argmin_{p' ∈ V} d(p, p')    // Pick closest to node
+  ///     Nout(p) ← Nout(p) ∪ {p*}         // Add to neighbors
+  ///     if |Nout(p)| = R then break      // Stop at max degree
+  ///     for p' ∈ V do
+  ///       if α · d(p*, p') ≤ d(p, p') then  // α-RNG condition
+  ///         remove p' from V               // Prune covered points
+  /// ```
+  /// 
+  /// The α parameter (distance_threshold) is CRUCIAL:
+  /// - α = 1: Standard RNG, may have large diameter
+  /// - α > 1 (e.g., 1.2): Guarantees O(log n) diameter for disk-based search
+  ///   because each step makes multiplicative progress toward query
+  /// 
+  /// Complexity: O(R × |V|) where R = max_edges, |V| = candidates
   fn prune_candidates(&self, node: &VecData, candidate_ids: &[Id]) -> Vec<Id> {
     let max_edges = self.cfg.max_edges;
+    let alpha = self.cfg.distance_threshold;
 
     // Get all candidates sorted by distance to node (closest first)
     let candidates: Vec<Point> = self
@@ -261,35 +274,32 @@ impl CoreNN {
       return candidates.into_iter().map(|p| p.id).collect();
     }
 
-    // HNSW heuristic: greedy selection with diversity check
-    let mut selected: Vec<Point> = Vec::with_capacity(max_edges);
+    // Vamana RobustPrune: iteratively select closest and prune covered candidates
+    use std::collections::VecDeque;
+    let mut selected: Vec<Id> = Vec::with_capacity(max_edges);
+    let mut remaining: VecDeque<Point> = candidates.into();
     
-    for candidate in candidates {
+    while let Some(p_star) = remaining.pop_front() {
+      // p* is the closest remaining candidate to node
+      selected.push(p_star.id);
+      
       if selected.len() >= max_edges {
         break;
       }
       
-      let dist_to_query = candidate.dist.0;
-      
-      // Check if this candidate is "good" - closer to query than to any selected neighbor
-      // Uses strict < like HNSW (no threshold)
-      let mut is_good = true;
-      for neighbor in &selected {
-        let dist_to_neighbor = candidate.dist(neighbor);
-        if dist_to_neighbor < dist_to_query {
-          // This candidate is closer to an existing neighbor than to query
-          // It's "covered" by that neighbor, skip it
-          is_good = false;
-          break; // Early exit!
-        }
-      }
-      
-      if is_good {
-        selected.push(candidate);
-      }
+      // Remove candidates that are "covered" by p* using α-RNG condition:
+      // Remove p' if α · d(p*, p') ≤ d(node, p')
+      // Keep p' if α · d(p*, p') > d(node, p')
+      // Equivalently: keep if d(node, p') < α · d(p*, p')
+      remaining.retain(|p_prime| {
+        let dist_node_to_candidate = p_prime.dist.0;
+        let dist_selected_to_candidate = p_star.dist(p_prime);
+        // Keep if node is closer to candidate than α × selected-to-candidate
+        dist_node_to_candidate < alpha * dist_selected_to_candidate
+      });
     }
     
-    selected.into_iter().map(|p| p.id).collect()
+    selected
   }
 
   fn search(&self, query: &VecData, k: usize, search_list_cap: usize) -> (Vec<Point>, DashSet<Id>) {

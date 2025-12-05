@@ -124,16 +124,35 @@ _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + 
 #endif
 ```
 
+## IMPORTANT: Vamana vs HNSW Differences
+
+**After reading the DiskANN paper carefully, we found that Vamana's RobustPrune
+is NOT identical to HNSW's heuristic - and the difference matters!**
+
+| Aspect | Vamana RobustPrune | HNSW Heuristic |
+|--------|-------------------|----------------|
+| Condition | `α · d(p*, p') ≤ d(p, p')` | `d(p*, p') < d(q, p')` |
+| α parameter | Yes (typically 1.2) | No |
+| Guarantee | O(log n) search path with α > 1 | No formal guarantee |
+
+The α parameter ensures each search step makes **multiplicative progress**:
+> "we would like to ensure that the distance to the query decreases by 
+> a multiplicative factor of α > 1 at every node along the search path"
+
+**Recommendation**: Keep Vamana's RobustPrune as default. See `VAMANA_RNG_ANALYSIS.md`.
+
 ## Implementation Recommendations for CoreNN
 
-### Priority 1: Fix Neighbor Selection
+### Priority 1: Keep Vamana RobustPrune (Done ✓)
 
-Replace RNG pruning with HNSW heuristic:
-- Use strict `<` comparison (no threshold)
-- Early exit when finding closer neighbor
-- O(M × C) complexity
+The original α-RNG pruning is correct and has theoretical guarantees.
+Don't replace with HNSW heuristic.
 
-### Priority 2: Lazy Backedge Updates
+### Priority 2: lowerBound Early Stopping (Done ✓)
+
+This is safe to adopt from HNSW - it's just a search optimization.
+
+### Priority 3: Lazy Backedge Updates
 
 Only prune backedges when neighbor is truly full:
 ```rust
@@ -144,7 +163,7 @@ if neighbor.edges.len() < max_edges {
 }
 ```
 
-### Priority 3: Priority Queue Search with lowerBound
+### Priority 4: Priority Queue Search with lowerBound
 
 Replace sorted Vec with BinaryHeap:
 - Track `lower_bound` (worst result distance)
