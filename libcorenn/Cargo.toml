@@ -39,3 +39,8 @@ tracing = "0.1.41"
 [dev-dependencies]
 ndarray-rand = "0.14.0" # Version 0.15 depends on ndarray 0.16 which we cannot use (see above).
 tracing-subscriber = "0.3.18"
+criterion = "0.5"
+
+[[bench]]
+name = "distance"
+harness = false

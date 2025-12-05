@@ -1,15 +1,10 @@
-#![feature(avx512_target_feature)]
+// Note: avx512_target_feature, path_add_extension, stdarch_x86_avx512 are now stable
 #![feature(duration_millis_float)]
 #![feature(f16)]
-#![feature(path_add_extension)]
 #![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_f16))]
 #![cfg_attr(
   any(target_arch = "x86", target_arch = "x86_64"),
   feature(stdarch_x86_avx512_f16)
-)]
-#![cfg_attr(
-  any(target_arch = "x86", target_arch = "x86_64"),
-  feature(stdarch_x86_avx512)
 )]
 
 use ahash::HashSet;
@@ -27,6 +22,7 @@ use compaction::compact;
 use compressor::pq::ProductQuantizer;
 use compressor::trunc::TruncCompressor;
 use compressor::Compressor;
+use compressor::DistanceTable;
 use compressor::CV;
 use dashmap::DashMap;
 use dashmap::DashSet;
@@ -113,9 +109,14 @@ impl Point {
   }
 
   pub fn dist_query(&self, query: &VecData) -> f64 {
+    self.dist_query_with_table(query, None)
+  }
+  
+  /// Compute distance to query, using ADC table if available for faster computation.
+  pub fn dist_query_with_table(&self, query: &VecData, table: Option<&DistanceTable>) -> f64 {
     match &self.vec {
       PointVec::Uncompressed(v) => (self.metric)(v, query),
-      PointVec::Compressed(c, cv) => c.dist(self.metric_type, cv, &c.compress(query)),
+      PointVec::Compressed(c, cv) => c.dist_query(query, cv, self.metric_type, table),
     }
   }
 }
@@ -181,6 +182,16 @@ impl CoreNN {
     ids: &'a [Id],
     query: Option<&'a VecData>,
   ) -> impl Iterator<Item = Option<Point>> + 'a {
+    self.get_points_with_table(ids, query, None)
+  }
+  
+  /// Get points with optional ADC distance table for faster compressed distance computation.
+  fn get_points_with_table<'a>(
+    &'a self,
+    ids: &'a [Id],
+    query: Option<&'a VecData>,
+    dist_table: Option<&'a DistanceTable>,
+  ) -> impl Iterator<Item = Option<Point>> + 'a {
     // Hold lock across all reads. Getting some compressed nodes and others uncompressed breaks all code that uses this data.
     let vecs = match &*self.mode.read() {
       Mode::Uncompressed(node_cache) => node_cache
@@ -207,7 +218,7 @@ impl CoreNN {
         dist: OrderedFloat(f64::INFINITY),
       };
       if let Some(q) = query {
-        node.dist.0 = node.dist_query(q);
+        node.dist.0 = node.dist_query_with_table(q, dist_table);
       }
       Some(node)
     })
@@ -253,6 +264,15 @@ impl CoreNN {
       search_list_cap >= k,
       "search list capacity must be greater than or equal to k"
     );
+    
+    // Create ADC distance table for fast compressed distance computation.
+    // This is created once and reused for all distance computations in this search.
+    let dist_table: Option<DistanceTable> = match &*self.mode.read() {
+      Mode::Compressed(compressor, _) => compressor.create_distance_table(query, self.cfg.metric),
+      Mode::Uncompressed(_) => None,
+    };
+    let dist_table_ref = dist_table.as_ref();
+    
     // Our list of candidate nodes, always sorted by distance.
     // This is our result list, but also the candidate list for expansion.
     let mut search_list = Vec::<Point>::new();
@@ -263,7 +283,7 @@ impl CoreNN {
     let mut expanded = HashSet::new();
 
     // Start with the entry node.
-    let Some(entry) = self.get_point(0, Some(query)) else {
+    let Some(entry) = self.get_points_with_table(&[0], Some(query), dist_table_ref).next().flatten() else {
       // No entry node, empty DB.
       return Default::default();
     };
@@ -315,11 +335,9 @@ impl CoreNN {
         point.dist.0 = (self.metric)(&node.vector, query);
         to_add.push(point);
       }
-      // Get all neighbors at once.
-      for p in self.get_points(&neighbor_ids, Some(query)) {
-        if let Some(p) = p {
-          to_add.push(p);
-        }
+      // Get all neighbors at once, using ADC for fast distance computation.
+      for p in self.get_points_with_table(&neighbor_ids, Some(query), dist_table_ref).flatten() {
+        to_add.push(p);
       }
 
       // WARNING: If you want to optimize by batching inserts, be careful:

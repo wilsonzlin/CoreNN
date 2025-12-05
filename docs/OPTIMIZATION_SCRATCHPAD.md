@@ -13,13 +13,31 @@
 
 ## Session Log
 
-### Session 1: December 5, 2025 - Initial Analysis
+### Session 1: December 5, 2025 - Initial Analysis & Core Optimizations
 
 #### Completed
 - [x] Complete codebase exploration
 - [x] Created master reference document
 - [x] Identified key optimization opportunities
 - [x] Documented architecture and algorithms
+- [x] **IMPLEMENTED: ADC (Asymmetric Distance Computation) for PQ**
+  - Added `PQDistanceTable` struct for precomputed distances
+  - Added `create_distance_table()` method to ProductQuantizer
+  - Updated `Compressor` trait with ADC support
+  - Modified `search()` to create table once and reuse
+  - Expected speedup: 3-10x for PQ distance computations
+- [x] **IMPLEMENTED: RocksDB Optimizations**
+  - Increased block cache from 128MB to 512MB
+  - Added bloom filters for faster point lookups
+  - Added `optimize_for_point_lookup()` hint
+  - Increased parallelism settings
+  - Expected: 20-50% improvement for I/O-bound workloads
+- [x] **IMPLEMENTED: Code Cleanup**
+  - Removed deprecated feature flags (now stable in nightly)
+  - Reduced compile warnings
+- [x] **ADDED: Benchmark Infrastructure**
+  - Created criterion benchmarks for distance computations
+  - Benchmarks cover L2 and Cosine for various dimensions
 
 #### Key Findings
 
@@ -202,8 +220,13 @@ Prefetching and cache optimization matter more than pure SIMD speed.
 ## Useful Commands
 
 ```bash
-# Build release
+# Build release (with clang - required for this system)
+export CXXFLAGS="-I/usr/include/c++/13 -I/usr/include/x86_64-linux-gnu/c++/13"
+export RUSTFLAGS="-L/usr/lib/gcc/x86_64-linux-gnu/13"
 cargo build --release -p corenn
+
+# Or use this one-liner:
+CXXFLAGS="-I/usr/include/c++/13 -I/usr/include/x86_64-linux-gnu/c++/13" RUSTFLAGS="-L/usr/lib/gcc/x86_64-linux-gnu/13" cargo build --release
 
 # Run with profiling
 perf record -g ./target/release/corenn eval ...
@@ -246,13 +269,34 @@ rustc --print cfg | grep target_feature
 
 ---
 
-## Tomorrow's Plan
+## Next Steps
 
-1. [ ] Set up benchmarking with a real dataset
-2. [ ] Run baseline measurements
-3. [ ] Create flamegraph profile
-4. [ ] Implement first quick win (feature detection cache)
-5. [ ] Measure improvement
+1. [ ] Set up benchmarking with a real dataset (SIFT1M or similar)
+2. [ ] Run baseline measurements to quantify improvements
+3. [ ] Create flamegraph profile to identify remaining bottlenecks
+4. [ ] Consider adding scalar quantization (int8) as an alternative to PQ
+5. [ ] Implement two-phase search with reranking for better accuracy
+6. [ ] Investigate parallel beam expansion for multi-core scaling
+
+## Summary of Changes Made
+
+### Files Modified:
+- `libcorenn/src/lib.rs` - ADC integration in search path
+- `libcorenn/src/compressor/mod.rs` - Added ADC trait methods
+- `libcorenn/src/compressor/pq.rs` - Full ADC implementation
+- `libcorenn/src/store/rocksdb.rs` - RocksDB performance tuning
+- `libcorenn/Cargo.toml` - Added criterion benchmarks
+
+### Files Added:
+- `docs/PERFORMANCE_OPTIMIZATION_MASTER.md` - Master reference document
+- `docs/OPTIMIZATION_SCRATCHPAD.md` - This scratchpad
+- `libcorenn/benches/distance.rs` - Distance benchmarks
+- `libcorenn/tests/pq_adc_test.rs` - ADC correctness tests
+
+### Expected Performance Impact:
+- **ADC for PQ**: 3-10x faster distance computation in compressed mode
+- **RocksDB tuning**: 20-50% improvement for I/O-bound workloads
+- Combined effect depends on workload characteristics
 
 ---
 
