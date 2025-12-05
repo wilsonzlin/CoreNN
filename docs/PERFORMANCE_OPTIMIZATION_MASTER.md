@@ -125,45 +125,53 @@ pub struct State {
 
 ## 3. Current Algorithm Analysis
 
-### Search Algorithm (lib.rs:246-348)
-The search implements a **greedy beam search** on the Vamana graph:
+### Search Algorithm (lib.rs) - HNSW-Style Early Stopping
+The search implements a **greedy beam search** with HNSW-style optimizations:
 
 ```
 1. Start from entry node (id=0, clone of first inserted vector)
-2. Maintain search_list sorted by distance (max size: search_list_cap)
-3. Loop:
+2. Initialize lower_bound = entry.distance
+3. Maintain search_list sorted by distance (max size: search_list_cap)
+4. Loop:
    a. Pop beam_width unexpanded nodes from search_list
-   b. For each expanded node:
+   b. HNSW early stop: if best_unexpanded > lower_bound AND list is full: break
+   c. For each expanded node:
       - Fetch neighbors from DB (NODE) + pending edges (add_edges)
-      - Add unseen neighbors to search_list
+      - Add unseen neighbors to search_list (only if could improve results)
       - Re-rank expanded node with full vector distance
-   c. Truncate search_list to search_list_cap
-4. Return top-k from search_list
+   d. Truncate search_list to search_list_cap
+   e. Update lower_bound = worst result distance
+5. Return top-k from search_list
 ```
 
-**Current Inefficiencies**:
-1. **Sequential expansion**: Neighbors fetched one-by-one from `get_points()`
-2. **Binary search insertion**: O(n) for each candidate into search_list
-3. **No prefetching**: DB reads are synchronous
-4. **Full vector re-ranking**: Always computes full distance
+**Optimizations Applied**:
+1. ✅ HNSW-style `lower_bound` early stopping
+2. ✅ Only add candidates that could improve results (< lower_bound)
+3. ✅ ADC distance tables for compressed vectors
+4. Binary search insertion: O(n) for each candidate into search_list
 
-### Insert Algorithm (lib.rs:527-642)
+### Insert Algorithm (lib.rs)
 ```
 1. Search for candidates using update_search_list_cap
-2. Prune candidates to get neighbors (RNG rule with distance_threshold)
+2. Prune candidates using HNSW heuristic (O(M×C) complexity)
 3. Create node with neighbors
-4. Add backedges to neighbors (may trigger neighbor pruning)
+4. Add backedges to neighbors (lazy pruning when add_edges overflows)
 5. Write transaction to DB
 ```
 
-### Pruning Algorithm (lib.rs:220-244)
-Uses **Robust Nearest-Neighbor (RNG) graph** pruning:
+### Pruning Algorithm (lib.rs) - HNSW Heuristic
+Uses **HNSW-style neighbor selection** (O(M×C) complexity):
 ```
-For each candidate c sorted by distance to node:
-  If d(node, c) ≤ α * d(c, closest_already_selected):
-    Add c to neighbors
+For each candidate c sorted by distance to node (closest first):
+  If no selected neighbor is closer to c than c is to node:
+    Add c to selected neighbors
+  (Early exit when found a closer neighbor)
 ```
-This creates a sparse, navigable graph.
+This is the exact algorithm from hnswlib's `getNeighborsByHeuristic2`.
+
+**Key difference from original Vamana RNG**:
+- HNSW: O(M×C) - compare to selected neighbors only, early exit
+- Vamana RNG: O(C²) - compare to all candidates with threshold
 
 ---
 
@@ -433,20 +441,28 @@ This creates a sparse, navigable graph.
 4. [ ] Optimize search_list data structure (H) - DEFERRED
    - Current binary search approach is cache-friendly
 
-### Phase 3: Search Algorithm (Days 8-14) - IN PROGRESS
-1. [ ] Implement two-phase search (A) - PARTIAL
-   - Added rerank_factor config option
-2. [ ] Add reranking path - PENDING
-3. [ ] Parallel beam expansion - PENDING
-4. [x] Early termination heuristics - COMPLETED ✓
-   - Added convergence detection (3 stale iterations)
-   - Monitors k-th best distance improvement
+### Phase 3: HNSW Algorithm Integration (Days 8-14) - COMPLETED ✓
+1. [x] HNSW-style neighbor selection - COMPLETED ✓
+   - Replaced O(C²) Vamana RNG with O(M×C) HNSW heuristic
+   - Exact algorithm from hnswlib's `getNeighborsByHeuristic2`
+   - Strict `<` comparison with early exit
+2. [x] HNSW-style early stopping - COMPLETED ✓
+   - Added `lower_bound` tracking (worst result distance)
+   - Stop when best unexplored > lower_bound AND list is full
+   - Replaced "stale iterations" heuristic
+3. [x] Only add improving candidates - COMPLETED ✓
+   - Skip candidates that can't improve results (dist >= lower_bound)
+4. [ ] Implement two-phase search (A) - PARTIAL
+   - Added rerank_factor config option, path not yet implemented
+5. [ ] Parallel beam expansion - PENDING
+6. [ ] Visited list pool - PENDING (avoid allocation per search)
 
 ### Phase 4: Advanced Optimizations (Days 15+) - PENDING
 1. [ ] Memory-mapped mode (K)
 2. [ ] Custom serialization (M)
 3. [ ] Graph layout optimization
 4. [ ] HNSW-style multi-layer (optional)
+5. [ ] Lazy backedge updates (HNSW-style)
 
 ### Performance Benchmarks (Current)
 
@@ -462,8 +478,27 @@ This creates a sparse, navigable graph.
 | Method | Time |
 |--------|------|
 | ADC    | 24.5 ns |
-| Symmetric | 553.5 ns |
-| Speedup | **22.6x** |
+| Symmetric | 520.6 ns |
+| Speedup | **21.2x** |
+
+#### SQ ADC (768d)
+| Method | Time |
+|--------|------|
+| SQ ADC | 50.6 ns |
+| Dequantize+Compute | 676.7 ns |
+| Raw f32 L2 | 28.2 ns |
+| Speedup vs dequantize | **13.4x** |
+
+#### Query Throughput (in-memory, no compression)
+| Dataset | k | Latency | Throughput |
+|---------|---|---------|------------|
+| 128d, 100 vecs | 10 | 31.7 µs | 31.5K QPS |
+| 128d, 1K vecs | 10 | 119.0 µs | 8.4K QPS |
+| 128d, 10K vecs | 10 | 1.54 ms | 650 QPS |
+| 768d, 5K vecs | 1 | 1.84 ms | 543 QPS |
+| 768d, 5K vecs | 10 | 1.86 ms | 537 QPS |
+| 768d, 5K vecs | 50 | 1.89 ms | 529 QPS |
+| 768d, 5K vecs | 100 | 1.92 ms | 520 QPS |
 
 ---
 

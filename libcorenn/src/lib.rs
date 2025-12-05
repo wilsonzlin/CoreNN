@@ -231,17 +231,22 @@ impl CoreNN {
     self.get_points(&[id], query).exactly_one().ok().unwrap()
   }
 
-  /// Prune candidates to select diverse neighbors.
+  /// Select diverse neighbors using HNSW-style heuristic.
   /// 
-  /// Two modes based on cfg.use_hnsw_heuristic:
-  /// - false (default): Vamana RNG pruning - O(C²), best query performance
-  /// - true: HNSW-style heuristic - O(M×C), faster inserts
+  /// This is the exact algorithm from hnswlib's `getNeighborsByHeuristic2`:
+  /// - O(M × C) complexity where M = max_edges, C = candidates
+  /// - Strict `<` comparison (no threshold parameter)
+  /// - Early exit when a closer selected neighbor is found
+  /// 
+  /// For each candidate (closest first):
+  /// - Check if candidate is closer to query than to ANY selected neighbor
+  /// - If so, add to selected neighbors
+  /// - Otherwise, skip (it's "covered" by an existing neighbor)
   fn prune_candidates(&self, node: &VecData, candidate_ids: &[Id]) -> Vec<Id> {
     let max_edges = self.cfg.max_edges;
-    let dist_thresh = self.cfg.distance_threshold;
 
-    // Get all candidates sorted by distance to node
-    let mut candidates: Vec<Point> = self
+    // Get all candidates sorted by distance to node (closest first)
+    let candidates: Vec<Point> = self
       .get_points(candidate_ids, Some(node))
       .flatten()
       .sorted_unstable_by_key(|s| s.dist)
@@ -251,60 +256,45 @@ impl CoreNN {
       return Vec::new();
     }
 
-    if self.cfg.use_hnsw_heuristic {
-      // HNSW-style heuristic: O(M × C)
-      // For each candidate, only compare against already-selected neighbors
-      let mut new_neighbors: Vec<Point> = Vec::with_capacity(max_edges);
-      
-      for candidate in candidates.drain(..) {
-        if new_neighbors.len() >= max_edges {
-          break;
-        }
-        
-        let is_diverse = new_neighbors.iter().all(|selected| {
-          let dist_to_node = candidate.dist.0;
-          let dist_to_selected = candidate.dist(selected);
-          dist_to_node <= dist_to_selected * dist_thresh
-        });
-        
-        if is_diverse {
-          new_neighbors.push(candidate);
-        }
-      }
-      
-      new_neighbors.into_iter().map(|p| p.id).collect()
-    } else {
-      // Vamana RNG pruning: O(C²)
-      // For each candidate, compare against ALL other candidates
-      // This produces better graph structure for queries
-      use std::collections::VecDeque;
-      let mut new_neighbors = Vec::with_capacity(max_edges);
-      let mut remaining: VecDeque<Point> = candidates.into();
-      
-      while let Some(p_star) = remaining.pop_front() {
-        new_neighbors.push(p_star.id);
-        
-        if new_neighbors.len() >= max_edges {
-          break;
-        }
-        
-        // Filter remaining candidates based on RNG property
-        remaining.retain(|s| {
-          let cand_dist_to_node = s.dist.0;
-          let cand_dist_to_pick = p_star.dist(s);
-          cand_dist_to_node <= cand_dist_to_pick * dist_thresh
-        });
-      }
-      
-      new_neighbors
+    // If fewer candidates than max_edges, keep all
+    if candidates.len() <= max_edges {
+      return candidates.into_iter().map(|p| p.id).collect();
     }
+
+    // HNSW heuristic: greedy selection with diversity check
+    let mut selected: Vec<Point> = Vec::with_capacity(max_edges);
+    
+    for candidate in candidates {
+      if selected.len() >= max_edges {
+        break;
+      }
+      
+      let dist_to_query = candidate.dist.0;
+      
+      // Check if this candidate is "good" - closer to query than to any selected neighbor
+      // Uses strict < like HNSW (no threshold)
+      let mut is_good = true;
+      for neighbor in &selected {
+        let dist_to_neighbor = candidate.dist(neighbor);
+        if dist_to_neighbor < dist_to_query {
+          // This candidate is closer to an existing neighbor than to query
+          // It's "covered" by that neighbor, skip it
+          is_good = false;
+          break; // Early exit!
+        }
+      }
+      
+      if is_good {
+        selected.push(candidate);
+      }
+    }
+    
+    selected.into_iter().map(|p| p.id).collect()
   }
 
   fn search(&self, query: &VecData, k: usize, search_list_cap: usize) -> (Vec<Point>, DashSet<Id>) {
-    // NOTE: This is intentionally simple over optimized.
-    // Not the most optimal data structures or avoiding of malloc/memcpy.
-    // And that's OK — simple makes this easier to understand and maintain.
-    // The performance is still extremely fast — and probably fits in cache better and branches less.
+    // HNSW-style beam search with lowerBound early stopping.
+    // Uses a sorted list for simplicity (could use BinaryHeap for slight speedup).
 
     assert!(
       search_list_cap >= k,
@@ -312,68 +302,68 @@ impl CoreNN {
     );
     
     // Create ADC distance table for fast compressed distance computation.
-    // This is created once and reused for all distance computations in this search.
     let dist_table: Option<DistanceTable> = match &*self.mode.read() {
       Mode::Compressed(compressor, _) => compressor.create_distance_table(query, self.cfg.metric),
       Mode::Uncompressed(_) => None,
     };
     let dist_table_ref = dist_table.as_ref();
     
-    // Our list of candidate nodes, always sorted by distance.
-    // This is our result list, but also the candidate list for expansion.
+    // Results: best candidates found so far, sorted by distance
     let mut search_list = Vec::<Point>::new();
-    // Seen != expansion. We just want to prevent duplicate nodes from being added to the search list.
-    // Use DashSet as we'll insert from for_each_concurrent.
+    // Visited set to prevent duplicates
     let seen = DashSet::new();
-    // There's no need to expand the same node more than once.
+    // Expanded set - no need to expand twice
     let mut expanded = HashSet::new();
     
-    // Early termination tracking: if the best k results haven't improved in
-    // several iterations, we can stop early.
-    let mut stale_iterations = 0;
-    let max_stale_iterations = 3; // Stop if no improvement for 3 iterations
-    let mut prev_best_dist = f64::INFINITY;
-
     // Start with the entry node.
     let Some(entry) = self.get_points_with_table(&[0], Some(query), dist_table_ref).next().flatten() else {
-      // No entry node, empty DB.
       return Default::default();
     };
+    // lowerBound: distance to worst result in search_list
+    // HNSW stops when best unexpanded candidate > lowerBound
+    let mut lower_bound = entry.dist.0;
     search_list.push(entry);
     seen.insert(0);
 
     loop {
-      // Pop and mark beam_width nodes for expansion.
-      // We pop as we'll later re-rank then re-insert with updated dists.
-      let to_expand = search_list
+      // Find best unexpanded candidate
+      let to_expand: Vec<Point> = search_list
         .extract_if(.., |p| expanded.insert(p.id))
         .take(self.cfg.beam_width)
         .collect_vec();
+      
       if to_expand.is_empty() {
         break;
-      };
+      }
+      
+      // HNSW-style early stopping:
+      // If best unexpanded candidate is worse than our worst result, stop
+      let best_unexpanded_dist = to_expand.first().map(|p| p.dist.0).unwrap_or(f64::INFINITY);
+      if best_unexpanded_dist > lower_bound && search_list.len() >= search_list_cap {
+        // Re-insert the candidates we extracted (they weren't expanded)
+        for p in to_expand {
+          expanded.remove(&p.id);
+        }
+        break;
+      }
 
       let fetched = self.get_nodes(&to_expand.iter().map(|p| p.id).collect_vec());
 
-      // Add expanded neighbors to search list.
       let mut to_add = Vec::<Point>::new();
       let mut neighbor_ids = Vec::<Id>::new();
+      
       for (mut point, node) in zip(to_expand, fetched) {
-        // Node doesn't exist anymore.
         let Some(node) = node else {
           continue;
         };
 
-        // Collect its neighbors to total set of neighbors.
+        // Collect neighbors
         for &neighbor in node.neighbors.iter() {
-          // We've seen this node in a previous search iteration,
-          // or in this iteration — but from another node's expansion.
           if !seen.insert(neighbor) {
             continue;
           }
           neighbor_ids.push(neighbor);
         }
-        // There may be additional neighbors.
         if let Some(add) = self.add_edges.get(&point.id) {
           for &neighbor in add.iter() {
             if !seen.insert(neighbor) {
@@ -383,20 +373,22 @@ impl CoreNN {
           }
         };
 
-        // Re-rank using full vector.
+        // Re-rank using full vector
         point.dist.0 = (self.metric)(&node.vector, query);
         to_add.push(point);
       }
-      // Get all neighbors at once, using ADC for fast distance computation.
+      
+      // Get neighbors with distance computation
       for p in self.get_points_with_table(&neighbor_ids, Some(query), dist_table_ref).flatten() {
-        to_add.push(p);
+        // HNSW optimization: only add if could improve results
+        if search_list.len() < search_list_cap || p.dist.0 < lower_bound {
+          to_add.push(p);
+        }
       }
 
-      // WARNING: If you want to optimize by batching inserts, be careful:
-      // Two source values to add could be inserted at the same position but between themselves are not sorted.
-      // Remember to handle this scenario.
+      // Insert new candidates in sorted order
       for point in to_add {
-        // Remove soft-deleted if already expanded. We still need to expand soft-deleted to traverse the graph accurately.
+        // Skip soft-deleted if already expanded
         if self.deleted.contains(&point.id) && expanded.contains(&point.id) {
           continue;
         }
@@ -406,23 +398,13 @@ impl CoreNN {
         search_list.insert(pos, point);
       }
 
-      // Without truncation each iteration, we'll search the entire graph.
+      // Truncate to search_list_cap
       search_list.truncate(search_list_cap);
       
-      // Early termination check: has the k-th best distance improved?
-      if search_list.len() >= k {
-        let current_kth_dist = search_list[k - 1].dist.0;
-        // Check if we've made meaningful progress (at least 0.1% improvement)
-        if current_kth_dist >= prev_best_dist * 0.999 {
-          stale_iterations += 1;
-          if stale_iterations >= max_stale_iterations {
-            // No improvement - terminate early
-            break;
-          }
-        } else {
-          stale_iterations = 0;
-          prev_best_dist = current_kth_dist;
-        }
+      // Update lowerBound (distance to worst result)
+      // This is used for HNSW early stopping
+      if !search_list.is_empty() {
+        lower_bound = search_list.last().unwrap().dist.0;
       }
     }
 

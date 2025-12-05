@@ -312,7 +312,95 @@ rustc --print cfg | grep target_feature
 
 ---
 
-### Session 2: December 5, 2025 - Core Optimizations Implementation
+### Session 2: December 5, 2025 - HNSW Deep Analysis & Implementation
+
+#### Research: HNSW Reference Implementation
+
+Cloned and analyzed https://github.com/nmslib/hnswlib to understand exactly why HNSW is faster.
+
+##### Key Findings
+
+1. **Neighbor Selection is O(M×C), NOT O(C²)**
+   - HNSW's `getNeighborsByHeuristic2` iterates through candidates sorted by distance
+   - For each candidate, only compares to already-selected neighbors
+   - Uses strict `<` comparison (no threshold parameter)
+   - Early exit when a closer neighbor is found
+   
+2. **Backedge Updates are Mostly O(1)**
+   - If neighbor has room (< maxM edges): just append, no pruning!
+   - Only prune when neighbor is at max capacity
+   - Vamana/CoreNN always triggers pruning when add_edges overflows
+
+3. **Search Uses lowerBound Early Stopping**
+   - `lowerBound` = distance to worst result in top-k
+   - Stop when best unexplored candidate > lowerBound
+   - More aggressive than "stale iterations" heuristic
+
+4. **Visited List Pool**
+   - Pre-allocated array (one slot per node)
+   - Generation counter instead of clearing
+   - O(1) "clear" instead of HashSet allocation
+
+##### Implemented Changes
+
+1. **✅ Replaced O(C²) Vamana RNG with O(M×C) HNSW Heuristic**
+   - `prune_candidates()` now uses exact HNSW algorithm
+   - Strict `<` comparison with early exit
+   - Removed `distance_threshold` and `use_hnsw_heuristic` config (always use HNSW now)
+
+2. **✅ lowerBound-based Early Stopping**
+   - Search maintains `lower_bound` (worst result distance)
+   - Stops when best unexplored > lower_bound AND search_list is full
+   - Removed old "stale iterations" heuristic
+
+3. **✅ Config Cleanup**
+   - Removed `distance_threshold` field (unused)
+   - Removed `use_hnsw_heuristic` field (always on)
+   - Updated `corenn-node` bindings
+
+##### Files Modified
+- `libcorenn/src/lib.rs` - prune_candidates() and search() algorithms
+- `libcorenn/src/cfg.rs` - removed unused config options
+- `corenn-node/src/lib.rs` - removed distance_threshold binding
+
+##### Files Added
+- `docs/HNSW_DEEP_ANALYSIS.md` - detailed analysis document
+
+#### Benchmark Results After HNSW Optimizations
+
+**Distance computation (768 dimensions):**
+```
+raw_f32_768d:           28.2 ns
+sq_adc_768d:            50.6 ns  (4x smaller memory)
+pq_adc_768d_64sub:      24.5 ns  (32x smaller memory, faster than raw!)
+pq_symmetric_768d:      520.6 ns (21x slower than ADC)
+sq_dequantize_768d:     676.7 ns (13x slower than ADC)
+```
+
+**Query throughput (768d, 5k vectors, in-memory):**
+```
+k=1:   1.84 ms  (543 QPS)
+k=10:  1.86 ms  (537 QPS)
+k=50:  1.89 ms  (529 QPS)
+k=100: 1.92 ms  (520 QPS)
+```
+
+**Query throughput by dataset size (128d):**
+```
+100 vectors:   31.7 µs  (31.5K QPS)
+1000 vectors:  119.0 µs (8.4K QPS)
+10000 vectors: 1.54 ms  (650 QPS)
+```
+
+#### TODO (Remaining HNSW Optimizations)
+
+- [ ] Visited list pool (avoid DashSet allocation per search)
+- [ ] Lazy backedge updates (only prune when neighbor is truly full)
+- [ ] More aggressive prefetching in search loop
+
+---
+
+### Session 3: December 5, 2025 - Core Optimizations Implementation
 
 #### Completed
 

@@ -24,7 +24,6 @@ pub struct Cfg {
   pub compression_mode: CompressionMode,
   pub compression_threshold: usize,
   pub dim: usize,
-  pub distance_threshold: f64,
   pub max_add_edges: usize,
   pub max_edges: usize,
   pub metric: StdMetric,
@@ -37,10 +36,6 @@ pub struct Cfg {
   pub rerank_factor: f32,
   pub trunc_dims: usize,
   pub update_search_list_cap: usize,
-  /// Use faster HNSW-style neighbor selection (O(M×C)) instead of Vamana RNG (O(C²)).
-  /// Faster inserts but potentially 10-20% slower queries.
-  /// Default: false (use original Vamana RNG for best query performance).
-  pub use_hnsw_heuristic: bool,
 }
 
 impl Default for Cfg {
@@ -52,7 +47,6 @@ impl Default for Cfg {
       compaction_threshold_deletes: 1_000_000,
       compression_mode: CompressionMode::PQ,
       compression_threshold: 10_000_000,
-      distance_threshold: 1.1,
       // Lazy pruning: allow 2x edges before triggering pruning.
       // This amortizes the cost of expensive pruning operations.
       max_add_edges: max_edges * 2,
@@ -66,7 +60,6 @@ impl Default for Cfg {
       dim: 0,
       pq_subspaces: 64,
       trunc_dims: 64,
-      use_hnsw_heuristic: false, // Default to Vamana RNG for best query performance
     }
   }
 }
