@@ -24,7 +24,7 @@ datasets/
 Outputs from benchmark runs go to `docs/benchmarks/YYYY-MM-DD/` (see `performance_master_plan.md`).
 
 ## 3. Tooling Requirements
-- Python ≥ 3.10 with `numpy`, `torch` (CUDA/ROCm builds), `cupy`, `cuml`, `msgpack`, `tqdm`.
+- Python ≥ 3.10 with `numpy`, `h5py`, `torch` (CUDA/ROCm builds), `cupy`, `cuml`, `msgpack`, `tqdm`.
 - Sufficient GPU memory (>= 12 GB recommended for Deep1B ground-truth batches; lower VRAM works with smaller `--batch-size`).
 - System packages: `wget`, `curl`, `aria2c`, `pigz`, `tar`.
 - Rust toolchain (nightly per `rust-toolchain.toml`).
@@ -40,12 +40,14 @@ pip install cupy-cuda12x cuml-cuda12x msgpack tqdm
 Adjust CUDA/ROCm wheels per GPU vendor.
 
 ## 4. SIFT1M Pipeline (Reference-Scale)
-Fast path (one command, idempotent):
+Fast path (HTTP mirror via ANN-Benchmarks HDF5; downloads ~500 MB):
 ```bash
 scripts/datasets/sift1m.sh all
 ```
-Manual breakdown (mirrors what the script does):
-1. **Download TEXMEX fvecs/ivecs**
+Set `SIFT_DOWNLOAD_MODE=ftp` to force the legacy TEXMEX mirror (may fail behind strict firewalls). Manual breakdown (matches the script):
+1. **Download source data**
+   - Default: HDF5 mirror (recommended). The script pulls `http://ann-benchmarks.com/sift-128-euclidean.hdf5` and converts it using `h5py`.
+   - Legacy manual option (FTP):
    ```bash
    mkdir -p datasets/sift1m/raw
    cd datasets/sift1m/raw
@@ -56,6 +58,8 @@ Manual breakdown (mirrors what the script does):
    ```
 
 2. **Convert to packed matrices (float32 rows)**
+   - Fast path: `scripts/datasets/sift1m.sh convert` handles both HDF5 and FTP layouts, chunking to keep RAM usage down (~50k rows at a time).
+   - Manual TEXMEX conversion:
    ```bash
    cd /workspace
    python tools/convert_texmex.py datasets/sift1m/raw/sift_base.fvecs --dtype float32 --out datasets/sift1m/processed/base.f32
@@ -97,7 +101,7 @@ PY
    ```
 
 5. **Manifest metadata**
-   Create `datasets/sift1m/manifests/base.json` describing SHA256, dim, dtype, source URL, creation command. Use this to prove reproducibility.
+   Run `scripts/datasets/sift1m.sh manifests` to emit JSON entries with SHA256 + counts. For manual runs, create `datasets/sift1m/manifests/base.json` detailing SHA256, dim, dtype, source URL, and creation command.
 
 6. **Baseline evaluation**
    ```bash
