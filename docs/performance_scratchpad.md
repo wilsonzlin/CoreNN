@@ -7,12 +7,18 @@
 | --- | --- | --- |
 | 2025-12-05T00:00 | Session start | Set up comprehensive plan + scratchpad.
 | 2025-12-05T00:45 | Repo audit | No historical benchmark data or metrics in tree.
+| 2025-12-05T01:15 | Dataset pipeline | Authored `docs/dataset_pipeline.md` for SIFT1M & Deep1B.
+| 2025-12-05T01:35 | Automation | Added `scripts/datasets/sift1m.sh` downloader + converter.
+| 2025-12-05T02:05 | Automation | Added `scripts/datasets/deep1b.sh` downloader + converter.
+| 2025-12-05T02:20 | Data fetch | `sift1m.sh download` failed (FTP PASV timeout / missing file).
 
 ## Immediate Next Actions
 - [x] Catalog existing benchmarks / gather any historical numbers. *(None checked in.)*
-- [ ] Stand up reproducible dataset pipeline (SIFT1M + Deep1B) using `tools/` scripts.
+- [x] Stand up reproducible dataset pipeline (SIFT1M + Deep1B) using `tools/` scripts. *(Documented steps; automation pending.)*
 - [ ] Run baseline `corenn cmd eval` to capture recall + latency.
 - [ ] Profile query hot path with `cargo flamegraph -p corenn --bin corenn -- eval ...`.
+- [x] Script Deep1B dataset automation.
+- [ ] Identify reliable SIFT1M mirrors (FTP unreliable).
 
 ## Notes / Hypotheses
 - Search path currently single-layer; likely to benefit from multiple entry points or coarse quantizers.
