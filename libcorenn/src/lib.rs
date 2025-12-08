@@ -113,7 +113,7 @@ impl Point {
   pub fn dist_query(&self, query: &VecData) -> f64 {
     self.dist_query_with_table(query, None)
   }
-  
+
   /// Compute distance to query, using ADC table if available for faster computation.
   pub fn dist_query_with_table(&self, query: &VecData, table: Option<&DistanceTable>) -> f64 {
     match &self.vec {
@@ -186,7 +186,7 @@ impl CoreNN {
   ) -> impl Iterator<Item = Option<Point>> + 'a {
     self.get_points_with_table(ids, query, None)
   }
-  
+
   /// Get points with optional ADC distance table for faster compressed distance computation.
   fn get_points_with_table<'a>(
     &'a self,
@@ -232,9 +232,9 @@ impl CoreNN {
   }
 
   /// Select diverse neighbors using Vamana's RobustPrune algorithm.
-  /// 
+  ///
   /// This is Algorithm 2 from the DiskANN paper (Subramanya et al., NeurIPS 2019):
-  /// 
+  ///
   /// ```text
   /// RobustPrune(p, V, α, R):
   ///   V ← (V ∪ Nout(p)) \ {p}
@@ -247,12 +247,12 @@ impl CoreNN {
   ///       if α · d(p*, p') ≤ d(p, p') then  // α-RNG condition
   ///         remove p' from V               // Prune covered points
   /// ```
-  /// 
+  ///
   /// The α parameter (distance_threshold) is CRUCIAL:
   /// - α = 1: Standard RNG, may have large diameter
   /// - α > 1 (e.g., 1.2): Guarantees O(log n) diameter for disk-based search
   ///   because each step makes multiplicative progress toward query
-  /// 
+  ///
   /// Complexity: O(R × |V|) where R = max_edges, |V| = candidates
   fn prune_candidates(&self, node: &VecData, candidate_ids: &[Id]) -> Vec<Id> {
     let max_edges = self.cfg.max_edges;
@@ -278,15 +278,15 @@ impl CoreNN {
     use std::collections::VecDeque;
     let mut selected: Vec<Id> = Vec::with_capacity(max_edges);
     let mut remaining: VecDeque<Point> = candidates.into();
-    
+
     while let Some(p_star) = remaining.pop_front() {
       // p* is the closest remaining candidate to node
       selected.push(p_star.id);
-      
+
       if selected.len() >= max_edges {
         break;
       }
-      
+
       // Remove candidates that are "covered" by p* using α-RNG condition:
       // Remove p' if α · d(p*, p') ≤ d(node, p')
       // Keep p' if α · d(p*, p') > d(node, p')
@@ -298,7 +298,7 @@ impl CoreNN {
         dist_node_to_candidate < alpha * dist_selected_to_candidate
       });
     }
-    
+
     selected
   }
 
@@ -310,23 +310,27 @@ impl CoreNN {
       search_list_cap >= k,
       "search list capacity must be greater than or equal to k"
     );
-    
+
     // Create ADC distance table for fast compressed distance computation.
     let dist_table: Option<DistanceTable> = match &*self.mode.read() {
       Mode::Compressed(compressor, _) => compressor.create_distance_table(query, self.cfg.metric),
       Mode::Uncompressed(_) => None,
     };
     let dist_table_ref = dist_table.as_ref();
-    
+
     // Results: best candidates found so far, sorted by distance
     let mut search_list = Vec::<Point>::new();
     // Visited set to prevent duplicates
     let seen = DashSet::new();
     // Expanded set - no need to expand twice
     let mut expanded = HashSet::new();
-    
+
     // Start with the entry node.
-    let Some(entry) = self.get_points_with_table(&[0], Some(query), dist_table_ref).next().flatten() else {
+    let Some(entry) = self
+      .get_points_with_table(&[0], Some(query), dist_table_ref)
+      .next()
+      .flatten()
+    else {
       return Default::default();
     };
     // lowerBound: distance to worst result in search_list
@@ -341,11 +345,11 @@ impl CoreNN {
         .extract_if(.., |p| expanded.insert(p.id))
         .take(self.cfg.beam_width)
         .collect_vec();
-      
+
       if to_expand.is_empty() {
         break;
       }
-      
+
       // HNSW-style early stopping:
       // If best unexpanded candidate is worse than our worst result, stop
       let best_unexpanded_dist = to_expand.first().map(|p| p.dist.0).unwrap_or(f64::INFINITY);
@@ -361,7 +365,7 @@ impl CoreNN {
 
       let mut to_add = Vec::<Point>::new();
       let mut neighbor_ids = Vec::<Id>::new();
-      
+
       for (mut point, node) in zip(to_expand, fetched) {
         let Some(node) = node else {
           continue;
@@ -387,9 +391,12 @@ impl CoreNN {
         point.dist.0 = (self.metric)(&node.vector, query);
         to_add.push(point);
       }
-      
+
       // Get neighbors with distance computation
-      for p in self.get_points_with_table(&neighbor_ids, Some(query), dist_table_ref).flatten() {
+      for p in self
+        .get_points_with_table(&neighbor_ids, Some(query), dist_table_ref)
+        .flatten()
+      {
         // HNSW optimization: only add if could improve results
         if search_list.len() < search_list_cap || p.dist.0 < lower_bound {
           to_add.push(p);
@@ -410,7 +417,7 @@ impl CoreNN {
 
       // Truncate to search_list_cap
       search_list.truncate(search_list_cap);
-      
+
       // Update lowerBound (distance to worst result)
       // This is used for HNSW early stopping
       if !search_list.is_empty() {
@@ -620,7 +627,7 @@ impl CoreNN {
     let vec = VecData::from(nan_to_num(vec));
     self.insert_vec(key, vec)
   }
-  
+
   /// Batch insert multiple vectors efficiently.
   /// This amortizes the overhead of graph updates across multiple inserts.
   /// Note: Order of insertion may affect graph structure.
@@ -630,18 +637,18 @@ impl CoreNN {
     VecData: From<Vec<D>>,
   {
     use rayon::prelude::*;
-    
+
     // Convert all vectors first (can be done in parallel)
     let items: Vec<(String, VecData)> = items
       .par_iter()
       .map(|(k, v)| (k.clone(), VecData::from(nan_to_num(v))))
       .collect();
-    
+
     // Insert sequentially but with batched DB writes
     for (key, vec) in items {
       self.insert_vec(&key, vec);
     }
-    
+
     // Trigger compression check once at the end
     self.maybe_enable_compression();
   }

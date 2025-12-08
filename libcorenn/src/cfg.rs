@@ -59,7 +59,7 @@ impl Default for Cfg {
       // This amortizes the cost of expensive pruning operations.
       max_add_edges: max_edges * 2,
       max_edges,
-      metric: StdMetric::L2, // L2 is the safe bet.
+      metric: StdMetric::L2,  // L2 is the safe bet.
       pq_sample_size: 10_000, // Default: plenty, while fast to train.
       query_search_list_cap,
       rerank_factor: 1.0, // No reranking by default. Set to 2.0-4.0 for better recall with compression.

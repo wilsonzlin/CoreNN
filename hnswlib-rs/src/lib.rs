@@ -340,12 +340,7 @@ impl<'a> HnswIndex<'a> {
     top_candidates
   }
 
-  pub fn search_knn(
-    &self,
-    query: &[f32],
-    k: usize,
-    metric: Metric,
-  ) -> Vec<(LabelType, f64)> {
+  pub fn search_knn(&self, query: &[f32], k: usize, metric: Metric) -> Vec<(LabelType, f64)> {
     let mut curr_obj = self.enter_point_node;
     let mut cur_dist = metric(query, &self.get_data_by_internal_id(curr_obj));
 

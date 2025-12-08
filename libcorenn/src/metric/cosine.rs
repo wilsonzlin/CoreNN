@@ -160,7 +160,7 @@ unsafe fn dist_cosine_f32_avx512(a: &[f32], b: &[f32]) -> f64 {
   let mut b_norm1 = _mm512_setzero_ps();
 
   let mut i = 0;
-  
+
   // 2x unrolled loop (32 elements per iteration)
   let limit_unrolled = len - (len % 32);
   while i < limit_unrolled {
