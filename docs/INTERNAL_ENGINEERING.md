@@ -100,7 +100,6 @@ SQ_MODEL: () → ScalarQuantizer    Scalar Quantization model
 | `compression_threshold` | 10M | Enable compression after N vectors |
 | `pq_subspaces` | 64 | PQ subspace count |
 | `pq_sample_size` | 10K | PQ training sample size |
-| `rerank_factor` | 1.0 | Two-phase search multiplier (>1 enables reranking) |
 | `trunc_dims` | 64 | Truncation dimensions (Matryoshka) |
 
 ## Algorithms
@@ -349,9 +348,6 @@ let db = CoreNN::create("/path/to/db", Cfg { dim: 768, ..Default::default() });
 db.insert("key", &vec);
 let results = db.query(&query, 100);  // Vec<(String, f64)>
 
-// Batch insert
-db.insert_batch(&[("k1", v1), ("k2", v2)]);
-
 // Open existing
 let db = CoreNN::open("/path/to/db");
 ```
@@ -412,6 +408,5 @@ DashSet per search. TODO: visited list pool with generation counter for high QPS
 3. Memory-mapped mode for read-only workloads
 4. Custom serialization (zero-copy for vectors)
 5. Graph layout optimization (BFS ordering for cache locality)
-6. Two-phase search implementation (use rerank_factor)
-7. Parallel beam expansion
-8. Optional HNSW-style multi-layer mode
+6. Parallel beam expansion
+7. Optional HNSW-style multi-layer mode

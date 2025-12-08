@@ -36,10 +36,6 @@ pub struct Cfg {
   pub pq_sample_size: usize,
   pub pq_subspaces: usize,
   pub query_search_list_cap: usize,
-  /// Rerank factor for two-phase search. When > 1.0, retrieves k * rerank_factor
-  /// candidates using compressed distances, then reranks with exact distances.
-  /// 1.0 = no reranking (default), 2.0 = retrieve 2x candidates for reranking.
-  pub rerank_factor: f32,
   pub trunc_dims: usize,
   pub update_search_list_cap: usize,
 }
@@ -62,7 +58,6 @@ impl Default for Cfg {
       metric: StdMetric::L2,  // L2 is the safe bet.
       pq_sample_size: 10_000, // Default: plenty, while fast to train.
       query_search_list_cap,
-      rerank_factor: 1.0, // No reranking by default. Set to 2.0-4.0 for better recall with compression.
       update_search_list_cap: query_search_list_cap,
       // These defaults are completely arbitrary, they should be set manually.
       dim: 0,

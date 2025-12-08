@@ -164,9 +164,11 @@ unsafe fn dist_cosine_f32_avx512(a: &[f32], b: &[f32]) -> f64 {
   // 2x unrolled loop (32 elements per iteration)
   let limit_unrolled = len - (len % 32);
   while i < limit_unrolled {
-    // Prefetch next cache lines
-    _mm_prefetch(ptr_a.add(i + 64) as *const i8, _MM_HINT_T0);
-    _mm_prefetch(ptr_b.add(i + 64) as *const i8, _MM_HINT_T0);
+    // Prefetch next cache lines (stay within allocation)
+    if i + 64 <= len {
+      _mm_prefetch(ptr_a.add(i + 64) as *const i8, _MM_HINT_T0);
+      _mm_prefetch(ptr_b.add(i + 64) as *const i8, _MM_HINT_T0);
+    }
 
     let a0 = _mm512_loadu_ps(ptr_a.add(i));
     let b0 = _mm512_loadu_ps(ptr_b.add(i));

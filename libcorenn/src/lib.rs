@@ -357,6 +357,10 @@ impl CoreNN {
         // Re-insert the candidates we extracted (they weren't expanded)
         for p in to_expand {
           expanded.remove(&p.id);
+          let pos = search_list
+            .binary_search_by_key(&p.dist, |s| s.dist)
+            .map_or_else(identity, identity);
+          search_list.insert(pos, p);
         }
         break;
       }
@@ -626,31 +630,6 @@ impl CoreNN {
     // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
     let vec = VecData::from(nan_to_num(vec));
     self.insert_vec(key, vec)
-  }
-
-  /// Batch insert multiple vectors efficiently.
-  /// This amortizes the overhead of graph updates across multiple inserts.
-  /// Note: Order of insertion may affect graph structure.
-  pub fn insert_batch<D>(&self, items: &[(String, Vec<D>)])
-  where
-    D: num::Float + Send + Sync,
-    VecData: From<Vec<D>>,
-  {
-    use rayon::prelude::*;
-
-    // Convert all vectors first (can be done in parallel)
-    let items: Vec<(String, VecData)> = items
-      .par_iter()
-      .map(|(k, v)| (k.clone(), VecData::from(nan_to_num(v))))
-      .collect();
-
-    // Insert sequentially but with batched DB writes
-    for (key, vec) in items {
-      self.insert_vec(&key, vec);
-    }
-
-    // Trigger compression check once at the end
-    self.maybe_enable_compression();
   }
 
   /// WARNING: `vec` must not contain any NaN values.

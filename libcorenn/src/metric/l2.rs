@@ -153,11 +153,15 @@ unsafe fn dist_l2_f32_avx512(a_slice: &[f32], b_slice: &[f32]) -> f64 {
   let limit_unrolled = len - (len % 64);
 
   while i < limit_unrolled {
-    // Prefetch next cache lines (typically 64 bytes = 16 f32s per line)
-    _mm_prefetch(ptr_a.add(i + 64) as *const i8, _MM_HINT_T0);
-    _mm_prefetch(ptr_b.add(i + 64) as *const i8, _MM_HINT_T0);
-    _mm_prefetch(ptr_a.add(i + 80) as *const i8, _MM_HINT_T0);
-    _mm_prefetch(ptr_b.add(i + 80) as *const i8, _MM_HINT_T0);
+    // Prefetch next cache lines (within allocation bounds)
+    if i + 64 <= len {
+      _mm_prefetch(ptr_a.add(i + 64) as *const i8, _MM_HINT_T0);
+      _mm_prefetch(ptr_b.add(i + 64) as *const i8, _MM_HINT_T0);
+    }
+    if i + 80 <= len {
+      _mm_prefetch(ptr_a.add(i + 80) as *const i8, _MM_HINT_T0);
+      _mm_prefetch(ptr_b.add(i + 80) as *const i8, _MM_HINT_T0);
+    }
 
     // Load 16 f32s at a time, 4x unrolled
     let v_a0 = _mm512_loadu_ps(ptr_a.add(i));
