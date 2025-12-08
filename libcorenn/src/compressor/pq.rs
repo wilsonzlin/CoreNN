@@ -14,6 +14,7 @@ use linfa_clustering::KMeans;
 use linfa_clustering::KMeansInit;
 use linfa_nn::distance::L2Dist;
 use ndarray::s;
+use ndarray::Array1;
 use ndarray::Array2;
 use ndarray::ArrayView1;
 use ndarray::ArrayView2;
@@ -25,6 +26,122 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::min;
 use std::sync::Arc;
+
+/// Precomputed distance lookup table for ADC (Asymmetric Distance Computation).
+/// This stores the distance from a query subvector to all centroids for each subspace.
+/// Created once per query, then used for fast distance computation to all quantized vectors.
+#[derive(Debug)]
+pub struct PQDistanceTable {
+  /// For L2: squared distances from query subvector to each centroid.
+  /// Shape: [num_subspaces][256] - 256 centroids per subspace.
+  pub squared_distances: Vec<[f32; 256]>,
+  /// For Cosine: dot products and norms needed for cosine computation.
+  /// We store dot products and the query's norm (per subspace).
+  pub dot_products: Vec<[f32; 256]>,
+  pub query_norms_sq: Vec<f32>,
+  pub centroid_norms_sq: Vec<[f32; 256]>,
+  pub metric: StdMetric,
+}
+
+impl PQDistanceTable {
+  /// Compute distance to a quantized vector using the precomputed table.
+  /// This is O(M) where M = number of subspaces, vs O(M*D/M) = O(D) for full computation.
+    pub fn distance(&self, codes: &[u8]) -> f64 {
+    match self.metric {
+      StdMetric::L2 => self.distance_l2(codes),
+      StdMetric::Cosine => self.distance_cosine(codes),
+    }
+  }
+
+  /// L2 distance using table lookup. Uses loop unrolling for better performance.
+    fn distance_l2(&self, codes: &[u8]) -> f64 {
+    let n = codes.len();
+    let mut total_sq: f32 = 0.0;
+    let mut i = 0;
+
+    // Unroll by 4 for better ILP
+    let limit_unrolled = n - (n % 4);
+    while i < limit_unrolled {
+      let c0 = codes[i] as usize;
+      let c1 = codes[i + 1] as usize;
+      let c2 = codes[i + 2] as usize;
+      let c3 = codes[i + 3] as usize;
+
+      total_sq += self.squared_distances[i][c0];
+      total_sq += self.squared_distances[i + 1][c1];
+      total_sq += self.squared_distances[i + 2][c2];
+      total_sq += self.squared_distances[i + 3][c3];
+
+      i += 4;
+    }
+
+    // Handle remainder
+    while i < n {
+      total_sq += self.squared_distances[i][codes[i] as usize];
+      i += 1;
+    }
+
+    (total_sq as f64).sqrt()
+  }
+
+  /// Cosine distance using table lookup.
+    fn distance_cosine(&self, codes: &[u8]) -> f64 {
+    let n = codes.len();
+    let mut total_dot: f32 = 0.0;
+    let mut total_query_norm_sq: f32 = 0.0;
+    let mut total_centroid_norm_sq: f32 = 0.0;
+
+    let mut i = 0;
+    let limit_unrolled = n - (n % 4);
+
+    // Unroll by 4
+    while i < limit_unrolled {
+      let c0 = codes[i] as usize;
+      let c1 = codes[i + 1] as usize;
+      let c2 = codes[i + 2] as usize;
+      let c3 = codes[i + 3] as usize;
+
+      total_dot += self.dot_products[i][c0];
+      total_dot += self.dot_products[i + 1][c1];
+      total_dot += self.dot_products[i + 2][c2];
+      total_dot += self.dot_products[i + 3][c3];
+
+      total_query_norm_sq += self.query_norms_sq[i];
+      total_query_norm_sq += self.query_norms_sq[i + 1];
+      total_query_norm_sq += self.query_norms_sq[i + 2];
+      total_query_norm_sq += self.query_norms_sq[i + 3];
+
+      total_centroid_norm_sq += self.centroid_norms_sq[i][c0];
+      total_centroid_norm_sq += self.centroid_norms_sq[i + 1][c1];
+      total_centroid_norm_sq += self.centroid_norms_sq[i + 2][c2];
+      total_centroid_norm_sq += self.centroid_norms_sq[i + 3][c3];
+
+      i += 4;
+    }
+
+    // Handle remainder
+    while i < n {
+      let code = codes[i] as usize;
+      total_dot += self.dot_products[i][code];
+      total_query_norm_sq += self.query_norms_sq[i];
+      total_centroid_norm_sq += self.centroid_norms_sq[i][code];
+      i += 1;
+    }
+
+    const EPSILON: f32 = 1e-12;
+    if total_query_norm_sq < EPSILON || total_centroid_norm_sq < EPSILON {
+      return if total_query_norm_sq < EPSILON && total_centroid_norm_sq < EPSILON {
+        0.0
+      } else {
+        1.0
+      };
+    }
+
+    let denom = (total_query_norm_sq * total_centroid_norm_sq).sqrt();
+    let cosine_sim = (total_dot / denom) as f64;
+    1.0 - cosine_sim.clamp(-1.0, 1.0)
+  }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProductQuantizer<T: Float> {
@@ -123,11 +240,99 @@ impl<T: Float> ProductQuantizer<T> {
   }
 }
 
+impl ProductQuantizer<f32> {
+  /// Create a distance lookup table for ADC (Asymmetric Distance Computation).
+  /// This precomputes distances from the query subvectors to all centroids,
+  /// enabling O(M) distance computation per quantized vector instead of O(D).
+  pub fn create_distance_table(&self, query: &Array1<f32>, metric: StdMetric) -> PQDistanceTable {
+    let subspaces = self.subspace_codebooks.len();
+    let subdims = self.dims / subspaces;
+
+    let mut squared_distances = Vec::with_capacity(subspaces);
+    let mut dot_products = Vec::with_capacity(subspaces);
+    let mut query_norms_sq = Vec::with_capacity(subspaces);
+    let mut centroid_norms_sq = Vec::with_capacity(subspaces);
+
+    for (i, codebook) in self.subspace_codebooks.iter().enumerate() {
+      let query_sub = query.slice(s![i * subdims..(i + 1) * subdims]);
+      let centroids = codebook.centroids(); // Array2<f32>, shape [256, subdims]
+
+      let mut sq_dists = [0.0f32; 256];
+      let mut dots = [0.0f32; 256];
+      let mut c_norms_sq = [0.0f32; 256];
+
+      // Query subvector norm (for cosine)
+      let q_norm_sq: f32 = query_sub.iter().map(|x| x * x).sum();
+
+      for j in 0..256 {
+        let centroid = centroids.row(j);
+
+        match metric {
+          StdMetric::L2 => {
+            // Squared L2 distance: ||q - c||^2
+            let mut sq_dist = 0.0f32;
+            for k in 0..subdims {
+              let diff = query_sub[k] - centroid[k];
+              sq_dist += diff * diff;
+            }
+            sq_dists[j] = sq_dist;
+          }
+          StdMetric::Cosine => {
+            // Dot product and centroid norm for cosine
+            let mut dot = 0.0f32;
+            let mut c_norm_sq = 0.0f32;
+            for k in 0..subdims {
+              dot += query_sub[k] * centroid[k];
+              c_norm_sq += centroid[k] * centroid[k];
+            }
+            dots[j] = dot;
+            c_norms_sq[j] = c_norm_sq;
+          }
+        }
+      }
+
+      squared_distances.push(sq_dists);
+      dot_products.push(dots);
+      query_norms_sq.push(q_norm_sq);
+      centroid_norms_sq.push(c_norms_sq);
+    }
+
+    PQDistanceTable {
+      squared_distances,
+      dot_products,
+      query_norms_sq,
+      centroid_norms_sq,
+      metric,
+    }
+  }
+
+  /// Fast distance computation using a precomputed table (ADC).
+    pub fn distance_with_table(&self, table: &PQDistanceTable, codes: &[u8]) -> f64 {
+    table.distance(codes)
+  }
+}
+
 impl Compressor for ProductQuantizer<f32> {
   fn into_compressed(&self, v: VecData) -> CV {
     let v = v.into_f32();
     let view = ArrayView1::from(&v);
     Arc::new(self.encode(&view))
+  }
+
+  fn create_distance_table(
+    &self,
+    query: &VecData,
+    metric: StdMetric,
+  ) -> Option<super::DistanceTable> {
+    let query_f32 = query.to_f32();
+    let table = self.create_distance_table(&query_f32, metric);
+    Some(Arc::new(table))
+  }
+
+  fn dist_with_table(&self, table: &super::DistanceTable, cv: &CV) -> Option<f64> {
+    let table = table.downcast_ref::<PQDistanceTable>()?;
+    let codes = cv.downcast_ref::<Vec<u8>>()?;
+    Some(table.distance(codes))
   }
 
   fn dist(&self, metric: StdMetric, a: &CV, b: &CV) -> f64 {

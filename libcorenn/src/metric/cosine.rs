@@ -148,24 +148,47 @@ unsafe fn dist_cosine_f16_avx512(a: &[half::f16], b: &[half::f16]) -> f64 {
 #[target_feature(enable = "avx512f")]
 unsafe fn dist_cosine_f32_avx512(a: &[f32], b: &[f32]) -> f64 {
   let len = a.len();
+  let ptr_a = a.as_ptr();
+  let ptr_b = b.as_ptr();
 
-  let mut dot_product_sum_vec = _mm512_setzero_ps();
-  let mut a_norm_sq_sum_vec = _mm512_setzero_ps();
-  let mut b_norm_sq_sum_vec = _mm512_setzero_ps();
+  // Use 4 accumulators for better ILP
+  let mut dot0 = _mm512_setzero_ps();
+  let mut dot1 = _mm512_setzero_ps();
+  let mut a_norm0 = _mm512_setzero_ps();
+  let mut a_norm1 = _mm512_setzero_ps();
+  let mut b_norm0 = _mm512_setzero_ps();
+  let mut b_norm1 = _mm512_setzero_ps();
 
   let mut i = 0;
-  let vec_width = 16; // 16 f32 elements
 
-  while i + vec_width <= len {
-    let a_vec = _mm512_loadu_ps(a.as_ptr().add(i) as *const f32);
-    let b_vec = _mm512_loadu_ps(b.as_ptr().add(i) as *const f32);
+  // 2x unrolled loop (32 elements per iteration)
+  let limit_unrolled = len - (len % 32);
+  while i < limit_unrolled {
+    // Prefetch next cache lines (stay within allocation)
+    if i + 64 <= len {
+      _mm_prefetch(ptr_a.add(i + 64) as *const i8, _MM_HINT_T0);
+      _mm_prefetch(ptr_b.add(i + 64) as *const i8, _MM_HINT_T0);
+    }
 
-    dot_product_sum_vec = _mm512_fmadd_ps(a_vec, b_vec, dot_product_sum_vec);
-    a_norm_sq_sum_vec = _mm512_fmadd_ps(a_vec, a_vec, a_norm_sq_sum_vec);
-    b_norm_sq_sum_vec = _mm512_fmadd_ps(b_vec, b_vec, b_norm_sq_sum_vec);
+    let a0 = _mm512_loadu_ps(ptr_a.add(i));
+    let b0 = _mm512_loadu_ps(ptr_b.add(i));
+    let a1 = _mm512_loadu_ps(ptr_a.add(i + 16));
+    let b1 = _mm512_loadu_ps(ptr_b.add(i + 16));
 
-    i += vec_width;
+    dot0 = _mm512_fmadd_ps(a0, b0, dot0);
+    dot1 = _mm512_fmadd_ps(a1, b1, dot1);
+    a_norm0 = _mm512_fmadd_ps(a0, a0, a_norm0);
+    a_norm1 = _mm512_fmadd_ps(a1, a1, a_norm1);
+    b_norm0 = _mm512_fmadd_ps(b0, b0, b_norm0);
+    b_norm1 = _mm512_fmadd_ps(b1, b1, b_norm1);
+
+    i += 32;
   }
+
+  // Combine accumulators
+  let dot_product_sum_vec = _mm512_add_ps(dot0, dot1);
+  let a_norm_sq_sum_vec = _mm512_add_ps(a_norm0, a_norm1);
+  let b_norm_sq_sum_vec = _mm512_add_ps(b_norm0, b_norm1);
 
   let mut dot_product_sum = _mm512_reduce_add_ps(dot_product_sum_vec) as f64;
   let mut a_norm_sq_sum = _mm512_reduce_add_ps(a_norm_sq_sum_vec) as f64;

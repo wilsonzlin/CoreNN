@@ -6,6 +6,7 @@ members = [
   "corenn",
   "corenn-py",
   "corenn-node",
+  "ci",
 ]
 
 [profile.release]

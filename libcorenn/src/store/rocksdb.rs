@@ -15,12 +15,25 @@ pub fn rocksdb_options(create_if_missing: bool, error_if_exists: bool) -> Option
   let mut opt = Options::default();
   opt.create_if_missing(create_if_missing);
   opt.set_error_if_exists(error_if_exists);
-  opt.set_max_background_jobs(num_cpus::get() as i32 * 2);
+
+  // Parallelism settings
+  let num_cpus = num_cpus::get() as i32;
+  opt.set_max_background_jobs(num_cpus * 2);
+  opt.increase_parallelism(num_cpus);
+
+  // Write settings
   opt.set_bytes_per_sync(1024 * 1024 * 4);
   opt.set_write_buffer_size(1024 * 1024 * 128);
+
+  // No compression for vectors - they don't compress well and it adds CPU overhead
   opt.set_compression_type(rocksdb::DBCompressionType::None);
 
-  let cache = Cache::new_lru_cache(1024 * 1024 * 128);
+  // Optimize for point lookups (most common operation during search)
+  opt.optimize_for_point_lookup(256); // 256MB block cache
+
+  // Use larger block cache - this is critical for vector workloads
+  // Vectors are frequently accessed and caching helps significantly
+  let cache = Cache::new_lru_cache(1024 * 1024 * 512); // 512MB cache
 
   // https://github.com/facebook/rocksdb/wiki/Block-Cache.
   let mut bbt_opt = BlockBasedOptions::default();
@@ -30,6 +43,10 @@ pub fn rocksdb_options(create_if_missing: bool, error_if_exists: bool) -> Option
   bbt_opt.set_cache_index_and_filter_blocks(true);
   bbt_opt.set_pin_l0_filter_and_index_blocks_in_cache(true);
   bbt_opt.set_format_version(6);
+
+  // Add bloom filter for faster point lookups
+  bbt_opt.set_bloom_filter(10.0, false);
+
   opt.set_block_based_table_factory(&bbt_opt);
   opt
 }

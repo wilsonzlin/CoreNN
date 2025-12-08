@@ -1,0 +1,166 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-cpu=native"
+  DATASET_BASE_URL: "https://static.wilsonl.in/embedding-datasets"
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+
+      - name: Build benchmark binary
+        run: cargo build --release -p ci
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-binary
+          path: target/release/ci
+          retention-days: 1
+
+  random:
+    name: Random Vectors
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-binary
+          path: .
+
+      - name: Run benchmarks
+        run: |
+          chmod +x ci
+          mkdir -p benchmark-results
+          ./ci --output benchmark-results/random.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-random
+          path: benchmark-results/
+          retention-days: 90
+
+  dataset:
+    name: ${{ matrix.dataset }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dataset: siftsmall
+            files: "info.toml vectors.bin queries.bin results.bin"
+          - dataset: sift-250k
+            files: "info.toml vectors.bin queries.bin results.bin"
+          - dataset: sift
+            files: "info.toml vectors.bin queries.bin results.bin"
+          - dataset: gist-250k
+            files: "info.toml vectors.bin queries.bin results.bin"
+          - dataset: gist
+            files: "info.toml vectors.bin queries.bin results.bin"
+          - dataset: bbcnews-nomicembed15
+            files: "info.toml vectors.bin"
+          - dataset: bbcnews-static256
+            files: "info.toml vectors.bin"
+          - dataset: steam-games
+            files: "info.toml vectors.bin"
+          - dataset: gdelt-us-news
+            files: "info.toml vectors.bin"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aria2
+        run: sudo apt-get update && sudo apt-get install -y aria2
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-binary
+          path: .
+
+      - name: Cache dataset
+        uses: actions/cache@v4
+        with:
+          path: ci/datasets/${{ matrix.dataset }}
+          key: dataset-${{ matrix.dataset }}-v1
+
+      - name: Download dataset
+        run: |
+          mkdir -p ci/datasets/${{ matrix.dataset }}
+          cd ci/datasets/${{ matrix.dataset }}
+          for f in ${{ matrix.files }}; do
+            [ -f "$f" ] || aria2c -x16 -s16 "$DATASET_BASE_URL/${{ matrix.dataset }}/$f"
+          done
+
+      - name: Run benchmarks
+        run: |
+          chmod +x ci
+          mkdir -p benchmark-results
+          ./ci --output benchmark-results/${{ matrix.dataset }}.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.dataset }}
+          path: benchmark-results/
+          retention-days: 90
+
+  summary:
+    name: Summary
+    needs: [random, dataset]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: all-results/
+          merge-multiple: true
+
+      - name: Generate summary
+        run: |
+          echo "# CoreNN Benchmark Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          for f in all-results/*.json 2>/dev/null; do
+            [ -f "$f" ] || continue
+            echo "### $(basename $f .json)" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat "$f" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done

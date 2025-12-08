@@ -139,27 +139,67 @@ unsafe fn dist_l2_f16_avx512(a_slice: &[f16], b_slice: &[f16]) -> f64 {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn dist_l2_f32_avx512(a_slice: &[f32], b_slice: &[f32]) -> f64 {
   let len = a_slice.len();
-  let mut acc_sum_ps = _mm512_setzero_ps(); // Accumulator for sum of squares (16 f32s)
+  // Use 4 accumulators for better instruction-level parallelism
+  let mut acc0 = _mm512_setzero_ps();
+  let mut acc1 = _mm512_setzero_ps();
+  let mut acc2 = _mm512_setzero_ps();
+  let mut acc3 = _mm512_setzero_ps();
 
   let ptr_a = a_slice.as_ptr();
   let ptr_b = b_slice.as_ptr();
 
   let mut i = 0;
-  // Process chunks of 16 f32 elements
-  let limit_avx512 = len - (len % 16);
+  // Process chunks of 64 f32 elements (4x unrolled)
+  let limit_unrolled = len - (len % 64);
 
+  while i < limit_unrolled {
+    // Prefetch next cache lines (within allocation bounds)
+    if i + 64 <= len {
+      _mm_prefetch(ptr_a.add(i + 64) as *const i8, _MM_HINT_T0);
+      _mm_prefetch(ptr_b.add(i + 64) as *const i8, _MM_HINT_T0);
+    }
+    if i + 80 <= len {
+      _mm_prefetch(ptr_a.add(i + 80) as *const i8, _MM_HINT_T0);
+      _mm_prefetch(ptr_b.add(i + 80) as *const i8, _MM_HINT_T0);
+    }
+
+    // Load 16 f32s at a time, 4x unrolled
+    let v_a0 = _mm512_loadu_ps(ptr_a.add(i));
+    let v_b0 = _mm512_loadu_ps(ptr_b.add(i));
+    let v_a1 = _mm512_loadu_ps(ptr_a.add(i + 16));
+    let v_b1 = _mm512_loadu_ps(ptr_b.add(i + 16));
+    let v_a2 = _mm512_loadu_ps(ptr_a.add(i + 32));
+    let v_b2 = _mm512_loadu_ps(ptr_b.add(i + 32));
+    let v_a3 = _mm512_loadu_ps(ptr_a.add(i + 48));
+    let v_b3 = _mm512_loadu_ps(ptr_b.add(i + 48));
+
+    // Compute differences
+    let diff0 = _mm512_sub_ps(v_a0, v_b0);
+    let diff1 = _mm512_sub_ps(v_a1, v_b1);
+    let diff2 = _mm512_sub_ps(v_a2, v_b2);
+    let diff3 = _mm512_sub_ps(v_a3, v_b3);
+
+    // Square and accumulate using FMA
+    acc0 = _mm512_fmadd_ps(diff0, diff0, acc0);
+    acc1 = _mm512_fmadd_ps(diff1, diff1, acc1);
+    acc2 = _mm512_fmadd_ps(diff2, diff2, acc2);
+    acc3 = _mm512_fmadd_ps(diff3, diff3, acc3);
+
+    i += 64;
+  }
+
+  // Combine accumulators
+  let acc01 = _mm512_add_ps(acc0, acc1);
+  let acc23 = _mm512_add_ps(acc2, acc3);
+  let mut acc_sum_ps = _mm512_add_ps(acc01, acc23);
+
+  // Process remaining 16-element chunks
+  let limit_avx512 = len - (len % 16);
   while i < limit_avx512 {
-    // Load 16 f32s from a and b
     let v_a_ps = _mm512_loadu_ps(ptr_a.add(i));
     let v_b_ps = _mm512_loadu_ps(ptr_b.add(i));
-
-    // Subtract
     let v_diff_ps = _mm512_sub_ps(v_a_ps, v_b_ps);
-
-    // Square and accumulate: acc_sum_ps = acc_sum_ps + (v_diff_ps * v_diff_ps)
-    // Using FMA (fused multiply-add)
     acc_sum_ps = _mm512_fmadd_ps(v_diff_ps, v_diff_ps, acc_sum_ps);
-
     i += 16;
   }
 

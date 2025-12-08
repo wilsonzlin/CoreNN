@@ -1,12 +1,33 @@
-use libcorenn::{cfg::{Cfg, CompressionMode}, metric::StdMetric, CoreNN};
-use neon::{handle::Handle, object::Object, prelude::{Context, FunctionContext, ModuleContext}, result::NeonResult, types::{buffer::TypedArray, Finalize, JsArray, JsBox, JsNumber, JsObject, JsString, JsTypedArray, JsUndefined, Value}};
+use libcorenn::CoreNN;
+use libcorenn::cfg::Cfg;
+use libcorenn::cfg::CompressionMode;
+use libcorenn::metric::StdMetric;
+use neon::handle::Handle;
+use neon::object::Object;
+use neon::prelude::Context;
+use neon::prelude::FunctionContext;
+use neon::prelude::ModuleContext;
+use neon::result::NeonResult;
+use neon::types::Finalize;
+use neon::types::JsArray;
+use neon::types::JsBox;
+use neon::types::JsNumber;
+use neon::types::JsObject;
+use neon::types::JsString;
+use neon::types::JsTypedArray;
+use neon::types::JsUndefined;
+use neon::types::Value;
+use neon::types::buffer::TypedArray;
 
 // Neon requires Finalize.
 struct CoreNNWrapper(CoreNN);
 
 impl Finalize for CoreNNWrapper {}
 
-fn compression_mode_from_str(cx: &mut FunctionContext, s: Handle<JsString>) -> NeonResult<CompressionMode> {
+fn compression_mode_from_str(
+  cx: &mut FunctionContext,
+  s: Handle<JsString>,
+) -> NeonResult<CompressionMode> {
   let s = s.value(cx);
   match s.as_str() {
     "pq" => Ok(CompressionMode::PQ),
@@ -35,16 +56,20 @@ fn as_usize(cx: &mut FunctionContext, v: Handle<JsNumber>) -> NeonResult<usize> 
 fn cfg_from_js(cx: &mut FunctionContext, cfg_js: &JsObject) -> NeonResult<Cfg> {
   let mut cfg = Cfg::default();
   macro_rules! prop {
-      ($name:ident, $type:ty, $parser:expr) => {
-        let maybe = prop::<$type, _>(cx, &cfg_js, stringify!($name), $parser)?;
-        if let Some(v) = maybe {
-          cfg.$name = v;
-        }
-      };
+    ($name:ident, $type:ty, $parser:expr) => {
+      let maybe = prop::<$type, _>(cx, &cfg_js, stringify!($name), $parser)?;
+      if let Some(v) = maybe {
+        cfg.$name = v;
+      }
+    };
   }
   prop!(beam_width, JsNumber, |cx, v| as_usize(cx, v));
-  prop!(compaction_threshold_deletes, JsNumber, |cx, v| as_usize(cx, v));
-  prop!(compression_mode, JsString, |cx, v| compression_mode_from_str(cx, v));
+  prop!(compaction_threshold_deletes, JsNumber, |cx, v| as_usize(
+    cx, v
+  ));
+  prop!(compression_mode, JsString, |cx, v| {
+    compression_mode_from_str(cx, v)
+  });
   prop!(compression_threshold, JsNumber, |cx, v| as_usize(cx, v));
   prop!(dim, JsNumber, |cx, v| as_usize(cx, v));
   prop!(distance_threshold, JsNumber, |cx, v| Ok(v.value(cx)));
@@ -59,7 +84,12 @@ fn cfg_from_js(cx: &mut FunctionContext, cfg_js: &JsObject) -> NeonResult<Cfg> {
   Ok(cfg)
 }
 
-fn prop<V: Value, R>(cx: &mut FunctionContext, obj: &JsObject, key: &str, parser: impl FnOnce(&mut FunctionContext, Handle<V>) -> NeonResult<R>) -> NeonResult<Option<R>> {
+fn prop<V: Value, R>(
+  cx: &mut FunctionContext,
+  obj: &JsObject,
+  key: &str,
+  parser: impl FnOnce(&mut FunctionContext, Handle<V>) -> NeonResult<R>,
+) -> NeonResult<Option<R>> {
   let Some(prop) = obj.get_opt::<V, _, _>(cx, key)? else {
     return Ok(None);
   };
