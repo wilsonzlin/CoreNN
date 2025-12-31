@@ -1,6 +1,6 @@
 use ahash::HashMap;
 use clap::Args;
-use hnswlib_rs::HnswIndex;
+use hnswlib_rs::HnswIndexView;
 use itertools::Itertools;
 use libcorenn::cfg::Cfg;
 use libcorenn::metric::StdMetric;
@@ -35,7 +35,7 @@ pub struct MigrateHnswArgs {
 impl MigrateHnswArgs {
   pub async fn exec(self: MigrateHnswArgs) {
     let hnsw_raw = read(&self.path).await.unwrap();
-    let index = HnswIndex::load(self.dim, &hnsw_raw);
+    let index = HnswIndexView::load(self.dim, &hnsw_raw).unwrap();
 
     let cfg = Cfg {
       dim: self.dim,
@@ -65,7 +65,7 @@ impl MigrateHnswArgs {
       .map(|hnsw_label| {
         (
           hnsw_label_to_corenn_id[&hnsw_label],
-          index.get_data_by_label(hnsw_label).to_vec(),
+          index.get_data_by_label(hnsw_label).unwrap().to_vec(),
         )
       })
       .collect::<HashMap<_, _>>();
@@ -74,6 +74,7 @@ impl MigrateHnswArgs {
       .map(|label| {
         let neighbors = index
           .get_merged_neighbors(label, 0)
+          .unwrap()
           .into_iter()
           .map(|hnsw_label| hnsw_label_to_corenn_id[&hnsw_label])
           .collect_vec();
@@ -86,7 +87,7 @@ impl MigrateHnswArgs {
     // Offset by 1 as 0 is an additional vector, the clone of the entry point.
     // Write internal entry point clone.
     {
-      let entry_label = index.entry_label();
+      let entry_label = index.entry_label().unwrap();
       let entry_id = hnsw_label_to_corenn_id[&entry_label];
       NODE.put(db, 0, DbNodeData {
         version: 0,
