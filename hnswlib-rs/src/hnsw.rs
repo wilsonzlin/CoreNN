@@ -1,85 +1,144 @@
 use crate::error::Error;
 use crate::error::Result;
-use crate::space::label_allowed;
+use crate::id::NodeId;
+use crate::metric::Metric;
+use crate::vectors::VectorStore;
+use crate::vectors::VectorStoreMut;
+use crate::vectors::VectorRef;
 use crate::visited::VisitedListPool;
-use crate::LabelType;
-use crate::SearchStopCondition;
-use crate::Space;
-use crate::TableInt;
-use arc_swap::ArcSwapOption;
-use ahash::HashMap;
-use ahash::HashMapExt;
 use ahash::HashSet;
 use ahash::HashSetExt;
+use ahash::RandomState;
+use dashmap::DashMap;
 use ordered_float::OrderedFloat;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rayon::prelude::*;
 use std::cmp::max;
 use std::collections::BinaryHeap;
 use std::f64;
-use std::io::Read;
-use std::io::Write;
-use std::mem::size_of;
+use std::hash::BuildHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::sync::OnceLock;
 use tracing::warn;
 
-const DELETE_MARK: u32 = 0x01 << 16;
-const MAX_LABEL_OPERATION_LOCKS: usize = 65_536;
+const DEFAULT_LABEL_OPERATION_LOCKS: usize = 65_536;
+const NODE_ID_NONE: u32 = u32::MAX;
+const HNSW_DATA_VERSION: u32 = 1;
 
-fn linklist_count(header: u32) -> usize {
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HnswConfig {
+  pub dim: usize,
+  pub max_nodes: usize,
+  pub m: usize,
+  pub ef_construction: usize,
+  pub ef_search: usize,
+  pub seed: u64,
+  pub label_operation_locks: usize,
+}
+
+impl HnswConfig {
+  pub fn new(dim: usize, max_nodes: usize) -> Self {
+    Self {
+      dim,
+      max_nodes,
+      m: 16,
+      ef_construction: 200,
+      ef_search: 50,
+      seed: 100,
+      label_operation_locks: DEFAULT_LABEL_OPERATION_LOCKS,
+    }
+  }
+
+  pub fn m(mut self, m: usize) -> Self {
+    self.m = m;
+    self
+  }
+
+  pub fn ef_construction(mut self, ef: usize) -> Self {
+    self.ef_construction = ef;
+    self
+  }
+
+  pub fn ef_search(mut self, ef: usize) -> Self {
+    self.ef_search = ef;
+    self
+  }
+
+  pub fn seed(mut self, seed: u64) -> Self {
+    self.seed = seed;
+    self
+  }
+
+  pub fn label_operation_locks(mut self, locks: usize) -> Self {
+    self.label_operation_locks = locks;
+    self
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOutcome {
+  Inserted,
+  Updated,
+  Resurrected,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit<K> {
+  pub key: K,
+  pub distance: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HnswData<K> {
+  pub version: u32,
+  pub cfg: HnswConfig,
+  pub entry_point: Option<u32>,
+  pub max_level: i32,
+  /// Node keys in `NodeId` order.
+  pub keys: Vec<K>,
+  /// Per-node tombstone flag (0/1), in `NodeId` order.
+  pub deleted: Vec<u8>,
+  /// Per-node max level, in `NodeId` order.
+  pub levels: Vec<u32>,
+  /// For each node, for each level `0..=levels[node]` (in that order), the neighbor list length.
+  pub neighbor_counts: Vec<u16>,
+  /// Concatenated neighbor ids for all lists described by `neighbor_counts`.
+  pub neighbors: Vec<u32>,
+}
+
+fn neighbors_count(header: u32) -> usize {
   (header & 0xffff) as usize
 }
 
-fn set_linklist_count(header: &mut u32, count: usize) {
-  let count: u32 = count.try_into().expect("count overflow");
-  *header = (*header & 0xffff_0000) | (count & 0xffff);
+fn pack_neighbors_count(cnt: usize) -> Result<u32> {
+  if cnt > u16::MAX as usize {
+    return Err(Error::InvalidIndexFormat("neighbor list too large".to_string()));
+  }
+  Ok(cnt as u32)
 }
 
 #[derive(Clone, Copy)]
-struct LinkList<'a> {
+struct NeighborList<'a> {
   data: &'a [AtomicU32],
   len: usize,
 }
 
-impl LinkList<'_> {
-  fn len(&self) -> usize {
-    self.len
-  }
-}
-
-struct LinkListIter<'a> {
-  data: &'a [AtomicU32],
-  idx: usize,
-  end: usize,
-}
-
-impl Iterator for LinkListIter<'_> {
-  type Item = TableInt;
-
-  fn next(&mut self) -> Option<Self::Item> {
-    if self.idx >= self.end {
-      return None;
-    }
-    let id = self.data[self.idx].load(Ordering::Relaxed);
-    self.idx += 1;
-    Some(id)
-  }
-}
-
-impl<'a> IntoIterator for LinkList<'a> {
-  type Item = TableInt;
-  type IntoIter = LinkListIter<'a>;
+impl<'a> IntoIterator for NeighborList<'a> {
+  type Item = NodeId;
+  type IntoIter = NeighborIter<'a>;
 
   fn into_iter(self) -> Self::IntoIter {
-    LinkListIter {
+    NeighborIter {
       data: self.data,
       idx: 0,
       end: self.len,
@@ -87,208 +146,295 @@ impl<'a> IntoIterator for LinkList<'a> {
   }
 }
 
-#[derive(Debug)]
-pub struct HnswIndex<S: Space> {
-  space: S,
-
-  max_elements: usize,
-
-  m: usize,
-  max_m: usize,
-  max_m0: usize,
-  ef_construction: usize,
-
-  mult: f64,
-  rev_size: f64,
-
-  allow_replace_deleted: bool,
-
-  visited_list_pool: VisitedListPool,
-
-  /// Prevents `save_to_*` / `resize_index` from racing concurrent mutations.
-  mutation_lock: RwLock<()>,
-
-  /// Locks operations with element by label value (hashed).
-  label_op_locks: Vec<Mutex<()>>,
-
-  /// Protects `enter_point_node` and `max_level` updates.
-  global: Mutex<()>,
-
-  /// Protects link list updates per internal id.
-  link_list_locks: Vec<Mutex<()>>,
-
-  label_lookup: Mutex<HashMap<LabelType, TableInt>>,
-
-  deleted_elements: Mutex<HashSet<TableInt>>,
-
-  cur_element_count: AtomicUsize,
-  num_deleted: AtomicUsize,
-
-  ef: AtomicUsize,
-  max_level: AtomicI32,
-  /// `TableInt::MAX` means empty.
-  enter_point_node: AtomicU32,
-
-  labels: Vec<AtomicUsize>,
-  vectors: Vec<ArcSwapOption<Vec<f32>>>,
-
-  // Base layer: per element, [header, neighbors...max_m0]
-  level0_links: Vec<AtomicU32>,
-  // Upper layers: per element, if level>0, [ [header, neighbors...max_m] * level ]
-  link_lists: Vec<OnceLock<Box<[AtomicU32]>>>,
-  element_levels: Vec<AtomicI32>,
-
-  level_rng: Mutex<StdRng>,
-  update_probability_rng: Mutex<StdRng>,
+struct NeighborIter<'a> {
+  data: &'a [AtomicU32],
+  idx: usize,
+  end: usize,
 }
 
-impl<S: Space> HnswIndex<S> {
-  pub fn new(
-    space: S,
-    max_elements: usize,
-    m: usize,
-    ef_construction: usize,
-    random_seed: u64,
-    allow_replace_deleted: bool,
-  ) -> Self {
-    assert!(max_elements <= TableInt::MAX as usize);
-    assert!(space.dim() > 0, "dim must be > 0");
-    assert!(m >= 2, "M must be >= 2");
+impl Iterator for NeighborIter<'_> {
+  type Item = NodeId;
 
-    let m = if m <= 10000 {
-      m
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.idx >= self.end {
+      return None;
+    }
+    let raw = self.data[self.idx].load(Ordering::Relaxed);
+    self.idx += 1;
+    Some(NodeId::new(raw))
+  }
+}
+
+pub struct Hnsw<K, M>
+where
+  K: Eq + Hash + Clone + Send + Sync + 'static,
+  M: Metric,
+{
+  metric: M,
+  cfg: HnswConfig,
+
+  max_m: usize,
+  max_m0: usize,
+
+  mult: f64,
+
+  /// Prevents resizing/serialization from racing concurrent mutations/search.
+  mutation_lock: RwLock<()>,
+
+  /// Serializes operations on the same key (hashed).
+  key_locks: Vec<Mutex<()>>,
+  key_lock_hasher: RandomState,
+
+  /// Protects `entry_point` and `max_level` updates.
+  global: Mutex<()>,
+
+  /// Protects link-list updates per node.
+  link_locks: Vec<Mutex<()>>,
+
+  /// External key -> internal node mapping.
+  key_to_node: DashMap<K, NodeId, RandomState>,
+
+  /// Internal node -> external key (immutable).
+  node_keys: Vec<OnceLock<K>>,
+
+  /// Number of allocated nodes.
+  cur_node_count: AtomicUsize,
+
+  /// Number of deleted nodes.
+  deleted_count: AtomicUsize,
+
+  /// Per node.
+  node_deleted: Vec<AtomicU8>,
+  node_level: Vec<AtomicI32>,
+
+  /// Base layer: per node, [header, neighbors...max_m0]
+  level0_links: Vec<AtomicU32>,
+  /// Upper layers: per node, if level>0, [ [header, neighbors...max_m] * level ]
+  upper_links: Vec<OnceLock<Box<[AtomicU32]>>>,
+
+  /// Search parameter (should be > k).
+  ef_search: AtomicUsize,
+
+  /// Search visited list pool (per thread handle).
+  visited_pool: VisitedListPool,
+
+  level_rng: Mutex<StdRng>,
+  update_rng: Mutex<StdRng>,
+
+  ef_construction: usize,
+  max_level: AtomicI32,
+  entry_point: AtomicU32,
+}
+
+impl<K, M> Hnsw<K, M>
+where
+  K: Eq + Hash + Clone + Send + Sync + 'static,
+  M: Metric,
+{
+  pub fn new(metric: M, mut cfg: HnswConfig) -> Self {
+    assert!(cfg.max_nodes <= u32::MAX as usize);
+    assert!(cfg.dim > 0, "dim must be > 0");
+    assert!(cfg.m >= 2, "m must be >= 2");
+    if !cfg.label_operation_locks.is_power_of_two() {
+      let next_pow2 = cfg.label_operation_locks.next_power_of_two();
+      warn!(
+        "label_operation_locks={} is not power-of-two; rounding up to {}",
+        cfg.label_operation_locks, next_pow2
+      );
+      cfg.label_operation_locks = next_pow2;
+    }
+
+    let m = if cfg.m <= 10_000 {
+      cfg.m
     } else {
-      warn!("M parameter exceeds 10000; capping to 10000");
-      10000
+      warn!("m={} exceeds 10000; capping to 10000", cfg.m);
+      10_000
     };
+    cfg.m = m;
 
     let max_m = m;
     let max_m0 = m * 2;
-    let ef_construction = ef_construction.max(m);
-
-    let level0_words_per_element = 1 + max_m0;
-    let level0_total_words = max_elements * level0_words_per_element;
+    let ef_construction = cfg.ef_construction.max(m);
+    cfg.ef_construction = ef_construction;
 
     let mult = 1.0 / (m as f64).ln();
-    let rev_size = 1.0 / mult;
 
-    let mut label_op_locks = Vec::with_capacity(MAX_LABEL_OPERATION_LOCKS);
-    for _ in 0..MAX_LABEL_OPERATION_LOCKS {
-      label_op_locks.push(Mutex::new(()));
+    let level0_words_per_node = 1 + max_m0;
+    let level0_total_words = cfg.max_nodes * level0_words_per_node;
+    let max_nodes = cfg.max_nodes;
+
+    let mut key_locks = Vec::with_capacity(cfg.label_operation_locks);
+    for _ in 0..cfg.label_operation_locks {
+      key_locks.push(Mutex::new(()));
     }
 
-    let mut link_list_locks = Vec::with_capacity(max_elements);
-    for _ in 0..max_elements {
-      link_list_locks.push(Mutex::new(()));
+    let mut link_locks = Vec::with_capacity(cfg.max_nodes);
+    for _ in 0..cfg.max_nodes {
+      link_locks.push(Mutex::new(()));
     }
 
-    let mut labels = Vec::with_capacity(max_elements);
-    labels.resize_with(max_elements, || AtomicUsize::new(0));
+    let mut node_keys = Vec::with_capacity(cfg.max_nodes);
+    node_keys.resize_with(cfg.max_nodes, OnceLock::new);
 
-    let mut vectors = Vec::with_capacity(max_elements);
-    vectors.resize_with(max_elements, ArcSwapOption::empty);
+    let mut node_deleted = Vec::with_capacity(cfg.max_nodes);
+    node_deleted.resize_with(cfg.max_nodes, || AtomicU8::new(0));
+
+    let mut node_level = Vec::with_capacity(cfg.max_nodes);
+    node_level.resize_with(cfg.max_nodes, || AtomicI32::new(0));
 
     let mut level0_links = Vec::with_capacity(level0_total_words);
     level0_links.resize_with(level0_total_words, || AtomicU32::new(0));
 
-    let mut link_lists = Vec::with_capacity(max_elements);
-    link_lists.resize_with(max_elements, OnceLock::new);
+    let mut upper_links = Vec::with_capacity(cfg.max_nodes);
+    upper_links.resize_with(cfg.max_nodes, OnceLock::new);
 
-    let mut element_levels = Vec::with_capacity(max_elements);
-    element_levels.resize_with(max_elements, || AtomicI32::new(0));
+    let seed = cfg.seed;
+    let update_seed = seed.wrapping_add(1);
+    let ef_search = cfg.ef_search;
 
     Self {
-      space,
-      max_elements,
-      m,
+      metric,
+      cfg,
       max_m,
       max_m0,
-      ef_construction,
       mult,
-      rev_size,
-      allow_replace_deleted,
-      visited_list_pool: VisitedListPool::new(1, max_elements),
       mutation_lock: RwLock::new(()),
-      label_op_locks,
+      key_locks,
+      key_lock_hasher: RandomState::new(),
       global: Mutex::new(()),
-      link_list_locks,
-      label_lookup: Mutex::new(HashMap::new()),
-      deleted_elements: Mutex::new(HashSet::new()),
-      cur_element_count: AtomicUsize::new(0),
-      num_deleted: AtomicUsize::new(0),
-      ef: AtomicUsize::new(10),
-      max_level: AtomicI32::new(-1),
-      enter_point_node: AtomicU32::new(TableInt::MAX),
-      labels,
-      vectors,
+      link_locks,
+      key_to_node: DashMap::with_hasher(RandomState::new()),
+      node_keys,
+      cur_node_count: AtomicUsize::new(0),
+      deleted_count: AtomicUsize::new(0),
+      node_deleted,
+      node_level,
       level0_links,
-      link_lists,
-      element_levels,
-      level_rng: Mutex::new(StdRng::seed_from_u64(random_seed)),
-      update_probability_rng: Mutex::new(StdRng::seed_from_u64(random_seed.wrapping_add(1))),
+      upper_links,
+      ef_search: AtomicUsize::new(ef_search),
+      visited_pool: VisitedListPool::new(16, max_nodes),
+      level_rng: Mutex::new(StdRng::seed_from_u64(seed)),
+      update_rng: Mutex::new(StdRng::seed_from_u64(update_seed)),
+      ef_construction,
+      max_level: AtomicI32::new(-1),
+      entry_point: AtomicU32::new(NODE_ID_NONE),
     }
-  }
-
-  pub fn space(&self) -> &S {
-    &self.space
   }
 
   pub fn dim(&self) -> usize {
-    self.space.dim()
+    self.cfg.dim
   }
 
-  pub fn set_ef(&self, ef: usize) {
-    self.ef.store(ef, Ordering::Release);
+  pub fn m(&self) -> usize {
+    self.cfg.m
   }
 
-  pub fn get_max_elements(&self) -> usize {
-    self.max_elements
+  pub fn ef_construction(&self) -> usize {
+    self.ef_construction
   }
 
-  pub fn get_current_element_count(&self) -> usize {
-    self.cur_element_count.load(Ordering::Acquire)
+  pub fn max_nodes(&self) -> usize {
+    self.cfg.max_nodes
   }
 
-  pub fn get_deleted_count(&self) -> usize {
-    self.num_deleted.load(Ordering::Acquire)
+  pub fn len(&self) -> usize {
+    self.cur_node_count.load(Ordering::Acquire)
   }
 
-  fn enter_point_node(&self) -> Option<TableInt> {
-    let raw = self.enter_point_node.load(Ordering::Acquire);
-    if raw == TableInt::MAX {
-      None
-    } else {
-      Some(raw)
+  pub fn deleted_len(&self) -> usize {
+    self.deleted_count.load(Ordering::Acquire)
+  }
+
+  pub fn live_len(&self) -> usize {
+    self.len().saturating_sub(self.deleted_len())
+  }
+
+  pub fn ef_search(&self) -> usize {
+    self.ef_search.load(Ordering::Acquire)
+  }
+
+  pub fn set_ef_search(&self, ef: usize) {
+    self.ef_search.store(ef, Ordering::Release);
+  }
+
+  fn key_lock<'a>(&'a self, key: &K) -> &'a Mutex<()> {
+    let mut hasher = self.key_lock_hasher.build_hasher();
+    key.hash(&mut hasher);
+    let idx = (hasher.finish() as usize) & (self.key_locks.len() - 1);
+    &self.key_locks[idx]
+  }
+
+  fn entry_point_node(&self) -> Option<NodeId> {
+    let raw = self.entry_point.load(Ordering::Acquire);
+    (raw != NODE_ID_NONE).then_some(NodeId::new(raw))
+  }
+
+  fn is_deleted(&self, node: NodeId) -> bool {
+    self.node_deleted[node.as_usize()].load(Ordering::Acquire) != 0
+  }
+
+  fn mark_deleted(&self, node: NodeId) -> Result<()> {
+    let old = self.node_deleted[node.as_usize()].swap(1, Ordering::AcqRel);
+    if old == 0 {
+      self.deleted_count.fetch_add(1, Ordering::AcqRel);
+    }
+    Ok(())
+  }
+
+  fn unmark_deleted(&self, node: NodeId) -> Result<bool> {
+    let old = self.node_deleted[node.as_usize()].swap(0, Ordering::AcqRel);
+    if old != 0 {
+      self.deleted_count.fetch_sub(1, Ordering::AcqRel);
+      return Ok(true);
+    }
+    Ok(false)
+  }
+
+  fn alloc_node(&self) -> Result<NodeId> {
+    let mut cur = self.cur_node_count.load(Ordering::Acquire);
+    loop {
+      if cur >= self.cfg.max_nodes {
+        return Err(Error::IndexFull {
+          max_nodes: self.cfg.max_nodes,
+        });
+      }
+      match self.cur_node_count.compare_exchange_weak(
+        cur,
+        cur + 1,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+      ) {
+        Ok(_) => return Ok(NodeId::new(cur as u32)),
+        Err(actual) => cur = actual,
+      }
     }
   }
 
-  fn label_op_lock(&self, label: LabelType) -> &Mutex<()> {
-    let lock_id = label & (MAX_LABEL_OPERATION_LOCKS - 1);
-    &self.label_op_locks[lock_id]
+  fn get_random_level(&self) -> i32 {
+    let mut u: f64 = self.level_rng.lock().gen();
+    if u == 0.0 {
+      u = f64::MIN_POSITIVE;
+    }
+    let r = -u.ln() * self.mult;
+    r as i32
   }
 
-  fn level0_block_range(&self, internal_id: TableInt) -> Result<std::ops::Range<usize>> {
+  fn level0_block_range(&self, node: NodeId) -> std::ops::Range<usize> {
     let words = 1 + self.max_m0;
-    let start = internal_id as usize * words;
-    let end = start + words;
-    if end > self.level0_links.len() {
-      return Err(Error::InvalidIndexFormat(
-        "internalId out of bounds".to_string(),
-      ));
-    }
-    Ok(start..end)
+    let start = node.as_usize() * words;
+    start..start + words
   }
 
-  fn level0_block(&self, internal_id: TableInt) -> Result<&[AtomicU32]> {
-    let r = self.level0_block_range(internal_id)?;
-    Ok(&self.level0_links[r])
+  fn level0_block(&self, node: NodeId) -> &[AtomicU32] {
+    let r = self.level0_block_range(node);
+    &self.level0_links[r]
   }
 
-  fn upper_block(&self, internal_id: TableInt, level: usize) -> Result<&[AtomicU32]> {
+  fn upper_block(&self, node: NodeId, level: usize) -> Result<&[AtomicU32]> {
     debug_assert!(level > 0);
     let Some(raw) = self
-      .link_lists
-      .get(internal_id as usize)
+      .upper_links
+      .get(node.as_usize())
       .and_then(|c| c.get())
     else {
       return Err(Error::InvalidIndexFormat("missing linklist".to_string()));
@@ -304,196 +450,92 @@ impl<S: Space> HnswIndex<S> {
     Ok(&raw[start..end])
   }
 
-  fn linklist_at_level(&self, internal_id: TableInt, level: usize) -> Result<LinkList<'_>> {
+  fn neighbors_at_level(&self, node: NodeId, level: usize) -> Result<NeighborList<'_>> {
     let block = if level == 0 {
-      self.level0_block(internal_id)?
+      self.level0_block(node)
     } else {
-      self.upper_block(internal_id, level)?
+      self.upper_block(node, level)?
     };
     let header = block[0].load(Ordering::Acquire);
-    let cnt = linklist_count(header);
+    let cnt = neighbors_count(header);
     let cap = if level == 0 { self.max_m0 } else { self.max_m };
     if cnt > cap {
-      return Err(Error::InvalidIndexFormat("linklist too large".to_string()));
+      return Err(Error::InvalidIndexFormat("neighbor list too large".to_string()));
     }
-    Ok(LinkList {
+    Ok(NeighborList {
       data: &block[1..],
       len: cnt,
     })
   }
 
-  fn set_linklist_count_atomic(&self, header: &AtomicU32, count: usize) -> Result<()> {
-    if count > u16::MAX as usize {
-      return Err(Error::InvalidIndexFormat("linklist too large".to_string()));
-    }
-    let mut old = header.load(Ordering::Relaxed);
-    loop {
-      let mut new = old;
-      set_linklist_count(&mut new, count);
-      match header.compare_exchange_weak(old, new, Ordering::Release, Ordering::Relaxed) {
-        Ok(_) => return Ok(()),
-        Err(actual) => old = actual,
-      }
-    }
-  }
-
-  fn is_marked_deleted_internal(&self, internal_id: TableInt) -> bool {
-    let Ok(block) = self.level0_block(internal_id) else {
-      return false;
-    };
-    let header = block[0].load(Ordering::Acquire);
-    (header & DELETE_MARK) != 0
-  }
-
-  fn mark_deleted_internal(&self, internal_id: TableInt) -> Result<()> {
-    if internal_id as usize >= self.get_current_element_count() {
-      return Err(Error::InvalidIndexFormat(
-        "internalId out of bounds".to_string(),
-      ));
-    }
-    let header = self.level0_block(internal_id)?[0].fetch_or(DELETE_MARK, Ordering::AcqRel);
-    if (header & DELETE_MARK) != 0 {
-      return Err(Error::InvalidIndexFormat(
-        "The requested to delete element is already deleted".to_string(),
-      ));
-    }
-    self.num_deleted.fetch_add(1, Ordering::AcqRel);
-    if self.allow_replace_deleted {
-      self.deleted_elements.lock().insert(internal_id);
-    }
+  fn set_neighbors_count(header: &AtomicU32, count: usize) -> Result<()> {
+    header.store(pack_neighbors_count(count)?, Ordering::Release);
     Ok(())
   }
 
-  fn unmark_deleted_internal(&self, internal_id: TableInt) -> Result<()> {
-    if internal_id as usize >= self.get_current_element_count() {
-      return Err(Error::InvalidIndexFormat(
-        "internalId out of bounds".to_string(),
-      ));
-    }
-    let header = self.level0_block(internal_id)?[0].fetch_and(!DELETE_MARK, Ordering::AcqRel);
-    if (header & DELETE_MARK) == 0 {
-      return Err(Error::InvalidIndexFormat(
-        "The requested to undelete element is not deleted".to_string(),
-      ));
-    }
-    self.num_deleted.fetch_sub(1, Ordering::AcqRel);
-    if self.allow_replace_deleted {
-      self.deleted_elements.lock().remove(&internal_id);
-    }
-    Ok(())
-  }
-
-  pub fn mark_delete(&self, label: LabelType) -> Result<()> {
-    let _mutation_guard = self.mutation_lock.read();
-    let _label_lock = self.label_op_lock(label).lock();
-    let internal_id = self
-      .label_lookup
-      .lock()
-      .get(&label)
-      .copied()
-      .ok_or(Error::LabelNotFound(label))?;
-    self.mark_deleted_internal(internal_id)
-  }
-
-  pub fn unmark_delete(&self, label: LabelType) -> Result<()> {
-    let _mutation_guard = self.mutation_lock.read();
-    let _label_lock = self.label_op_lock(label).lock();
-    let internal_id = self
-      .label_lookup
-      .lock()
-      .get(&label)
-      .copied()
-      .ok_or(Error::LabelNotFound(label))?;
-    self.unmark_deleted_internal(internal_id)
-  }
-
-  pub fn get_external_label(&self, internal_id: TableInt) -> Result<LabelType> {
-    if internal_id as usize >= self.get_current_element_count() {
-      return Err(Error::InvalidIndexFormat(
-        "internalId out of bounds".to_string(),
-      ));
-    }
-    Ok(self.labels[internal_id as usize].load(Ordering::Acquire))
-  }
-
-  pub fn get_data_by_label(&self, label: LabelType) -> Result<Arc<Vec<f32>>> {
-    let internal_id = self
-      .label_lookup
-      .lock()
-      .get(&label)
-      .copied()
-      .ok_or(Error::LabelNotFound(label))?;
-    if self.is_marked_deleted_internal(internal_id) {
-      return Err(Error::LabelNotFound(label));
-    }
+  fn node_key(&self, node: NodeId) -> Result<&K> {
     self
-      .vectors
-      .get(internal_id as usize)
-      .ok_or_else(|| Error::InvalidIndexFormat("internalId out of bounds".to_string()))?
-      .load_full()
-      .ok_or_else(|| Error::InvalidIndexFormat("missing vector".to_string()))
+      .node_keys
+      .get(node.as_usize())
+      .ok_or_else(|| Error::InvalidIndexFormat("node out of bounds".to_string()))?
+      .get()
+      .ok_or_else(|| Error::InvalidIndexFormat("missing node key".to_string()))
   }
 
-  fn get_random_level(&self) -> i32 {
-    let mut u: f64 = self.level_rng.lock().gen();
-    if u == 0.0 {
-      u = f64::MIN_POSITIVE;
+  fn distance_between_nodes<V: VectorStore>(&self, vectors: &V, a: NodeId, b: NodeId) -> Result<f32> {
+    let va = vectors.vector(a).ok_or(Error::MissingVector)?;
+    let vb = vectors.vector(b).ok_or(Error::MissingVector)?;
+    let va = va.as_f32_slice();
+    let vb = vb.as_f32_slice();
+    if va.len() != self.cfg.dim {
+      return Err(Error::DimensionMismatch {
+        expected: self.cfg.dim,
+        actual: va.len(),
+      });
     }
-    let r = -u.ln() * self.mult;
-    r as i32
+    if vb.len() != self.cfg.dim {
+      return Err(Error::DimensionMismatch {
+        expected: self.cfg.dim,
+        actual: vb.len(),
+      });
+    }
+    Ok(self.metric.distance(va, vb))
   }
 
-  fn distance_between_internal(&self, a: TableInt, b: TableInt) -> Result<f32> {
-    let va = self
-      .vectors
-      .get(a as usize)
-      .ok_or_else(|| Error::InvalidIndexFormat("internalId out of bounds".to_string()))?
-      .load();
-    let va = va
-      .as_ref()
-      .ok_or_else(|| Error::InvalidIndexFormat("missing vector".to_string()))?;
-    let vb = self
-      .vectors
-      .get(b as usize)
-      .ok_or_else(|| Error::InvalidIndexFormat("internalId out of bounds".to_string()))?
-      .load();
-    let vb = vb
-      .as_ref()
-      .ok_or_else(|| Error::InvalidIndexFormat("missing vector".to_string()))?;
-    Ok(self.space.distance(va.as_slice(), vb.as_slice()))
+  fn distance_query_to_node<V: VectorStore>(&self, vectors: &V, query: &[f32], node: NodeId) -> Result<f32> {
+    if query.len() != self.cfg.dim {
+      return Err(Error::DimensionMismatch {
+        expected: self.cfg.dim,
+        actual: query.len(),
+      });
+    }
+    let v = vectors.vector(node).ok_or(Error::MissingVector)?;
+    let v = v.as_f32_slice();
+    if v.len() != self.cfg.dim {
+      return Err(Error::DimensionMismatch {
+        expected: self.cfg.dim,
+        actual: v.len(),
+      });
+    }
+    Ok(self.metric.distance(query, v))
   }
 
-  fn vector_guard(&self, internal_id: TableInt) -> Result<arc_swap::Guard<Option<Arc<Vec<f32>>>>> {
-    self
-      .vectors
-      .get(internal_id as usize)
-      .ok_or_else(|| Error::InvalidIndexFormat("internalId out of bounds".to_string()))
-      .map(|v| v.load())
-  }
-
-  fn distance_query_to_internal(&self, query: &[f32], internal_id: TableInt) -> Result<f32> {
-    let v = self.vector_guard(internal_id)?;
-    let v = v
-      .as_ref()
-      .ok_or_else(|| Error::InvalidIndexFormat("missing vector".to_string()))?;
-    Ok(self.space.distance(query, v.as_slice()))
-  }
-
-  fn get_neighbors_by_heuristic2(
+  fn get_neighbors_by_heuristic2<V: VectorStore>(
     &self,
-    top_candidates: &mut BinaryHeap<(OrderedFloat<f32>, TableInt)>,
+    vectors: &V,
+    top_candidates: &mut BinaryHeap<(OrderedFloat<f32>, NodeId)>,
     m: usize,
   ) -> Result<()> {
     if top_candidates.len() < m {
       return Ok(());
     }
 
-    let mut queue_closest: BinaryHeap<(OrderedFloat<f32>, TableInt)> = BinaryHeap::new();
+    let mut queue_closest: BinaryHeap<(OrderedFloat<f32>, NodeId)> = BinaryHeap::new();
     while let Some((dist, id)) = top_candidates.pop() {
       queue_closest.push((OrderedFloat(-dist.0), id));
     }
 
-    let mut return_list: Vec<(OrderedFloat<f32>, TableInt)> = Vec::with_capacity(m);
+    let mut return_list: Vec<(OrderedFloat<f32>, NodeId)> = Vec::with_capacity(m);
     while let Some((neg_dist_to_query, cur_id)) = queue_closest.pop() {
       if return_list.len() >= m {
         break;
@@ -502,7 +544,7 @@ impl<S: Space> HnswIndex<S> {
 
       let mut good = true;
       for &(_, selected_id) in &return_list {
-        let cur_dist = self.distance_between_internal(selected_id, cur_id)?;
+        let cur_dist = self.distance_between_nodes(vectors, selected_id, cur_id)?;
         if cur_dist < dist_to_query {
           good = false;
           break;
@@ -520,55 +562,68 @@ impl<S: Space> HnswIndex<S> {
     Ok(())
   }
 
-  fn search_base_layer(
+  fn search_base_layer<V: VectorStore>(
     &self,
-    ep_id: TableInt,
-    data_point: &[f32],
+    vectors: &V,
+    ep: NodeId,
+    query: &[f32],
     layer: usize,
-  ) -> Result<BinaryHeap<(OrderedFloat<f32>, TableInt)>> {
-    let mut visited = self.visited_list_pool.get();
+    ef: usize,
+    filter: Option<&dyn Fn(&K) -> bool>,
+  ) -> Result<BinaryHeap<(OrderedFloat<f32>, NodeId)>> {
+    let mut visited = self.visited_pool.get();
     let visited_tag = visited.tag;
     let visited_mass = visited.mass_mut();
 
-    let mut top_candidates: BinaryHeap<(OrderedFloat<f32>, TableInt)> = BinaryHeap::new();
-    let mut candidate_set: BinaryHeap<(OrderedFloat<f32>, TableInt)> = BinaryHeap::new();
+    let mut top_candidates: BinaryHeap<(OrderedFloat<f32>, NodeId)> = BinaryHeap::new();
+    let mut candidate_set: BinaryHeap<(OrderedFloat<f32>, NodeId)> = BinaryHeap::new();
 
     let mut lower_bound;
-    if !self.is_marked_deleted_internal(ep_id) {
-      let dist = self.distance_query_to_internal(data_point, ep_id)?;
-      top_candidates.push((OrderedFloat(dist), ep_id));
+    let ep_key = self.node_key(ep)?;
+    let ep_allowed = filter.map(|f| f(ep_key)).unwrap_or(true);
+    if !self.is_deleted(ep) && ep_allowed {
+      let dist = self.distance_query_to_node(vectors, query, ep)?;
       lower_bound = dist;
-      candidate_set.push((OrderedFloat(-dist), ep_id));
+      top_candidates.push((OrderedFloat(dist), ep));
+      candidate_set.push((OrderedFloat(-dist), ep));
     } else {
       lower_bound = f32::INFINITY;
-      candidate_set.push((OrderedFloat(-lower_bound), ep_id));
+      candidate_set.push((OrderedFloat(-lower_bound), ep));
     }
-    visited_mass[ep_id as usize] = visited_tag;
 
-    while let Some((neg_dist, cur_node)) = candidate_set.pop() {
+    visited_mass[ep.as_usize()] = visited_tag;
+
+    while let Some((neg_dist, cur)) = candidate_set.pop() {
       let cur_dist = -neg_dist.0;
-      if cur_dist > lower_bound && top_candidates.len() == self.ef_construction {
+      if cur_dist > lower_bound && top_candidates.len() == ef {
         break;
       }
 
-      for candidate_id in self.linklist_at_level(cur_node, layer)? {
-        if visited_mass[candidate_id as usize] == visited_tag {
+      for cand in self.neighbors_at_level(cur, layer)? {
+        if visited_mass[cand.as_usize()] == visited_tag {
           continue;
         }
-        visited_mass[candidate_id as usize] = visited_tag;
+        visited_mass[cand.as_usize()] = visited_tag;
 
-        let dist1 = self.distance_query_to_internal(data_point, candidate_id)?;
-        if top_candidates.len() < self.ef_construction || lower_bound > dist1 {
-          candidate_set.push((OrderedFloat(-dist1), candidate_id));
-          if !self.is_marked_deleted_internal(candidate_id) {
-            top_candidates.push((OrderedFloat(dist1), candidate_id));
-          }
-          if top_candidates.len() > self.ef_construction {
-            top_candidates.pop();
-          }
-          if let Some((worst, _)) = top_candidates.peek() {
-            lower_bound = worst.0;
-          }
+        let dist = self.distance_query_to_node(vectors, query, cand)?;
+        let should_consider = top_candidates.len() < ef || lower_bound > dist;
+        if !should_consider {
+          continue;
+        }
+
+        candidate_set.push((OrderedFloat(-dist), cand));
+
+        let cand_key = self.node_key(cand)?;
+        let cand_allowed = filter.map(|f| f(cand_key)).unwrap_or(true);
+        if !self.is_deleted(cand) && cand_allowed {
+          top_candidates.push((OrderedFloat(dist), cand));
+        }
+
+        while top_candidates.len() > ef {
+          top_candidates.pop();
+        }
+        if let Some((worst, _)) = top_candidates.peek() {
+          lower_bound = worst.0;
         }
       }
     }
@@ -576,252 +631,167 @@ impl<S: Space> HnswIndex<S> {
     Ok(top_candidates)
   }
 
-  fn mutually_connect_new_element(
+  fn mutually_connect_new_element<V: VectorStore>(
     &self,
-    cur_c: TableInt,
-    top_candidates: &mut BinaryHeap<(OrderedFloat<f32>, TableInt)>,
+    vectors: &V,
+    node: NodeId,
+    mut top_candidates: BinaryHeap<(OrderedFloat<f32>, NodeId)>,
     level: usize,
     is_update: bool,
-  ) -> Result<TableInt> {
-    self.get_neighbors_by_heuristic2(top_candidates, self.m)?;
-    if top_candidates.len() > self.m {
+  ) -> Result<NodeId> {
+    let cap = if level == 0 { self.max_m0 } else { self.max_m };
+    self.get_neighbors_by_heuristic2(vectors, &mut top_candidates, self.cfg.m)?;
+    if top_candidates.len() > self.cfg.m {
       return Err(Error::InvalidIndexFormat(
-        "heuristic returned more than M candidates".to_string(),
+        "heuristic returned more than m candidates".to_string(),
       ));
     }
 
-    let mut selected_neighbors: Vec<TableInt> = Vec::with_capacity(self.m);
+    let mut selected: Vec<NodeId> = Vec::with_capacity(self.cfg.m);
     while let Some((_dist, id)) = top_candidates.pop() {
-      selected_neighbors.push(id);
+      selected.push(id);
     }
 
-    let next_closest_entry_point = *selected_neighbors
+    let next_entry = *selected
       .last()
       .ok_or_else(|| Error::InvalidIndexFormat("empty selected neighbor list".to_string()))?;
 
-    for &neighbor in &selected_neighbors {
-      if level > self.element_levels[neighbor as usize].load(Ordering::Acquire) as usize {
+    for &neighbor in &selected {
+      let neighbor_level = self.node_level[neighbor.as_usize()].load(Ordering::Acquire);
+      if level > neighbor_level.max(0) as usize {
         return Err(Error::InvalidIndexFormat(
-          "Trying to make a link on a non-existent level".to_string(),
+          "trying to link on a non-existent level".to_string(),
         ));
       }
     }
 
     {
-      let _cur_lock = self.link_list_locks[cur_c as usize].lock();
+      let _lock = self.link_locks[node.as_usize()].lock();
       let block = if level == 0 {
-        self.level0_block(cur_c)?
+        self.level0_block(node)
       } else {
-        self.upper_block(cur_c, level)?
+        self.upper_block(node, level)?
       };
       let header = block[0].load(Ordering::Acquire);
-      if linklist_count(header) != 0 && !is_update {
+      if neighbors_count(header) != 0 && !is_update {
         return Err(Error::InvalidIndexFormat(
-          "The newly inserted element should have blank link list".to_string(),
+          "newly inserted node should have blank neighbor list".to_string(),
         ));
       }
-      for (idx, &neighbor) in selected_neighbors.iter().enumerate() {
-        block[1 + idx].store(neighbor, Ordering::Relaxed);
+      for (idx, &neighbor) in selected.iter().enumerate() {
+        block[1 + idx].store(neighbor.as_u32(), Ordering::Relaxed);
       }
-      self.set_linklist_count_atomic(&block[0], selected_neighbors.len())?;
+      Self::set_neighbors_count(&block[0], selected.len())?;
     }
 
-    self.connect_backlinks(cur_c, &selected_neighbors, level, is_update)?;
+    self.connect_backlinks(vectors, node, &selected, level, is_update)?;
 
-    Ok(next_closest_entry_point)
+    if selected.len() > cap {
+      return Err(Error::InvalidIndexFormat("too many selected neighbors".to_string()));
+    }
+
+    Ok(next_entry)
   }
 
-  fn connect_backlinks(
+  fn connect_backlinks<V: VectorStore>(
     &self,
-    cur_c: TableInt,
-    selected_neighbors: &[TableInt],
+    vectors: &V,
+    node: NodeId,
+    selected: &[NodeId],
     level: usize,
     is_update: bool,
   ) -> Result<()> {
     let mcurmax = if level > 0 { self.max_m } else { self.max_m0 };
 
-    for &neighbor in selected_neighbors {
-      if neighbor == cur_c {
+    for &neighbor in selected {
+      if neighbor == node {
         return Err(Error::InvalidIndexFormat(
-          "Trying to connect an element to itself".to_string(),
+          "trying to connect a node to itself".to_string(),
         ));
       }
-      if level > self.element_levels[neighbor as usize].load(Ordering::Acquire) as usize {
+      let neighbor_level = self.node_level[neighbor.as_usize()].load(Ordering::Acquire);
+      if level > neighbor_level.max(0) as usize {
         return Err(Error::InvalidIndexFormat(
-          "Trying to make a link on a non-existent level".to_string(),
-        ));
-      }
-
-      let _lock = self.link_list_locks[neighbor as usize].lock();
-      let existing = self.linklist_at_level(neighbor, level)?;
-      let sz_link_list_other = existing.len();
-      let is_cur_c_present = is_update && existing.into_iter().any(|id| id == cur_c);
-      if sz_link_list_other > mcurmax {
-        return Err(Error::InvalidIndexFormat(
-          "Bad value of sz_link_list_other".to_string(),
+          "trying to link on a non-existent level".to_string(),
         ));
       }
 
-      if is_cur_c_present {
+      let _lock = self.link_locks[neighbor.as_usize()].lock();
+      let existing = self.neighbors_at_level(neighbor, level)?;
+      let sz_other = existing.len;
+      let is_present = is_update && existing.into_iter().any(|id| id == node);
+      if sz_other > mcurmax {
+        return Err(Error::InvalidIndexFormat(
+          "bad neighbor list size".to_string(),
+        ));
+      }
+      if is_present {
         continue;
       }
 
-      if sz_link_list_other < mcurmax {
-        let block = if level == 0 {
-          self.level0_block(neighbor)?
-        } else {
-          self.upper_block(neighbor, level)?
-        };
-        block[1 + sz_link_list_other].store(cur_c, Ordering::Relaxed);
-        self.set_linklist_count_atomic(&block[0], sz_link_list_other + 1)?;
+      let block = if level == 0 {
+        self.level0_block(neighbor)
+      } else {
+        self.upper_block(neighbor, level)?
+      };
+
+      if sz_other < mcurmax {
+        block[1 + sz_other].store(node.as_u32(), Ordering::Relaxed);
+        Self::set_neighbors_count(&block[0], sz_other + 1)?;
         continue;
       }
 
-      let existing = existing.into_iter().collect::<Vec<_>>();
-      let d_max = self.distance_between_internal(cur_c, neighbor)?;
-      let mut candidates: BinaryHeap<(OrderedFloat<f32>, TableInt)> = BinaryHeap::new();
-      candidates.push((OrderedFloat(d_max), cur_c));
+      let mut candidates: BinaryHeap<(OrderedFloat<f32>, NodeId)> = BinaryHeap::new();
+      let d_max = self.distance_between_nodes(vectors, node, neighbor)?;
+      candidates.push((OrderedFloat(d_max), node));
 
-      for existing in existing {
-        let dist = self.distance_between_internal(existing, neighbor)?;
+      for existing in existing.into_iter() {
+        let dist = self.distance_between_nodes(vectors, existing, neighbor)?;
         candidates.push((OrderedFloat(dist), existing));
       }
 
-      self.get_neighbors_by_heuristic2(&mut candidates, mcurmax)?;
+      self.get_neighbors_by_heuristic2(vectors, &mut candidates, mcurmax)?;
 
-      let mut new_neighbors: Vec<TableInt> = Vec::with_capacity(candidates.len());
+      let mut new_neighbors: Vec<NodeId> = Vec::with_capacity(candidates.len());
       while let Some((_dist, id)) = candidates.pop() {
         new_neighbors.push(id);
       }
 
-      let block = if level == 0 {
-        self.level0_block(neighbor)?
-      } else {
-        self.upper_block(neighbor, level)?
-      };
-      for (indx, &id) in new_neighbors.iter().enumerate() {
-        block[1 + indx].store(id, Ordering::Relaxed);
+      for (idx, &id) in new_neighbors.iter().enumerate() {
+        block[1 + idx].store(id.as_u32(), Ordering::Relaxed);
       }
-      self.set_linklist_count_atomic(&block[0], new_neighbors.len())?;
+      Self::set_neighbors_count(&block[0], new_neighbors.len())?;
     }
 
     Ok(())
   }
 
-  fn get_connections_with_lock(
-    &self,
-    internal_id: TableInt,
-    level: usize,
-  ) -> Result<Vec<TableInt>> {
-    let _lock = self.link_list_locks[internal_id as usize].lock();
-    Ok(self
-      .linklist_at_level(internal_id, level)?
-      .into_iter()
-      .collect())
-  }
-
-  fn repair_connections_for_update(
-    &self,
-    data_point: &[f32],
-    entry_point_internal_id: TableInt,
-    data_point_internal_id: TableInt,
-    data_point_level: usize,
-    max_level: usize,
-  ) -> Result<()> {
-    let mut curr_obj = entry_point_internal_id;
-    if data_point_level < max_level {
-      let mut curdist = self.distance_query_to_internal(data_point, curr_obj)?;
-      for level in (data_point_level + 1..=max_level).rev() {
-        let mut changed = true;
-        while changed {
-          changed = false;
-          for cand in self.linklist_at_level(curr_obj, level)? {
-            let d = self.distance_query_to_internal(data_point, cand)?;
-            if d < curdist {
-              curdist = d;
-              curr_obj = cand;
-              changed = true;
-            }
-          }
-        }
-      }
-    }
-
-    if data_point_level > max_level {
-      return Err(Error::InvalidIndexFormat(
-        "Level of item to be updated cannot be bigger than max level".to_string(),
-      ));
-    }
-
-    for level in (0..=data_point_level).rev() {
-      let mut top_candidates = self.search_base_layer(curr_obj, data_point, level)?;
-      let mut filtered: BinaryHeap<(OrderedFloat<f32>, TableInt)> = BinaryHeap::new();
-      while let Some(cand) = top_candidates.pop() {
-        if cand.1 != data_point_internal_id {
-          filtered.push(cand);
-        }
-      }
-
-      if filtered.is_empty() {
-        continue;
-      }
-
-      let ep_deleted = self.is_marked_deleted_internal(entry_point_internal_id);
-      if ep_deleted {
-        let dist = self.distance_query_to_internal(data_point, entry_point_internal_id)?;
-        filtered.push((OrderedFloat(dist), entry_point_internal_id));
-        if filtered.len() > self.ef_construction {
-          filtered.pop();
-        }
-      }
-
-      curr_obj =
-        self.mutually_connect_new_element(data_point_internal_id, &mut filtered, level, true)?;
-    }
-
-    Ok(())
-  }
-
-  fn update_point(
-    &self,
-    data_point: &[f32],
-    internal_id: TableInt,
-    update_neighbor_probability: f32,
-  ) -> Result<()> {
-    self
-      .vectors
-      .get(internal_id as usize)
-      .ok_or_else(|| Error::InvalidIndexFormat("internalId out of bounds".to_string()))?
-      .store(Some(Arc::new(data_point.to_vec())));
-
+  fn update_point<V: VectorStore>(&self, vectors: &V, node: NodeId, update_neighbor_probability: f32) -> Result<()> {
     let max_level_copy = self.max_level.load(Ordering::Acquire);
-    let entry_point_copy = self.enter_point_node();
-    if entry_point_copy == Some(internal_id) && self.get_current_element_count() == 1 {
+    let entry = self.entry_point_node().ok_or(Error::EmptyIndex)?;
+
+    if entry == node && self.len() == 1 {
       return Ok(());
     }
 
-    let entry_point_copy = entry_point_copy.ok_or(Error::EmptyIndex)?;
-    let elem_level = self.element_levels[internal_id as usize].load(Ordering::Acquire);
+    let elem_level = self.node_level[node.as_usize()].load(Ordering::Acquire);
     if elem_level < 0 {
-      return Err(Error::InvalidIndexFormat(
-        "element level is negative".to_string(),
-      ));
+      return Err(Error::InvalidIndexFormat("node level < 0".to_string()));
     }
-    let elem_level = elem_level as usize;
 
-    for layer in 0..=elem_level {
-      let mut s_cand: HashSet<TableInt> = HashSet::new();
-      let mut s_neigh: HashSet<TableInt> = HashSet::new();
+    for layer in 0..=elem_level as usize {
+      let mut s_cand = HashSet::<NodeId>::new();
+      let mut s_neigh = HashSet::<NodeId>::new();
 
-      let list_one_hop = self.get_connections_with_lock(internal_id, layer)?;
+      let list_one_hop = self.get_connections_with_lock(node, layer)?;
       if list_one_hop.is_empty() {
         continue;
       }
 
-      s_cand.insert(internal_id);
+      s_cand.insert(node);
 
       let update_decisions: Vec<f32> = {
-        let mut rng = self.update_probability_rng.lock();
+        let mut rng = self.update_rng.lock();
         (0..list_one_hop.len()).map(|_| rng.gen::<f32>()).collect()
       };
 
@@ -833,7 +803,6 @@ impl<S: Space> HnswIndex<S> {
         }
 
         s_neigh.insert(el_one_hop);
-
         let list_two_hop = self.get_connections_with_lock(el_one_hop, layer)?;
         for el_two_hop in list_two_hop {
           s_cand.insert(el_two_hop);
@@ -851,13 +820,13 @@ impl<S: Space> HnswIndex<S> {
         }
 
         let elements_to_keep = self.ef_construction.min(size);
-        let mut candidates: BinaryHeap<(OrderedFloat<f32>, TableInt)> = BinaryHeap::new();
+        let mut candidates: BinaryHeap<(OrderedFloat<f32>, NodeId)> = BinaryHeap::new();
 
         for cand in s_cand.iter().copied() {
           if cand == neigh {
             continue;
           }
-          let dist = self.distance_between_internal(neigh, cand)?;
+          let dist = self.distance_between_nodes(vectors, neigh, cand)?;
           if candidates.len() < elements_to_keep {
             candidates.push((OrderedFloat(dist), cand));
           } else if dist < candidates.peek().unwrap().0 .0 {
@@ -867,128 +836,152 @@ impl<S: Space> HnswIndex<S> {
         }
 
         let cap = if layer == 0 { self.max_m0 } else { self.max_m };
-        self.get_neighbors_by_heuristic2(&mut candidates, cap)?;
+        self.get_neighbors_by_heuristic2(vectors, &mut candidates, cap)?;
 
-        let _lock = self.link_list_locks[neigh as usize].lock();
+        let _lock = self.link_locks[neigh.as_usize()].lock();
         let block = if layer == 0 {
-          self.level0_block(neigh)?
+          self.level0_block(neigh)
         } else {
           self.upper_block(neigh, layer)?
         };
 
         let cand_size = candidates.len();
         for idx in 0..cand_size {
-          block[1 + idx].store(candidates.pop().unwrap().1, Ordering::Relaxed);
+          block[1 + idx].store(candidates.pop().unwrap().1.as_u32(), Ordering::Relaxed);
         }
-        self.set_linklist_count_atomic(&block[0], cand_size)?;
+        Self::set_neighbors_count(&block[0], cand_size)?;
       }
     }
 
-    self.repair_connections_for_update(
-      data_point,
-      entry_point_copy,
-      internal_id,
-      elem_level,
-      max_level_copy.max(0) as usize,
-    )?;
+    self.repair_connections_for_update(vectors, entry, node, elem_level as usize, max_level_copy.max(0) as usize)?;
 
     Ok(())
   }
 
-  fn add_point_at_level(
+  fn repair_connections_for_update<V: VectorStore>(
     &self,
-    data_point: &[f32],
-    label: LabelType,
-    forced_level: Option<i32>,
-  ) -> Result<TableInt> {
-    let _mutation_guard = self.mutation_lock.read();
-
-    let cur_c: TableInt;
-    {
-      let mut label_lookup = self.label_lookup.lock();
-      if let Some(&existing) = label_lookup.get(&label) {
-        if self.allow_replace_deleted && self.is_marked_deleted_internal(existing) {
-          return Err(Error::InvalidIndexFormat(
-            "Can't use addPoint to update deleted elements if replacement of deleted elements is enabled."
-              .to_string(),
-          ));
-        }
-        drop(label_lookup);
-        if self.is_marked_deleted_internal(existing) {
-          self.unmark_deleted_internal(existing)?;
-        }
-        self.update_point(data_point, existing, 1.0)?;
-        return Ok(existing);
-      }
-
-      let cur_count = self.cur_element_count.load(Ordering::Acquire);
-      if cur_count >= self.max_elements {
-        return Err(Error::IndexFull {
-          max_elements: self.max_elements,
-        });
-      }
-      cur_c = cur_count as TableInt;
-      self.cur_element_count.store(cur_count + 1, Ordering::Release);
-      label_lookup.insert(label, cur_c);
-    }
-
-    let curlevel = forced_level.unwrap_or_else(|| self.get_random_level());
-    if curlevel < 0 {
-      return Err(Error::InvalidIndexFormat(
-        "level must be >= 0".to_string(),
-      ));
-    }
-    self.element_levels[cur_c as usize].store(curlevel, Ordering::Release);
-
-    // "memset" base layer for the new element.
-    for word in self.level0_block(cur_c)? {
-      word.store(0, Ordering::Relaxed);
-    }
-
-    // Initialization of the data and label.
-    self.labels[cur_c as usize].store(label, Ordering::Release);
-    self
-      .vectors
-      .get(cur_c as usize)
-      .ok_or_else(|| Error::InvalidIndexFormat("internalId out of bounds".to_string()))?
-      .store(Some(Arc::new(data_point.to_vec())));
-
-    if curlevel > 0 {
-      let words = (curlevel as usize) * (1 + self.max_m);
-      let mut raw = Vec::with_capacity(words);
-      raw.resize_with(words, || AtomicU32::new(0));
-      self
-        .link_lists
-        .get(cur_c as usize)
-        .ok_or_else(|| Error::InvalidIndexFormat("internalId out of bounds".to_string()))?
-        .set(raw.into_boxed_slice())
-        .map_err(|_| Error::InvalidIndexFormat("linklist already initialized".to_string()))?;
-    }
-
-    let mut templock = Some(self.global.lock());
-    let maxlevelcopy = self.max_level.load(Ordering::Acquire);
-    if curlevel <= maxlevelcopy {
-      drop(templock.take());
-    }
-
-    let mut curr_obj = self.enter_point_node();
-    let Some(enterpoint_copy) = curr_obj else {
-      // First element.
-      self.enter_point_node.store(cur_c, Ordering::Release);
-      self.max_level.store(curlevel, Ordering::Release);
-      return Ok(cur_c);
-    };
-
-    if maxlevelcopy >= 0 && curlevel < maxlevelcopy {
-      let mut curdist = self.distance_query_to_internal(data_point, enterpoint_copy)?;
-      let mut curr = enterpoint_copy;
-      for level in ((curlevel + 1) as usize..=maxlevelcopy as usize).rev() {
+    vectors: &V,
+    entry: NodeId,
+    node: NodeId,
+    node_level: usize,
+    max_level: usize,
+  ) -> Result<()> {
+    let mut curr = entry;
+    if node_level < max_level {
+      let node_vec = vectors.vector(node).ok_or(Error::MissingVector)?;
+      let node_vec = node_vec.as_f32_slice();
+      let mut curdist = self.distance_query_to_node(vectors, node_vec, curr)?;
+      for level in (node_level + 1..=max_level).rev() {
         let mut changed = true;
         while changed {
           changed = false;
-          let _lock = self.link_list_locks[curr as usize].lock();
-          for cand in self.linklist_at_level(curr, level)? {
-            let d = self.distance_query_to_internal(data_point, cand)?;
+          for cand in self.neighbors_at_level(curr, level)? {
+            let d = self.distance_between_nodes(vectors, node, cand)?;
+            if d < curdist {
+              curdist = d;
+              curr = cand;
+              changed = true;
+            }
+          }
+        }
+      }
+    }
+
+    if node_level > max_level {
+      return Err(Error::InvalidIndexFormat(
+        "node level cannot exceed max level".to_string(),
+      ));
+    }
+
+    let node_vec = vectors.vector(node).ok_or(Error::MissingVector)?;
+    let node_vec = node_vec.as_f32_slice();
+
+    for level in (0..=node_level).rev() {
+      let mut top_candidates = self.search_base_layer(vectors, curr, node_vec, level, self.ef_construction, None)?;
+
+      let mut filtered: BinaryHeap<(OrderedFloat<f32>, NodeId)> = BinaryHeap::new();
+      while let Some(cand) = top_candidates.pop() {
+        if cand.1 != node {
+          filtered.push(cand);
+        }
+      }
+
+      if !filtered.is_empty() {
+        let entry_deleted = self.is_deleted(entry);
+        if entry_deleted {
+          let dist = self.distance_between_nodes(vectors, node, entry)?;
+          filtered.push((OrderedFloat(dist), entry));
+          if filtered.len() > self.ef_construction {
+            filtered.pop();
+          }
+        }
+        curr = self.mutually_connect_new_element(vectors, node, filtered, level, true)?;
+      }
+    }
+
+    Ok(())
+  }
+
+  fn get_connections_with_lock(&self, node: NodeId, level: usize) -> Result<Vec<NodeId>> {
+    let _lock = self.link_locks[node.as_usize()].lock();
+    Ok(self.neighbors_at_level(node, level)?.into_iter().collect())
+  }
+
+  fn add_point_at_level<V: VectorStore>(
+    &self,
+    vectors: &V,
+    node: NodeId,
+    forced_level: Option<i32>,
+  ) -> Result<()> {
+    let cur_level = forced_level.unwrap_or_else(|| self.get_random_level());
+    if cur_level < 0 {
+      return Err(Error::InvalidIndexFormat("level must be >= 0".to_string()));
+    }
+    self.node_level[node.as_usize()].store(cur_level, Ordering::Release);
+
+    // Clear base layer neighbor list.
+    for word in self.level0_block(node) {
+      word.store(0, Ordering::Relaxed);
+    }
+
+    // Initialize upper layers if any.
+    if cur_level > 0 {
+      let words = (cur_level as usize) * (1 + self.max_m);
+      let mut raw = Vec::with_capacity(words);
+      raw.resize_with(words, || AtomicU32::new(0));
+      self
+        .upper_links
+        .get(node.as_usize())
+        .ok_or_else(|| Error::InvalidIndexFormat("node out of bounds".to_string()))?
+        .set(raw.into_boxed_slice())
+        .map_err(|_| Error::InvalidIndexFormat("upper linklist already initialized".to_string()))?;
+    }
+
+    let mut templock = Some(self.global.lock());
+    let max_level_copy = self.max_level.load(Ordering::Acquire);
+    if cur_level <= max_level_copy {
+      drop(templock.take());
+    }
+
+    let mut curr_obj = self.entry_point_node();
+    let Some(entry) = curr_obj else {
+      self.entry_point.store(node.as_u32(), Ordering::Release);
+      self.max_level.store(cur_level, Ordering::Release);
+      return Ok(());
+    };
+
+    let node_vec = vectors.vector(node).ok_or(Error::MissingVector)?;
+    let node_vec = node_vec.as_f32_slice();
+
+    if max_level_copy >= 0 && cur_level < max_level_copy {
+      let mut curdist = self.distance_query_to_node(vectors, node_vec, entry)?;
+      let mut curr = entry;
+      for level in ((cur_level + 1) as usize..=max_level_copy as usize).rev() {
+        let mut changed = true;
+        while changed {
+          changed = false;
+          for cand in self.neighbors_at_level(curr, level)? {
+            let d = self.distance_query_to_node(vectors, node_vec, cand)?;
             if d < curdist {
               curdist = d;
               curr = cand;
@@ -1000,1217 +993,1168 @@ impl<S: Space> HnswIndex<S> {
       curr_obj = Some(curr);
     }
 
-    let mut curr_obj = curr_obj.expect("enterpoint checked above");
+    let mut curr_obj = curr_obj.expect("entry checked above");
 
-    let ep_deleted = self.is_marked_deleted_internal(enterpoint_copy);
-    let max_conn_level =
-      usize::min(curlevel.max(0) as usize, maxlevelcopy.max(0) as usize);
+    let entry_deleted = self.is_deleted(entry);
+    let max_conn_level = usize::min(cur_level.max(0) as usize, max_level_copy.max(0) as usize);
 
-    let mut selected_neighbors_per_level: Vec<Vec<TableInt>> = vec![Vec::new(); max_conn_level + 1];
+    let mut selected_per_level: Vec<Vec<NodeId>> = vec![Vec::new(); max_conn_level + 1];
 
-    // Phase 1: fill `cur_c`'s own link lists, but do NOT publish backlinks yet.
+    // Phase 1: fill `node`'s own neighbor lists, but do NOT publish backlinks yet.
     for level in (0..=max_conn_level).rev() {
-      let mut top_candidates = self.search_base_layer(curr_obj, data_point, level)?;
-      if ep_deleted {
-        let dist = self.distance_query_to_internal(data_point, enterpoint_copy)?;
-        top_candidates.push((OrderedFloat(dist), enterpoint_copy));
+      let mut top_candidates = self.search_base_layer(vectors, curr_obj, node_vec, level, self.ef_construction, None)?;
+      if entry_deleted {
+        let dist = self.distance_query_to_node(vectors, node_vec, entry)?;
+        top_candidates.push((OrderedFloat(dist), entry));
         if top_candidates.len() > self.ef_construction {
           top_candidates.pop();
         }
       }
 
-      self.get_neighbors_by_heuristic2(&mut top_candidates, self.m)?;
-      if top_candidates.len() > self.m {
+      self.get_neighbors_by_heuristic2(vectors, &mut top_candidates, self.cfg.m)?;
+      if top_candidates.len() > self.cfg.m {
         return Err(Error::InvalidIndexFormat(
-          "heuristic returned more than M candidates".to_string(),
+          "heuristic returned more than m candidates".to_string(),
         ));
       }
 
-      let mut selected_neighbors: Vec<TableInt> = Vec::with_capacity(self.m);
+      let mut selected: Vec<NodeId> = Vec::with_capacity(self.cfg.m);
       while let Some((_dist, id)) = top_candidates.pop() {
-        selected_neighbors.push(id);
+        selected.push(id);
       }
 
-      let next_closest_entry_point = *selected_neighbors
+      let next_entry = *selected
         .last()
         .ok_or_else(|| Error::InvalidIndexFormat("empty selected neighbor list".to_string()))?;
 
-      for &neighbor in &selected_neighbors {
-        if level > self.element_levels[neighbor as usize].load(Ordering::Acquire) as usize {
+      for &neighbor in &selected {
+        let neighbor_level = self.node_level[neighbor.as_usize()].load(Ordering::Acquire);
+        if level > neighbor_level.max(0) as usize {
           return Err(Error::InvalidIndexFormat(
-            "Trying to make a link on a non-existent level".to_string(),
+            "trying to link on a non-existent level".to_string(),
           ));
         }
       }
 
       {
-        let _cur_lock = self.link_list_locks[cur_c as usize].lock();
+        let _lock = self.link_locks[node.as_usize()].lock();
         let block = if level == 0 {
-          self.level0_block(cur_c)?
+          self.level0_block(node)
         } else {
-          self.upper_block(cur_c, level)?
+          self.upper_block(node, level)?
         };
         let header = block[0].load(Ordering::Acquire);
-        if linklist_count(header) != 0 {
+        if neighbors_count(header) != 0 {
           return Err(Error::InvalidIndexFormat(
-            "The newly inserted element should have blank link list".to_string(),
+            "new node should have blank neighbor list".to_string(),
           ));
         }
-        for (idx, &neighbor) in selected_neighbors.iter().enumerate() {
-          block[1 + idx].store(neighbor, Ordering::Relaxed);
+        for (idx, &neighbor) in selected.iter().enumerate() {
+          block[1 + idx].store(neighbor.as_u32(), Ordering::Relaxed);
         }
-        self.set_linklist_count_atomic(&block[0], selected_neighbors.len())?;
+        Self::set_neighbors_count(&block[0], selected.len())?;
       }
 
-      selected_neighbors_per_level[level] = selected_neighbors;
-      curr_obj = next_closest_entry_point;
+      selected_per_level[level] = selected;
+      curr_obj = next_entry;
     }
 
     // Phase 2: publish backlinks.
     for level in (0..=max_conn_level).rev() {
-      self.connect_backlinks(cur_c, &selected_neighbors_per_level[level], level, false)?;
+      self.connect_backlinks(vectors, node, &selected_per_level[level], level, false)?;
     }
 
-    if curlevel > maxlevelcopy {
+    if cur_level > max_level_copy {
       debug_assert!(templock.is_some());
-      self.enter_point_node.store(cur_c, Ordering::Release);
-      self.max_level.store(curlevel, Ordering::Release);
+      self.entry_point.store(node.as_u32(), Ordering::Release);
+      self.max_level.store(cur_level, Ordering::Release);
     }
 
-    Ok(cur_c)
+    Ok(())
   }
 
-  pub fn add_point(&self, data_point: &[f32], label: LabelType) -> Result<TableInt> {
-    if data_point.len() != self.space.dim() {
-      return Err(Error::DimensionMismatch {
-        expected: self.space.dim(),
-        actual: data_point.len(),
-      });
-    }
-    let _label_lock = self.label_op_lock(label).lock();
-    self.add_point_at_level(data_point, label, None)
-  }
-
-  pub fn add_point_replace_deleted(&self, data_point: &[f32], label: LabelType) -> Result<TableInt> {
-    if !self.allow_replace_deleted {
+  pub(crate) fn legacy_start_loading(&self, cur_element_count: usize) -> Result<()> {
+    if cur_element_count > self.cfg.max_nodes {
       return Err(Error::InvalidIndexFormat(
-        "Replacement of deleted elements is disabled in constructor".to_string(),
+        "cur_element_count > max_nodes".to_string(),
       ));
     }
-    if data_point.len() != self.space.dim() {
+    self
+      .cur_node_count
+      .store(cur_element_count, Ordering::Release);
+    Ok(())
+  }
+
+  pub(crate) fn legacy_set_node_key(&self, internal_id: u32, key: K) -> Result<()> {
+    let node = NodeId::new(internal_id);
+    self
+      .node_keys
+      .get(node.as_usize())
+      .ok_or_else(|| Error::InvalidIndexFormat("node out of bounds".to_string()))?
+      .set(key.clone())
+      .map_err(|_| Error::InvalidIndexFormat("node key already set".to_string()))?;
+    if self.key_to_node.insert(key, node).is_some() {
+      return Err(Error::InvalidIndexFormat("duplicate node key".to_string()));
+    }
+    Ok(())
+  }
+
+  pub(crate) fn legacy_set_node_level(&self, internal_id: u32, level: i32) -> Result<()> {
+    if level < 0 {
+      return Err(Error::InvalidIndexFormat("node level < 0".to_string()));
+    }
+    let node = NodeId::new(internal_id);
+    self.node_level[node.as_usize()].store(level, Ordering::Release);
+
+    if level == 0 {
+      return Ok(());
+    }
+
+    let words = (level as usize) * (1 + self.max_m);
+    let mut raw = Vec::with_capacity(words);
+    raw.resize_with(words, || AtomicU32::new(0));
+    self
+      .upper_links
+      .get(node.as_usize())
+      .ok_or_else(|| Error::InvalidIndexFormat("node out of bounds".to_string()))?
+      .set(raw.into_boxed_slice())
+      .map_err(|_| Error::InvalidIndexFormat("upper linklist already initialized".to_string()))?;
+    Ok(())
+  }
+
+  pub(crate) fn legacy_set_node_deleted(&self, internal_id: u32, deleted: bool) -> Result<()> {
+    let node = NodeId::new(internal_id);
+    let v = if deleted { 1 } else { 0 };
+    self.node_deleted[node.as_usize()].store(v, Ordering::Release);
+    Ok(())
+  }
+
+  pub(crate) fn legacy_set_neighbors(
+    &self,
+    internal_id: u32,
+    level: usize,
+    neighbors: &[u32],
+  ) -> Result<()> {
+    let node = NodeId::new(internal_id);
+    let cap = if level == 0 { self.max_m0 } else { self.max_m };
+    if neighbors.len() > cap {
+      return Err(Error::InvalidIndexFormat(
+        "neighbor list too large".to_string(),
+      ));
+    }
+    for &neighbor in neighbors {
+      if neighbor == internal_id {
+        return Err(Error::InvalidIndexFormat(
+          "self edge in neighbor list".to_string(),
+        ));
+      }
+      if neighbor as usize >= self.len() {
+        return Err(Error::InvalidIndexFormat(
+          "neighbor id out of bounds".to_string(),
+        ));
+      }
+    }
+
+    let block = if level == 0 {
+      self.level0_block(node)
+    } else {
+      self.upper_block(node, level)?
+    };
+    for (idx, &neighbor) in neighbors.iter().enumerate() {
+      block[1 + idx].store(neighbor, Ordering::Relaxed);
+    }
+    Self::set_neighbors_count(&block[0], neighbors.len())?;
+    Ok(())
+  }
+
+  pub(crate) fn legacy_finish_loading(
+    &self,
+    max_level: i32,
+    entry_point_internal_id: Option<u32>,
+    deleted_count: usize,
+  ) -> Result<()> {
+    let entry = entry_point_internal_id.unwrap_or(NODE_ID_NONE);
+    if entry != NODE_ID_NONE && entry as usize >= self.len() {
+      return Err(Error::InvalidIndexFormat(
+        "entry point out of bounds".to_string(),
+      ));
+    }
+    self.deleted_count.store(deleted_count, Ordering::Release);
+    self.max_level.store(max_level, Ordering::Release);
+    self.entry_point.store(entry, Ordering::Release);
+    Ok(())
+  }
+
+  pub fn to_data(&self) -> Result<HnswData<K>> {
+    let _mutation_guard = self.mutation_lock.write();
+
+    let len = self.len();
+    let max_level = self.max_level.load(Ordering::Acquire);
+    let entry_point = self.entry_point_node().map(|n| n.as_u32());
+
+    if len == 0 {
+      if entry_point.is_some() || max_level != -1 {
+        return Err(Error::InvalidIndexFormat(
+          "empty index has non-empty entry point/maxlevel".to_string(),
+        ));
+      }
+    } else {
+      let Some(entry) = entry_point else {
+        return Err(Error::InvalidIndexFormat(
+          "non-empty index missing entry point".to_string(),
+        ));
+      };
+      if entry as usize >= len {
+        return Err(Error::InvalidIndexFormat(
+          "entry point out of bounds".to_string(),
+        ));
+      }
+      if max_level < 0 {
+        return Err(Error::InvalidIndexFormat(
+          "non-empty index has maxlevel < 0".to_string(),
+        ));
+      }
+      let entry_level = self.node_level[entry as usize].load(Ordering::Acquire);
+      if entry_level != max_level {
+        return Err(Error::InvalidIndexFormat(
+          "entry point level != max_level".to_string(),
+        ));
+      }
+    }
+
+    let mut cfg = self.cfg.clone();
+    cfg.ef_search = self.ef_search.load(Ordering::Acquire);
+    cfg.m = self.max_m;
+    cfg.ef_construction = self.ef_construction;
+
+    #[derive(Debug)]
+    struct Chunk<K> {
+      keys: Vec<K>,
+      deleted: Vec<u8>,
+      levels: Vec<u32>,
+      neighbor_counts: Vec<u16>,
+      neighbors: Vec<u32>,
+      max_level: i32,
+    }
+
+    let threads = rayon::current_num_threads();
+    let desired_chunks = threads.saturating_mul(8).max(1);
+    let min_chunk = 16_384usize;
+    let chunk_size = (len / desired_chunks).max(min_chunk).max(1);
+    let chunk_count = len.div_ceil(chunk_size);
+
+    let chunks: Result<Vec<Chunk<K>>> = (0..chunk_count)
+      .into_par_iter()
+      .map(|chunk_idx| -> Result<Chunk<K>> {
+        let start = chunk_idx * chunk_size;
+        let end = (start + chunk_size).min(len);
+        let range_len = end - start;
+
+        let mut keys = Vec::with_capacity(range_len);
+        let mut deleted = Vec::with_capacity(range_len);
+        let mut levels = Vec::with_capacity(range_len);
+
+        let mut neighbor_counts = Vec::new();
+        let mut neighbors = Vec::new();
+
+        let mut max_level = -1i32;
+
+        for internal_id in start..end {
+          let node = NodeId::new(internal_id as u32);
+          keys.push(self.node_key(node)?.clone());
+
+          let is_deleted = self.is_deleted(node);
+          deleted.push(if is_deleted { 1 } else { 0 });
+
+          let level_i32 = self.node_level[internal_id].load(Ordering::Acquire);
+          if level_i32 < 0 {
+            return Err(Error::InvalidIndexFormat("node level < 0".to_string()));
+          }
+          max_level = max(max_level, level_i32);
+          let level_u32 = level_i32 as u32;
+          levels.push(level_u32);
+
+          for l in 0..=level_u32 as usize {
+            let list = self.neighbors_at_level(node, l)?;
+            let cnt: u16 = list
+              .len
+              .try_into()
+              .map_err(|_| Error::InvalidIndexFormat("neighbor list too large".to_string()))?;
+            neighbor_counts.push(cnt);
+            for neighbor in list {
+              neighbors.push(neighbor.as_u32());
+            }
+          }
+        }
+
+        Ok(Chunk {
+          keys,
+          deleted,
+          levels,
+          neighbor_counts,
+          neighbors,
+          max_level,
+        })
+      })
+      .collect();
+    let chunks = chunks?;
+
+    let total_neighbor_counts: usize = chunks.iter().map(|c| c.neighbor_counts.len()).sum();
+    let total_neighbors: usize = chunks.iter().map(|c| c.neighbors.len()).sum();
+
+    let mut keys = Vec::with_capacity(len);
+    let mut deleted = Vec::with_capacity(len);
+    let mut levels = Vec::with_capacity(len);
+    let mut neighbor_counts = Vec::with_capacity(total_neighbor_counts);
+    let mut neighbors = Vec::with_capacity(total_neighbors);
+
+    let mut computed_max_level = -1i32;
+    for chunk in chunks {
+      computed_max_level = max(computed_max_level, chunk.max_level);
+      keys.extend(chunk.keys);
+      deleted.extend(chunk.deleted);
+      levels.extend(chunk.levels);
+      neighbor_counts.extend(chunk.neighbor_counts);
+      neighbors.extend(chunk.neighbors);
+    }
+
+    if computed_max_level != max_level {
+      return Err(Error::InvalidIndexFormat(
+        "max_level does not match node levels".to_string(),
+      ));
+    }
+
+    if keys.len() != len || deleted.len() != len || levels.len() != len {
+      return Err(Error::InvalidIndexFormat(
+        "serialized node arrays have mismatched lengths".to_string(),
+      ));
+    }
+
+    let expected_neighbor_count_entries: usize = levels
+      .iter()
+      .try_fold(0usize, |acc, &level| acc.checked_add(level as usize + 1))
+      .ok_or_else(|| Error::InvalidIndexFormat("neighbor counts overflow".to_string()))?;
+    if neighbor_counts.len() != expected_neighbor_count_entries {
+      return Err(Error::InvalidIndexFormat(
+        "neighbor list counts length mismatch".to_string(),
+      ));
+    }
+
+    let expected_neighbors_len: usize = neighbor_counts
+      .iter()
+      .try_fold(0usize, |acc, &cnt| acc.checked_add(cnt as usize))
+      .ok_or_else(|| Error::InvalidIndexFormat("neighbors overflow".to_string()))?;
+    if neighbors.len() != expected_neighbors_len {
+      return Err(Error::InvalidIndexFormat(
+        "neighbor ids length mismatch".to_string(),
+      ));
+    }
+
+    Ok(HnswData {
+      version: HNSW_DATA_VERSION,
+      cfg,
+      entry_point,
+      max_level,
+      keys,
+      deleted,
+      levels,
+      neighbor_counts,
+      neighbors,
+    })
+  }
+
+  pub fn from_data(metric: M, data: HnswData<K>) -> Result<Self> {
+    if data.version != HNSW_DATA_VERSION {
+      return Err(Error::InvalidIndexFormat(format!(
+        "unsupported hnsw data version {}",
+        data.version
+      )));
+    }
+    if data.cfg.dim == 0 {
+      return Err(Error::InvalidIndexFormat("dim must be > 0".to_string()));
+    }
+    if data.cfg.m < 2 {
+      return Err(Error::InvalidIndexFormat("m must be >= 2".to_string()));
+    }
+    if data.keys.len() > data.cfg.max_nodes {
+      return Err(Error::InvalidIndexFormat(
+        "node count > max_nodes".to_string(),
+      ));
+    }
+    if data.cfg.max_nodes > u32::MAX as usize {
+      return Err(Error::InvalidIndexFormat(
+        "max_nodes exceeds u32::MAX".to_string(),
+      ));
+    }
+
+    let node_count = data.keys.len();
+    if data.deleted.len() != node_count || data.levels.len() != node_count {
+      return Err(Error::InvalidIndexFormat(
+        "serialized node arrays have mismatched lengths".to_string(),
+      ));
+    }
+    for &d in &data.deleted {
+      if d > 1 {
+        return Err(Error::InvalidIndexFormat(
+          "deleted flag is not 0/1".to_string(),
+        ));
+      }
+    }
+
+    if node_count == 0 {
+      if data.entry_point.is_some() || data.max_level != -1 {
+        return Err(Error::InvalidIndexFormat(
+          "empty index has non-empty entry point/maxlevel".to_string(),
+        ));
+      }
+      if !data.neighbor_counts.is_empty() || !data.neighbors.is_empty() {
+        return Err(Error::InvalidIndexFormat(
+          "empty index has non-empty neighbor data".to_string(),
+        ));
+      }
+    } else {
+      let Some(ep) = data.entry_point else {
+        return Err(Error::InvalidIndexFormat(
+          "non-empty index missing entry point".to_string(),
+        ));
+      };
+      if ep as usize >= node_count {
+        return Err(Error::InvalidIndexFormat(
+          "entry point out of bounds".to_string(),
+        ));
+      }
+      if data.max_level < 0 {
+        return Err(Error::InvalidIndexFormat(
+          "non-empty index has maxlevel < 0".to_string(),
+        ));
+      }
+    }
+
+    let mut max_node_level: i32 = -1;
+    for &level in &data.levels {
+      if level > i32::MAX as u32 {
+        return Err(Error::InvalidIndexFormat(
+          "node level too large".to_string(),
+        ));
+      }
+      max_node_level = max(max_node_level, level as i32);
+    }
+
+    if node_count > 0 && data.max_level != max_node_level {
+      return Err(Error::InvalidIndexFormat(
+        "max_level does not match node levels".to_string(),
+      ));
+    }
+    if let Some(ep) = data.entry_point {
+      if data.levels[ep as usize] as i32 != data.max_level {
+        return Err(Error::InvalidIndexFormat(
+          "entry point level != max_level".to_string(),
+        ));
+      }
+    }
+
+    let m_capped = data.cfg.m.min(10_000);
+    let max_m = m_capped;
+    let max_m0 = m_capped
+      .checked_mul(2)
+      .ok_or_else(|| Error::InvalidIndexFormat("max_m0 overflow".to_string()))?;
+
+    let expected_neighbor_count_entries: usize = data
+      .levels
+      .iter()
+      .try_fold(0usize, |acc, &level| acc.checked_add(level as usize + 1))
+      .ok_or_else(|| Error::InvalidIndexFormat("neighbor counts overflow".to_string()))?;
+    if data.neighbor_counts.len() != expected_neighbor_count_entries {
+      return Err(Error::InvalidIndexFormat(
+        "neighbor list counts length mismatch".to_string(),
+      ));
+    }
+
+    let expected_neighbors_len: usize = data
+      .neighbor_counts
+      .iter()
+      .try_fold(0usize, |acc, &cnt| acc.checked_add(cnt as usize))
+      .ok_or_else(|| Error::InvalidIndexFormat("neighbors overflow".to_string()))?;
+    if data.neighbors.len() != expected_neighbors_len {
+      return Err(Error::InvalidIndexFormat(
+        "neighbor ids length mismatch".to_string(),
+      ));
+    }
+
+    let mut list_idx = 0usize;
+    let mut neighbor_idx = 0usize;
+    let mut seen = HashSet::<u32>::new();
+
+    for (internal_id, &level_u32) in data.levels.iter().enumerate() {
+      for level in 0..=level_u32 as usize {
+        let cnt = data
+          .neighbor_counts
+          .get(list_idx)
+          .copied()
+          .ok_or_else(|| Error::InvalidIndexFormat("neighbor counts out of bounds".to_string()))?
+          as usize;
+        list_idx += 1;
+
+        let cap = if level == 0 { max_m0 } else { max_m };
+        if cnt > cap {
+          return Err(Error::InvalidIndexFormat(
+            "neighbor list too large".to_string(),
+          ));
+        }
+
+        let slice = data
+          .neighbors
+          .get(neighbor_idx..neighbor_idx + cnt)
+          .ok_or_else(|| Error::InvalidIndexFormat("neighbor ids out of bounds".to_string()))?;
+        neighbor_idx += cnt;
+
+        seen.clear();
+        for &neighbor in slice {
+          if neighbor == internal_id as u32 {
+            return Err(Error::InvalidIndexFormat(
+              "self edge in neighbor list".to_string(),
+            ));
+          }
+          if neighbor as usize >= node_count {
+            return Err(Error::InvalidIndexFormat(
+              "neighbor id out of bounds".to_string(),
+            ));
+          }
+          if data.levels[neighbor as usize] < level as u32 {
+            return Err(Error::InvalidIndexFormat(
+              "neighbor does not exist at level".to_string(),
+            ));
+          }
+          if !seen.insert(neighbor) {
+            return Err(Error::InvalidIndexFormat(
+              "duplicate neighbor in list".to_string(),
+            ));
+          }
+        }
+      }
+    }
+    debug_assert_eq!(list_idx, data.neighbor_counts.len());
+    debug_assert_eq!(neighbor_idx, data.neighbors.len());
+
+    let h = Self::new(metric, data.cfg);
+    h.legacy_start_loading(node_count)?;
+
+    let mut deleted_count = 0usize;
+    for internal_id in 0..node_count {
+      let deleted = data.deleted[internal_id] != 0;
+      if deleted {
+        deleted_count += 1;
+      }
+      h.legacy_set_node_key(internal_id as u32, data.keys[internal_id].clone())?;
+      h.legacy_set_node_level(internal_id as u32, data.levels[internal_id] as i32)?;
+      h.legacy_set_node_deleted(internal_id as u32, deleted)?;
+    }
+
+    let mut list_idx = 0usize;
+    let mut neighbor_idx = 0usize;
+    for internal_id in 0..node_count {
+      for level in 0..=data.levels[internal_id] as usize {
+        let cnt = data.neighbor_counts[list_idx] as usize;
+        list_idx += 1;
+        let slice = &data.neighbors[neighbor_idx..neighbor_idx + cnt];
+        neighbor_idx += cnt;
+        h.legacy_set_neighbors(internal_id as u32, level, slice)?;
+      }
+    }
+    debug_assert_eq!(list_idx, data.neighbor_counts.len());
+    debug_assert_eq!(neighbor_idx, data.neighbors.len());
+
+    h.legacy_finish_loading(data.max_level, data.entry_point, deleted_count)?;
+    Ok(h)
+  }
+
+  pub fn insert<V: VectorStoreMut>(&self, vectors: &V, key: K, vector: &[f32]) -> Result<()> {
+    if vector.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
-        expected: self.space.dim(),
-        actual: data_point.len(),
+        expected: self.cfg.dim,
+        actual: vector.len(),
       });
     }
 
     let _mutation_guard = self.mutation_lock.read();
-    let _label_lock = self.label_op_lock(label).lock();
+    let _key_guard = self.key_lock(&key).lock();
 
-    {
-      let label_lookup = self.label_lookup.lock();
-      if label_lookup.contains_key(&label) {
-        drop(label_lookup);
-        return self.add_point_at_level(data_point, label, None);
-      }
+    if self.key_to_node.contains_key(&key) {
+      return Err(Error::KeyAlreadyExists);
     }
 
-    let internal_id_replaced = {
-      let mut deleted = self.deleted_elements.lock();
-      deleted.iter().next().copied().map(|id| {
-        deleted.remove(&id);
-        id
-      })
-    };
+    let node = self.alloc_node()?;
+    // Store the vector before publishing the node into the graph.
+    vectors.set(node, vector)?;
+    self
+      .node_keys
+      .get(node.as_usize())
+      .ok_or_else(|| Error::InvalidIndexFormat("node out of bounds".to_string()))?
+      .set(key.clone())
+      .map_err(|_| Error::InvalidIndexFormat("node key already set".to_string()))?;
+    self.node_deleted[node.as_usize()].store(0, Ordering::Release);
+    self.key_to_node.insert(key, node);
 
-    let Some(internal_id_replaced) = internal_id_replaced else {
-      return self.add_point_at_level(data_point, label, None);
-    };
-
-    let label_replaced = self.get_external_label(internal_id_replaced)?;
-    self.labels[internal_id_replaced as usize].store(label, Ordering::Release);
-
-    {
-      let mut label_lookup = self.label_lookup.lock();
-      label_lookup.remove(&label_replaced);
-      label_lookup.insert(label, internal_id_replaced);
-    }
-
-    self.unmark_deleted_internal(internal_id_replaced)?;
-    self.update_point(data_point, internal_id_replaced, 1.0)?;
-
-    Ok(internal_id_replaced)
+    self.add_point_at_level(vectors, node, None)?;
+    Ok(())
   }
 
-  fn search_base_layer_st<const BARE_BONE: bool>(
-    &self,
-    ep_id: TableInt,
-    query: &[f32],
-    ef: usize,
-    filter: Option<&dyn Fn(LabelType) -> bool>,
-  ) -> Result<BinaryHeap<(OrderedFloat<f32>, TableInt)>> {
-    let mut visited = self.visited_list_pool.get();
-    let visited_tag = visited.tag;
-    let visited_mass = visited.mass_mut();
-
-    let mut top_candidates: BinaryHeap<(OrderedFloat<f32>, TableInt)> = BinaryHeap::new();
-    let mut candidate_set: BinaryHeap<(OrderedFloat<f32>, TableInt)> = BinaryHeap::new();
-
-    let mut lower_bound;
-    let ep_label = self.get_external_label(ep_id)?;
-    if BARE_BONE || (!self.is_marked_deleted_internal(ep_id) && label_allowed(filter, ep_label)) {
-      let dist = self.distance_query_to_internal(query, ep_id)?;
-      lower_bound = dist;
-      top_candidates.push((OrderedFloat(dist), ep_id));
-      candidate_set.push((OrderedFloat(-dist), ep_id));
-    } else {
-      lower_bound = f32::INFINITY;
-      candidate_set.push((OrderedFloat(-lower_bound), ep_id));
-    }
-
-    visited_mass[ep_id as usize] = visited_tag;
-
-    while let Some((neg_dist, current_node_id)) = candidate_set.pop() {
-      let candidate_dist = -neg_dist.0;
-
-      let flag_stop_search = if BARE_BONE {
-        candidate_dist > lower_bound
-      } else {
-        candidate_dist > lower_bound && top_candidates.len() == ef
-      };
-      if flag_stop_search {
-        break;
-      }
-
-      for candidate_id in self.linklist_at_level(current_node_id, 0)? {
-        if visited_mass[candidate_id as usize] == visited_tag {
-          continue;
-        }
-        visited_mass[candidate_id as usize] = visited_tag;
-
-        let dist = self.distance_query_to_internal(query, candidate_id)?;
-        let flag_consider_candidate = top_candidates.len() < ef || lower_bound > dist;
-        if !flag_consider_candidate {
-          continue;
-        }
-
-        candidate_set.push((OrderedFloat(-dist), candidate_id));
-
-        if BARE_BONE {
-          top_candidates.push((OrderedFloat(dist), candidate_id));
-        } else {
-          let cand_label = self.get_external_label(candidate_id)?;
-          if !self.is_marked_deleted_internal(candidate_id) && label_allowed(filter, cand_label) {
-            top_candidates.push((OrderedFloat(dist), candidate_id));
-          }
-        }
-
-        while top_candidates.len() > ef {
-          top_candidates.pop();
-        }
-        if let Some((worst, _)) = top_candidates.peek() {
-          lower_bound = worst.0;
-        }
-      }
-    }
-
-    Ok(top_candidates)
-  }
-
-  fn search_base_layer_st_stop_condition(
-    &self,
-    ep_id: TableInt,
-    query: &[f32],
-    filter: Option<&dyn Fn(LabelType) -> bool>,
-    stop_condition: &mut dyn SearchStopCondition,
-  ) -> Result<BinaryHeap<(OrderedFloat<f32>, TableInt)>> {
-    let mut visited = self.visited_list_pool.get();
-    let visited_tag = visited.tag;
-    let visited_mass = visited.mass_mut();
-
-    let mut top_candidates: BinaryHeap<(OrderedFloat<f32>, TableInt)> = BinaryHeap::new();
-    let mut candidate_set: BinaryHeap<(OrderedFloat<f32>, TableInt)> = BinaryHeap::new();
-
-    let mut lower_bound;
-    let ep_label = self.get_external_label(ep_id)?;
-    if !self.is_marked_deleted_internal(ep_id) && label_allowed(filter, ep_label) {
-      let ep_data = self.vector_guard(ep_id)?;
-      let ep_data = ep_data
-        .as_ref()
-        .ok_or_else(|| Error::InvalidIndexFormat("missing vector".to_string()))?;
-      let dist = self.space.distance(query, ep_data.as_slice());
-      lower_bound = dist;
-      top_candidates.push((OrderedFloat(dist), ep_id));
-      stop_condition.add_point_to_result(ep_label, ep_data.as_slice(), dist);
-      candidate_set.push((OrderedFloat(-dist), ep_id));
-    } else {
-      lower_bound = f32::INFINITY;
-      candidate_set.push((OrderedFloat(-lower_bound), ep_id));
-    }
-
-    visited_mass[ep_id as usize] = visited_tag;
-
-    while let Some((neg_dist, current_node_id)) = candidate_set.pop() {
-      let candidate_dist = -neg_dist.0;
-      if stop_condition.should_stop_search(candidate_dist, lower_bound) {
-        break;
-      }
-
-      for candidate_id in self.linklist_at_level(current_node_id, 0)? {
-        if visited_mass[candidate_id as usize] == visited_tag {
-          continue;
-        }
-        visited_mass[candidate_id as usize] = visited_tag;
-
-        let cand_data = self.vector_guard(candidate_id)?;
-        let cand_data = cand_data
-          .as_ref()
-          .ok_or_else(|| Error::InvalidIndexFormat("missing vector".to_string()))?;
-        let dist = self.space.distance(query, cand_data.as_slice());
-
-        if !stop_condition.should_consider_candidate(dist, lower_bound) {
-          continue;
-        }
-
-        candidate_set.push((OrderedFloat(-dist), candidate_id));
-
-        let cand_label = self.get_external_label(candidate_id)?;
-        if !self.is_marked_deleted_internal(candidate_id) && label_allowed(filter, cand_label) {
-          top_candidates.push((OrderedFloat(dist), candidate_id));
-          stop_condition.add_point_to_result(cand_label, cand_data.as_slice(), dist);
-        }
-
-        while stop_condition.should_remove_extra() {
-          let Some((dist, id)) = top_candidates.pop() else {
-            break;
-          };
-          let label = self.get_external_label(id)?;
-          let data = self.vector_guard(id)?;
-          let data = data
-            .as_ref()
-            .ok_or_else(|| Error::InvalidIndexFormat("missing vector".to_string()))?;
-          stop_condition.remove_point_from_result(label, data.as_slice(), dist.0);
-        }
-
-        if let Some((worst, _)) = top_candidates.peek() {
-          lower_bound = worst.0;
-        }
-      }
-    }
-
-    Ok(top_candidates)
-  }
-
-  pub fn search_stop_condition_closest(
-    &self,
-    query: &[f32],
-    stop_condition: &mut dyn SearchStopCondition,
-    filter: Option<&dyn Fn(LabelType) -> bool>,
-  ) -> Result<Vec<(LabelType, f32)>> {
-    if query.len() != self.space.dim() {
+  pub fn set<V: VectorStoreMut>(&self, vectors: &V, key: K, vector: &[f32]) -> Result<SetOutcome> {
+    if vector.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
-        expected: self.space.dim(),
-        actual: query.len(),
+        expected: self.cfg.dim,
+        actual: vector.len(),
       });
     }
-    if self.get_current_element_count() == 0 {
-      return Ok(Vec::new());
+
+    let _mutation_guard = self.mutation_lock.read();
+    let _key_guard = self.key_lock(&key).lock();
+
+    if let Some(existing) = self.key_to_node.get(&key).map(|e| *e.value()) {
+      vectors.set(existing, vector)?;
+      let resurrected = self.unmark_deleted(existing)?;
+      self.update_point(vectors, existing, 1.0)?;
+      return Ok(if resurrected {
+        SetOutcome::Resurrected
+      } else {
+        SetOutcome::Updated
+      });
     }
 
-    let mut curr_obj = self.enter_point_node().ok_or(Error::EmptyIndex)?;
-    let mut cur_dist = self.distance_query_to_internal(query, curr_obj)?;
+    let node = self.alloc_node()?;
+    vectors.set(node, vector)?;
+    self
+      .node_keys
+      .get(node.as_usize())
+      .ok_or_else(|| Error::InvalidIndexFormat("node out of bounds".to_string()))?
+      .set(key.clone())
+      .map_err(|_| Error::InvalidIndexFormat("node key already set".to_string()))?;
+    self.node_deleted[node.as_usize()].store(0, Ordering::Release);
+    self.key_to_node.insert(key, node);
+    self.add_point_at_level(vectors, node, None)?;
 
-    let max_level = self.max_level.load(Ordering::Acquire);
-    for level in (1..=max_level.max(0) as usize).rev() {
-      let mut changed = true;
-      while changed {
-        changed = false;
-        for cand in self.linklist_at_level(curr_obj, level)? {
-          let d = self.distance_query_to_internal(query, cand)?;
-          if d < cur_dist {
-            cur_dist = d;
-            curr_obj = cand;
-            changed = true;
-          }
-        }
-      }
-    }
-
-    let mut top_candidates =
-      self.search_base_layer_st_stop_condition(curr_obj, query, filter, stop_condition)?;
-
-    let mut result: Vec<(LabelType, f32)> = Vec::with_capacity(top_candidates.len());
-    while let Some((dist, id)) = top_candidates.pop() {
-      result.push((self.get_external_label(id)?, dist.0));
-    }
-    result.reverse();
-    stop_condition.filter_results(&mut result);
-    Ok(result)
+    Ok(SetOutcome::Inserted)
   }
 
-  pub fn search_knn(
+  pub fn delete(&self, key: &K) -> Result<bool> {
+    let _mutation_guard = self.mutation_lock.read();
+    let _key_guard = self.key_lock(key).lock();
+    let Some(node) = self.key_to_node.get(key).map(|e| *e.value()) else {
+      return Ok(false);
+    };
+    if self.is_deleted(node) {
+      return Ok(false);
+    }
+    self.mark_deleted(node)?;
+    Ok(true)
+  }
+
+  pub fn search<V: VectorStore>(
     &self,
+    vectors: &V,
     query: &[f32],
     k: usize,
-    filter: Option<&dyn Fn(LabelType) -> bool>,
-  ) -> Result<Vec<(LabelType, f32)>> {
-    if query.len() != self.space.dim() {
+    filter: Option<&dyn Fn(&K) -> bool>,
+  ) -> Result<Vec<SearchHit<K>>> {
+    if query.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
-        expected: self.space.dim(),
+        expected: self.cfg.dim,
         actual: query.len(),
       });
     }
-    if self.get_current_element_count() == 0 {
-      return Ok(Vec::new());
-    }
 
-    let mut curr_obj = self.enter_point_node().ok_or(Error::EmptyIndex)?;
-    let mut cur_dist = self.distance_query_to_internal(query, curr_obj)?;
+    let _mutation_guard = self.mutation_lock.read();
 
+    let entry = self.entry_point_node().ok_or(Error::EmptyIndex)?;
     let max_level = self.max_level.load(Ordering::Acquire);
+
+    let mut curr = entry;
+    let mut curdist = self.distance_query_to_node(vectors, query, curr)?;
+
     for level in (1..=max_level.max(0) as usize).rev() {
       let mut changed = true;
       while changed {
         changed = false;
-        for cand in self.linklist_at_level(curr_obj, level)? {
-          let d = self.distance_query_to_internal(query, cand)?;
-          if d < cur_dist {
-            cur_dist = d;
-            curr_obj = cand;
+        for cand in self.neighbors_at_level(curr, level)? {
+          let d = self.distance_query_to_node(vectors, query, cand)?;
+          if d < curdist {
+            curdist = d;
+            curr = cand;
             changed = true;
           }
         }
       }
     }
 
-    let ef = max(self.ef.load(Ordering::Acquire), k);
-    let bare_bone_search = self.get_deleted_count() == 0 && filter.is_none();
-    let mut top_candidates = if bare_bone_search {
-      self.search_base_layer_st::<true>(curr_obj, query, ef, filter)?
-    } else {
-      self.search_base_layer_st::<false>(curr_obj, query, ef, filter)?
-    };
-
-    while top_candidates.len() > k {
-      top_candidates.pop();
-    }
-
-    let mut res = Vec::with_capacity(top_candidates.len());
-    while let Some((dist, id)) = top_candidates.pop() {
-      res.push((self.get_external_label(id)?, dist.0));
-    }
-    res.reverse();
-    Ok(res)
-  }
-
-  pub fn resize_index(&mut self, new_max_elements: usize) -> Result<()> {
-    let _mutation_guard = self.mutation_lock.write();
-
-    let cur_count = self.cur_element_count.load(Ordering::Acquire);
-    if new_max_elements < cur_count {
-      return Err(Error::InvalidIndexFormat(
-        "Cannot resize, max element is less than the current number of elements".to_string(),
-      ));
-    }
-    if new_max_elements > TableInt::MAX as usize {
-      return Err(Error::InvalidIndexFormat(
-        "new_max_elements exceeds internal id range".to_string(),
-      ));
-    }
-
-    self.max_elements = new_max_elements;
-    self.visited_list_pool.resize(1, new_max_elements);
-
-    self
-      .element_levels
-      .resize_with(new_max_elements, || AtomicI32::new(0));
-    self.labels.resize_with(new_max_elements, || AtomicUsize::new(0));
-    self.vectors.resize_with(new_max_elements, ArcSwapOption::empty);
-    self
-      .link_list_locks
-      .resize_with(new_max_elements, || Mutex::new(()));
-
-    let words_per_element = 1 + self.max_m0;
-    self.level0_links.resize_with(
-      new_max_elements * words_per_element,
-      || AtomicU32::new(0),
-    );
-
-    self.link_lists.resize_with(new_max_elements, OnceLock::new);
-    Ok(())
-  }
-
-  pub fn index_file_size(&self) -> usize {
-    let _mutation_guard = self.mutation_lock.write();
-    let cur_element_count = self.cur_element_count.load(Ordering::Acquire);
-
-    let size_links_level0 = (1 + self.max_m0) * size_of::<u32>();
-    let size_data = self.space.dim() * size_of::<f32>();
-    let size_data_per_element = size_links_level0 + size_data + size_of::<LabelType>();
-    let size_links_per_element = (1 + self.max_m) * size_of::<u32>();
-
-    let mut size = 0usize;
-    size += size_of::<usize>(); // offsetLevel0
-    size += size_of::<usize>(); // max_elements
-    size += size_of::<usize>(); // cur_element_count
-    size += size_of::<usize>(); // size_data_per_element
-    size += size_of::<usize>(); // label_offset
-    size += size_of::<usize>(); // offsetData
-    size += size_of::<i32>(); // maxlevel
-    size += size_of::<u32>(); // enterpoint_node
-    size += size_of::<usize>(); // maxM
-    size += size_of::<usize>(); // maxM0
-    size += size_of::<usize>(); // M
-    size += size_of::<f64>(); // mult
-    size += size_of::<usize>(); // ef_construction
-
-    size += cur_element_count * size_data_per_element;
-
-    for i in 0..cur_element_count {
-      let level = self.element_levels[i].load(Ordering::Acquire);
-      let link_list_size = if level > 0 {
-        size_links_per_element * (level as usize)
-      } else {
-        0
-      };
-      size += size_of::<u32>();
-      size += link_list_size;
-    }
-    size
-  }
-
-  pub fn save_to_writer(&self, mut w: impl Write) -> Result<()> {
-    let _mutation_guard = self.mutation_lock.write();
-
-    let cur_element_count = self.cur_element_count.load(Ordering::Acquire);
-    let max_level = self.max_level.load(Ordering::Acquire);
-    let enter_point_raw = self.enter_point_node.load(Ordering::Acquire);
-
-    let size_links_level0 = (1 + self.max_m0) * size_of::<u32>();
-    let data_size = self.space.dim() * size_of::<f32>();
-    let size_data_per_element = size_links_level0 + data_size + size_of::<LabelType>();
-    let label_offset = size_links_level0 + data_size;
-    let offset_data = size_links_level0;
-
-    w.write_all(&0usize.to_le_bytes())?;
-    w.write_all(&self.max_elements.to_le_bytes())?;
-    w.write_all(&cur_element_count.to_le_bytes())?;
-    w.write_all(&size_data_per_element.to_le_bytes())?;
-    w.write_all(&label_offset.to_le_bytes())?;
-    w.write_all(&offset_data.to_le_bytes())?;
-    w.write_all(&max_level.to_le_bytes())?;
-    w.write_all(&enter_point_raw.to_le_bytes())?;
-    w.write_all(&self.max_m.to_le_bytes())?;
-    w.write_all(&self.max_m0.to_le_bytes())?;
-    w.write_all(&self.m.to_le_bytes())?;
-    w.write_all(&self.mult.to_le_bytes())?;
-    w.write_all(&self.ef_construction.to_le_bytes())?;
-
-    let words_per_element = 1 + self.max_m0;
-    let dim = self.space.dim();
-    let mut level0_buf: Vec<u32> = vec![0u32; words_per_element];
-    for i in 0..cur_element_count {
-      let start = i * words_per_element;
-      let end = start + words_per_element;
-      for (dst, src) in level0_buf
-        .iter_mut()
-        .zip(self.level0_links[start..end].iter())
-      {
-        *dst = src.load(Ordering::Acquire);
+    let ef = max(k + 1, self.ef_search.load(Ordering::Acquire));
+    let top_candidates = self.search_base_layer(vectors, curr, query, 0, ef, filter)?;
+    let mut out = Vec::with_capacity(k);
+    for (dist, node) in top_candidates.into_sorted_vec() {
+      if out.len() >= k {
+        break;
       }
-      w.write_all(bytemuck::cast_slice(&level0_buf))?;
-
-      let v = self.vectors[i].load();
-      let v = v
-        .as_ref()
-        .ok_or_else(|| Error::InvalidIndexFormat("missing vector".to_string()))?;
-      if v.len() != dim {
-        return Err(Error::InvalidIndexFormat(
-          "vector dimension mismatch".to_string(),
-        ));
+      if self.is_deleted(node) {
+        continue;
       }
-      w.write_all(bytemuck::cast_slice(v.as_slice()))?;
-
-      let label = self.labels[i].load(Ordering::Acquire);
-      w.write_all(&label.to_le_bytes())?;
-    }
-
-    let words_per_level = 1 + self.max_m;
-    let mut upper_buf: Vec<u32> = Vec::new();
-    for i in 0..cur_element_count {
-      let level = self.element_levels[i].load(Ordering::Acquire);
-      let link_list_size = if level > 0 {
-        (words_per_level * level as usize * size_of::<u32>()) as u32
-      } else {
-        0u32
-      };
-      w.write_all(&link_list_size.to_le_bytes())?;
-      if link_list_size != 0 {
-        let Some(raw) = self.link_lists[i].get() else {
-          return Err(Error::InvalidIndexFormat("missing linklist".to_string()));
-        };
-        if raw.len() != words_per_level * (level as usize) {
-          return Err(Error::InvalidIndexFormat(
-            "linklist size mismatch".to_string(),
-          ));
-        }
-        upper_buf.resize(raw.len(), 0u32);
-        for (dst, src) in upper_buf.iter_mut().zip(raw.iter()) {
-          *dst = src.load(Ordering::Acquire);
-        }
-        w.write_all(bytemuck::cast_slice(&upper_buf))?;
+      let key = self.node_key(node)?;
+      if filter.map(|f| f(key)).unwrap_or(true) {
+        out.push(SearchHit {
+          key: key.clone(),
+          distance: dist.0,
+        });
       }
     }
-
-    Ok(())
-  }
-
-  pub fn save_to_vec(&self) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(self.index_file_size());
-    self.save_to_writer(&mut out)?;
     Ok(out)
   }
 
-  pub fn load_from_reader(space: S, mut r: impl Read, max_elements: Option<usize>) -> Result<Self> {
-    Self::load_from_reader_with_options(space, &mut r, max_elements, 100, false)
+  pub fn entry_key(&self) -> Result<K> {
+    let entry = self.entry_point_node().ok_or(Error::EmptyIndex)?;
+    Ok(self.node_key(entry)?.clone())
   }
 
-  pub fn load_from_reader_with_options(
-    space: S,
-    mut r: impl Read,
-    max_elements: Option<usize>,
-    random_seed: u64,
-    allow_replace_deleted: bool,
-  ) -> Result<Self> {
-    let mut buf = Vec::new();
-    r.read_to_end(&mut buf)?;
-    Self::load_from_bytes_with_options(
-      space,
-      &buf,
-      max_elements,
-      random_seed,
-      allow_replace_deleted,
-    )
+  pub fn keys(&self) -> Vec<K> {
+    let len = self.len();
+    let mut out = Vec::with_capacity(len);
+    for internal_id in 0..len {
+      if let Some(key) = self.node_keys[internal_id].get() {
+        out.push(key.clone());
+      }
+    }
+    out
   }
 
-  pub fn load_from_bytes(space: S, data: &[u8], max_elements: Option<usize>) -> Result<Self> {
-    Self::load_from_bytes_with_options(space, data, max_elements, 100, false)
+  pub fn node_id(&self, key: &K) -> Result<NodeId> {
+    self
+      .key_to_node
+      .get(key)
+      .map(|e| *e.value())
+      .ok_or(Error::KeyNotFound)
   }
 
-  pub fn load_from_bytes_with_options(
-    space: S,
-    data: &[u8],
-    max_elements: Option<usize>,
-    random_seed: u64,
-    allow_replace_deleted: bool,
-  ) -> Result<Self> {
-    let mut rd = &*data;
-
-    let read_usize = |rd: &mut &[u8]| -> Result<usize> {
-      if rd.len() < size_of::<usize>() {
-        return Err(Error::InvalidIndexFormat("unexpected EOF".to_string()));
-      }
-      let (bytes, rest) = rd.split_at(size_of::<usize>());
-      *rd = rest;
-      Ok(usize::from_le_bytes(bytes.try_into().unwrap()))
-    };
-
-    let read_i32 = |rd: &mut &[u8]| -> Result<i32> {
-      if rd.len() < 4 {
-        return Err(Error::InvalidIndexFormat("unexpected EOF".to_string()));
-      }
-      let (bytes, rest) = rd.split_at(4);
-      *rd = rest;
-      Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
-    };
-
-    let read_u32 = |rd: &mut &[u8]| -> Result<u32> {
-      if rd.len() < 4 {
-        return Err(Error::InvalidIndexFormat("unexpected EOF".to_string()));
-      }
-      let (bytes, rest) = rd.split_at(4);
-      *rd = rest;
-      Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
-    };
-
-    let read_f64 = |rd: &mut &[u8]| -> Result<f64> {
-      if rd.len() < 8 {
-        return Err(Error::InvalidIndexFormat("unexpected EOF".to_string()));
-      }
-      let (bytes, rest) = rd.split_at(8);
-      *rd = rest;
-      Ok(f64::from_le_bytes(bytes.try_into().unwrap()))
-    };
-
-    let offset_level0 = read_usize(&mut rd)?;
-    let file_max_elements = read_usize(&mut rd)?;
-    let cur_element_count = read_usize(&mut rd)?;
-
-    let mut max_elements = max_elements.unwrap_or(0);
-    if max_elements < cur_element_count {
-      max_elements = file_max_elements;
-    }
-
-    let size_data_per_element = read_usize(&mut rd)?;
-    let label_offset = read_usize(&mut rd)?;
-    let offset_data = read_usize(&mut rd)?;
-    let max_level = read_i32(&mut rd)?;
-    let enter_point_raw = read_u32(&mut rd)?;
-    let max_m = read_usize(&mut rd)?;
-    let max_m0 = read_usize(&mut rd)?;
-    let m = read_usize(&mut rd)?;
-    let mult = read_f64(&mut rd)?;
-    let ef_construction = read_usize(&mut rd)?;
-
-    if m < 2 {
-      return Err(Error::InvalidIndexFormat("invalid M".to_string()));
-    }
-
-    if offset_level0 != 0 {
-      return Err(Error::InvalidIndexFormat(format!(
-        "unsupported offset_level0={offset_level0}"
-      )));
-    }
-    if cur_element_count > max_elements {
-      return Err(Error::InvalidIndexFormat(
-        "cur_element_count > max_elements".to_string(),
-      ));
-    }
-
-    let dim = space.dim();
-    let expected_data_size = dim * size_of::<f32>();
-    if offset_data + expected_data_size + size_of::<LabelType>() != size_data_per_element {
-      return Err(Error::InvalidIndexFormat(
-        "incompatible dimension for index".to_string(),
-      ));
-    }
-    if label_offset != offset_data + expected_data_size {
-      return Err(Error::InvalidIndexFormat(
-        "unexpected label_offset".to_string(),
-      ));
-    }
-
-    let max_m_expected = m;
-    if max_m != max_m_expected {
-      // hnswlib stores both `maxM_` and `M_` in the header, and they are typically equal.
-      // Be strict for now to avoid subtle incompatibilities.
-      return Err(Error::InvalidIndexFormat(
-        "unsupported: maxM != M".to_string(),
-      ));
-    }
-
-    if max_m0 != m.saturating_mul(2) {
-      return Err(Error::InvalidIndexFormat(
-        "unsupported: maxM0 != 2*M".to_string(),
-      ));
-    }
-
-    let mut idx = Self::new(
-      space,
-      max_elements,
-      m,
-      ef_construction,
-      random_seed,
-      allow_replace_deleted,
-    );
-    idx.mult = mult;
-    idx.rev_size = 1.0 / mult;
-    idx.max_level.store(max_level, Ordering::Release);
-    idx.enter_point_node.store(enter_point_raw, Ordering::Release);
-    idx.ef.store(10, Ordering::Release);
-    idx.cur_element_count
-      .store(cur_element_count, Ordering::Release);
-
-    let words_per_element = 1 + idx.max_m0;
-    let bytes_per_element_links = words_per_element * size_of::<u32>();
-
-    {
-      let mut label_lookup = idx.label_lookup.lock();
-      for i in 0..cur_element_count {
-        if rd.len() < bytes_per_element_links + expected_data_size + size_of::<LabelType>() {
-          return Err(Error::InvalidIndexFormat("unexpected EOF".to_string()));
-        }
-
-        let l0_words = &idx.level0_links[i * words_per_element..(i + 1) * words_per_element];
-        let (l0_bytes, rest) = rd.split_at(bytes_per_element_links);
-        rd = rest;
-        if let Ok(src) = bytemuck::try_cast_slice::<u8, u32>(l0_bytes) {
-          for (dst, &val) in l0_words.iter().zip(src.iter()) {
-            dst.store(val, Ordering::Relaxed);
-          }
-        } else {
-          for (dst, chunk) in l0_words.iter().zip(l0_bytes.chunks_exact(4)) {
-            dst.store(
-              u32::from_le_bytes(chunk.try_into().unwrap()),
-              Ordering::Relaxed,
-            );
-          }
-        }
-
-        let (v_bytes, rest) = rd.split_at(expected_data_size);
-        rd = rest;
-        let mut vec = vec![0.0f32; dim];
-        if let Ok(src) = bytemuck::try_cast_slice::<u8, f32>(v_bytes) {
-          vec.copy_from_slice(src);
-        } else {
-          for (dst, chunk) in vec.iter_mut().zip(v_bytes.chunks_exact(4)) {
-            *dst = f32::from_bits(u32::from_le_bytes(chunk.try_into().unwrap()));
-          }
-        }
-        idx.vectors[i].store(Some(Arc::new(vec)));
-
-        let (label_bytes, rest) = rd.split_at(size_of::<LabelType>());
-        rd = rest;
-        let label = LabelType::from_le_bytes(label_bytes.try_into().unwrap());
-        idx.labels[i].store(label, Ordering::Relaxed);
-        if label_lookup.insert(label, i as TableInt).is_some() {
-          return Err(Error::InvalidIndexFormat(
-            "duplicate external label".to_string(),
-          ));
-        }
-      }
-    }
-
-    let words_per_level = 1 + idx.max_m;
-    let size_links_per_element = words_per_level * size_of::<u32>();
-
-    for i in 0..cur_element_count {
-      let link_list_size = read_u32(&mut rd)? as usize;
-      if link_list_size == 0 {
-        idx.element_levels[i].store(0, Ordering::Relaxed);
-        continue;
-      }
-      if link_list_size % size_links_per_element != 0 {
-        return Err(Error::InvalidIndexFormat(
-          "invalid linkListSize".to_string(),
-        ));
-      }
-      let levels = link_list_size / size_links_per_element;
-      let words = link_list_size / size_of::<u32>();
-      idx.element_levels[i].store(levels as i32, Ordering::Relaxed);
-      if rd.len() < link_list_size {
-        return Err(Error::InvalidIndexFormat("unexpected EOF".to_string()));
-      }
-      let (bytes, rest) = rd.split_at(link_list_size);
-      rd = rest;
-      let mut raw = vec![0u32; words];
-      if let Ok(src) = bytemuck::try_cast_slice::<u8, u32>(bytes) {
-        raw.copy_from_slice(src);
-      } else {
-        for (dst, chunk) in raw.iter_mut().zip(bytes.chunks_exact(4)) {
-          *dst = u32::from_le_bytes(chunk.try_into().unwrap());
-        }
-      }
-      let mut atoms = Vec::with_capacity(raw.len());
-      for v in raw {
-        atoms.push(AtomicU32::new(v));
-      }
-      idx.link_lists[i]
-        .set(atoms.into_boxed_slice())
-        .map_err(|_| Error::InvalidIndexFormat("linklist already initialized".to_string()))?;
-    }
-
-    if !rd.is_empty() {
-      return Err(Error::InvalidIndexFormat(
-        "Index seems to be corrupted or unsupported".to_string(),
-      ));
-    }
-
-    let mut num_deleted = 0usize;
-    {
-      let mut deleted_elements = idx.deleted_elements.lock();
-      for i in 0..cur_element_count {
-        if idx.is_marked_deleted_internal(i as TableInt) {
-          num_deleted += 1;
-          if idx.allow_replace_deleted {
-            deleted_elements.insert(i as TableInt);
-          }
-        }
-      }
-    }
-    idx.num_deleted.store(num_deleted, Ordering::Release);
-
-    Ok(idx)
+  pub fn is_deleted_key(&self, key: &K) -> Result<bool> {
+    let node = self
+      .key_to_node
+      .get(key)
+      .map(|e| *e.value())
+      .ok_or(Error::KeyNotFound)?;
+    Ok(self.is_deleted(node))
   }
 
-  pub fn check_integrity(&self) -> Result<()> {
-    let _mutation_guard = self.mutation_lock.write();
+  pub fn level(&self, key: &K) -> Result<usize> {
+    let node = self
+      .key_to_node
+      .get(key)
+      .map(|e| *e.value())
+      .ok_or(Error::KeyNotFound)?;
+    let level = self.node_level[node.as_usize()].load(Ordering::Acquire);
+    if level < 0 {
+      return Err(Error::InvalidIndexFormat("node level < 0".to_string()));
+    }
+    Ok(level as usize)
+  }
 
-    let cur_element_count = self.cur_element_count.load(Ordering::Acquire);
-    let mut inbound: Vec<usize> = vec![0; cur_element_count];
-    for i in 0..cur_element_count {
-      let max_level = self.element_levels[i].load(Ordering::Acquire);
-      if max_level < 0 {
-        return Err(Error::InvalidIndexFormat(
-          "negative element level".to_string(),
-        ));
-      }
-      let max_level = max_level as usize;
-      for level in 0..=max_level {
-        let ll = self.linklist_at_level(i as TableInt, level)?;
-        let mut s = HashSet::new();
-        for to in ll {
-          if to as usize >= cur_element_count {
-            return Err(Error::InvalidIndexFormat("bad neighbor id".to_string()));
-          }
-          if to as usize == i {
-            return Err(Error::InvalidIndexFormat("self loop".to_string()));
-          }
-          inbound[to as usize] += 1;
-          s.insert(to);
-        }
-        if s.len() != ll.len() {
-          return Err(Error::InvalidIndexFormat("duplicate edge".to_string()));
-        }
+  pub fn neighbors(&self, key: &K, level: usize) -> Result<Vec<K>> {
+    let node = self
+      .key_to_node
+      .get(key)
+      .map(|e| *e.value())
+      .ok_or(Error::KeyNotFound)?;
+    let max_level = self.node_level[node.as_usize()].load(Ordering::Acquire);
+    if max_level < 0 {
+      return Err(Error::InvalidIndexFormat("node level < 0".to_string()));
+    }
+    if level > max_level as usize {
+      return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for neighbor in self.neighbors_at_level(node, level)? {
+      out.push(self.node_key(neighbor)?.clone());
+    }
+    Ok(out)
+  }
+
+  pub fn merged_neighbors(&self, key: &K, min_level: usize) -> Result<Vec<K>> {
+    let node = self
+      .key_to_node
+      .get(key)
+      .map(|e| *e.value())
+      .ok_or(Error::KeyNotFound)?;
+    let max_level = self.node_level[node.as_usize()].load(Ordering::Acquire);
+    if max_level < 0 {
+      return Err(Error::InvalidIndexFormat("node level < 0".to_string()));
+    }
+    let max_level = max_level as usize;
+    if min_level > max_level {
+      return Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::<u32>::new();
+    for level in min_level..=max_level {
+      for neighbor in self.neighbors_at_level(node, level)? {
+        seen.insert(neighbor.as_u32());
       }
     }
 
-    if cur_element_count > 1 {
-      for (i, &n) in inbound.iter().enumerate() {
-        if n == 0 {
-          return Err(Error::InvalidIndexFormat(format!(
-            "node {i} has zero inbound connections"
-          )));
-        }
-      }
+    let mut ids: Vec<u32> = seen.into_iter().collect();
+    ids.sort_unstable();
+
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+      out.push(self.node_key(NodeId::new(id))?.clone());
     }
-    Ok(())
+    Ok(out)
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::space::InnerProductSpace;
-  use crate::space::L2Space;
-  use crate::stop_condition::EpsilonSearchStopCondition;
-  use crate::stop_condition::MultiVectorSearchStopCondition;
-  use crate::view::HnswIndexView;
-  use approx::assert_relative_eq;
-  use proptest::prelude::*;
+  use crate::metric::L2;
+  use crate::vectors::InMemoryVectorStore;
+  use crate::vectors::VectorStore;
   use rand::rngs::StdRng;
   use rand::Rng;
   use rand::SeedableRng;
+  use proptest::prelude::*;
+  use std::sync::Arc;
+  use std::thread;
 
-  fn brute_force_knn<S: Space>(
-    space: &S,
-    points: &[(LabelType, Vec<f32>)],
-    query: &[f32],
-    k: usize,
-  ) -> Vec<(LabelType, f32)> {
-    let mut all: Vec<(LabelType, f32)> = points
-      .iter()
-      .map(|(l, v)| (*l, space.distance(query, v)))
-      .collect();
-    all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then_with(|| a.0.cmp(&b.0)));
-    all.truncate(k);
-    all
-  }
+  fn assert_integrity<K: Eq + Hash + Clone + Send + Sync + 'static, M: Metric>(h: &Hnsw<K, M>) {
+    let len = h.len();
+    assert!(len <= h.max_nodes());
 
-  #[test]
-  fn delete_mark_is_preserved_when_setting_count() {
-    let mut header = DELETE_MARK | 7;
-    set_linklist_count(&mut header, 123);
-    assert_eq!(header & DELETE_MARK, DELETE_MARK);
-    assert_eq!(linklist_count(header), 123);
-  }
+    let mut deleted = 0usize;
+    for internal_id in 0..len {
+      let node = NodeId::new(internal_id as u32);
+      let key = h
+        .node_keys
+        .get(internal_id)
+        .and_then(|k| k.get())
+        .expect("missing node key");
+      let mapped = h
+        .key_to_node
+        .get(key)
+        .map(|e| *e.value())
+        .expect("missing key_to_node entry");
+      assert_eq!(mapped, node);
 
-  #[test]
-  fn mark_delete_and_unmark_delete_affects_search_results() {
-    let space = L2Space::new(2);
-    let idx = HnswIndex::new(space, 10, 8, 64, 42, false);
-    idx.add_point(&[0.0, 0.0], 1).unwrap();
-    idx.add_point(&[10.0, 10.0], 2).unwrap();
-    idx.set_ef(10);
-
-    let res = idx.search_knn(&[0.0, 0.0], 2, None).unwrap();
-    assert_eq!(res[0].0, 1);
-
-    idx.mark_delete(1).unwrap();
-    let res = idx.search_knn(&[0.0, 0.0], 2, None).unwrap();
-    assert_eq!(res[0].0, 2);
-
-    idx.unmark_delete(1).unwrap();
-    let res = idx.search_knn(&[0.0, 0.0], 2, None).unwrap();
-    assert_eq!(res[0].0, 1);
-  }
-
-  #[test]
-  fn replace_deleted_reuses_internal_slot() {
-    let space = L2Space::new(2);
-    let idx = HnswIndex::new(space, 10, 8, 64, 42, true);
-    let id1 = idx.add_point(&[0.0, 0.0], 1).unwrap();
-    let _id2 = idx.add_point(&[10.0, 10.0], 2).unwrap();
-    idx.mark_delete(1).unwrap();
-    assert_eq!(idx.get_deleted_count(), 1);
-
-    let id3 = idx.add_point_replace_deleted(&[1.0, 1.0], 3).unwrap();
-    assert_eq!(id3, id1);
-    assert_eq!(idx.get_deleted_count(), 0);
-    assert!(idx.get_data_by_label(3).is_ok());
-    assert!(matches!(idx.get_data_by_label(1), Err(Error::LabelNotFound(1))));
-  }
-
-  #[test]
-  fn update_existing_label_updates_vector() {
-    let space = L2Space::new(2);
-    let idx = HnswIndex::new(space, 10, 8, 64, 42, false);
-    idx.add_point(&[0.0, 0.0], 1).unwrap();
-    idx.add_point(&[100.0, 100.0], 1).unwrap();
-    let v = idx.get_data_by_label(1).unwrap();
-    assert_relative_eq!(v[0], 100.0);
-    assert_relative_eq!(v[1], 100.0);
-  }
-
-  #[test]
-  fn save_load_roundtrip_is_byte_identical() {
-    let space = L2Space::new(4);
-    let idx = HnswIndex::new(space, 100, 16, 200, 123, true);
-
-    for i in 0..50 {
-      let v = [i as f32, 1.0, 2.0, 3.0];
-      idx.add_point_at_level(&v, i as LabelType, Some(0)).unwrap();
-    }
-    idx.mark_delete(10).unwrap();
-    idx.mark_delete(20).unwrap();
-
-    let bytes1 = idx.save_to_vec().unwrap();
-    let idx2 =
-      HnswIndex::load_from_bytes_with_options(L2Space::new(4), &bytes1, None, 123, true).unwrap();
-    let bytes2 = idx2.save_to_vec().unwrap();
-    assert_eq!(bytes1, bytes2);
-  }
-
-  #[test]
-  fn view_can_parse_rust_saved_index() {
-    let space = InnerProductSpace::new(3);
-    let idx = HnswIndex::new(space, 10, 8, 64, 42, false);
-    idx.add_point(&[1.0, 0.0, 0.0], 1).unwrap();
-    idx.add_point(&[0.0, 1.0, 0.0], 2).unwrap();
-    idx.add_point(&[0.0, 0.0, 1.0], 3).unwrap();
-    let bytes = idx.save_to_vec().unwrap();
-
-    let view = HnswIndexView::load(3, &bytes).unwrap();
-    assert_eq!(view.cur_element_count, 3);
-    assert_eq!(view.m, 8);
-    assert!(view.has_label(1));
-    assert!(view.has_label(2));
-    assert!(view.has_label(3));
-  }
-
-  #[test]
-  fn exact_knn_for_small_sets_with_high_params_level0_only() {
-    let dim = 8;
-    let n = 64;
-    let k = 5;
-    let mut rng = StdRng::seed_from_u64(7);
-    let space = L2Space::new(dim);
-
-    let idx = HnswIndex::new(space.clone(), n, n, n, 7, false);
-    idx.set_ef(n);
-
-    let mut points: Vec<(LabelType, Vec<f32>)> = Vec::new();
-    for label in 0..n {
-      let mut v = vec![0.0_f32; dim];
-      for x in &mut v {
-        *x = rng.gen_range(-1.0..1.0);
+      if h.node_deleted[internal_id].load(Ordering::Acquire) != 0 {
+        deleted += 1;
       }
-      idx
-        .add_point_at_level(&v, label as LabelType, Some(0))
-        .unwrap();
-      points.push((label as LabelType, v));
-    }
 
-    for _ in 0..20 {
-      let mut q = vec![0.0_f32; dim];
-      for x in &mut q {
-        *x = rng.gen_range(-1.0..1.0);
+      let level = h.node_level[internal_id].load(Ordering::Acquire);
+      assert!(level >= 0);
+
+      if level == 0 {
+        assert!(h.upper_links[internal_id].get().is_none());
+      } else {
+        assert!(h.upper_links[internal_id].get().is_some());
       }
-      let brute = brute_force_knn(&space, &points, &q, k);
-      let got = idx.search_knn(&q, k, None).unwrap();
-      let mut got_sorted = got;
-      got_sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then_with(|| a.0.cmp(&b.0)));
-      assert_eq!(got_sorted, brute);
-    }
-  }
 
-  #[test]
-  fn epsilon_stop_condition_filters_results() {
-    let space = L2Space::new(1);
-    let idx = HnswIndex::new(space, 10, 8, 64, 42, false);
-    for (label, x) in [(0, 0.0), (1, 0.5), (2, 2.0), (3, 10.0)] {
-      idx.add_point(&[x], label).unwrap();
-    }
-
-    let mut stop = EpsilonSearchStopCondition::new(1.0, 1, 10);
-    let res = idx
-      .search_stop_condition_closest(&[0.0], &mut stop, None)
-      .unwrap();
-    assert!(!res.is_empty());
-    assert!(res.iter().all(|(_, d)| *d <= 1.0));
-  }
-
-  #[test]
-  fn multivector_stop_condition_limits_distinct_doc_ids() {
-    let space = L2Space::new(1);
-    let idx = HnswIndex::new(space, 32, 16, 64, 42, false);
-    // Three docs, 3 vectors each, increasing distance from query.
-    for label in 0..9usize {
-      idx
-        .add_point_at_level(&[label as f32], label as LabelType, Some(0))
-        .unwrap();
-    }
-
-    let mut stop =
-      MultiVectorSearchStopCondition::new(|label: LabelType, _dp: &[f32]| label / 3, 2, 3);
-    let res = idx
-      .search_stop_condition_closest(&[0.0], &mut stop, None)
-      .unwrap();
-
-    let distinct_docs = res.iter().map(|(l, _)| l / 3).collect::<HashSet<_>>();
-    assert!(distinct_docs.len() <= 2);
-  }
-
-  #[test]
-  fn parallel_add_point_is_thread_safe() {
-    use std::sync::Arc;
-    use std::thread;
-
-    let dim = 4;
-    let n = 256;
-    let threads = 8;
-    let space = L2Space::new(dim);
-    let idx = Arc::new(HnswIndex::new(space, n, 16, 200, 42, false));
-
-    let mut handles = Vec::new();
-    for t in 0..threads {
-      let idx = idx.clone();
-      handles.push(thread::spawn(move || {
-        for label in (t..n).step_by(threads) {
-          let v = [
-            label as f32,
-            (label as f32) * 0.25,
-            (label as f32) * -0.5,
-            1.0,
-          ];
-          idx.add_point(&v, label).unwrap();
+      for l in 0..=level as usize {
+        let cap = if l == 0 { h.max_m0 } else { h.max_m };
+        let list = h.neighbors_at_level(node, l).expect("neighbors_at_level");
+        assert!(list.len <= cap);
+        for neighbor in list {
+          assert_ne!(neighbor, node);
+          assert!(neighbor.as_usize() < len);
+          let neighbor_level = h.node_level[neighbor.as_usize()].load(Ordering::Acquire);
+          assert!(neighbor_level >= l as i32);
         }
-      }));
+      }
     }
-    for h in handles {
-      h.join().unwrap();
-    }
+    assert_eq!(h.deleted_len(), deleted);
+  }
 
-    assert_eq!(idx.get_current_element_count(), n);
-    idx.set_ef(n);
-
-    for label in [0usize, 1, 2, 17, 63, 128, 255] {
-      let v = [
-        label as f32,
-        (label as f32) * 0.25,
-        (label as f32) * -0.5,
-        1.0,
-      ];
-      let got = idx.get_data_by_label(label).unwrap();
-      assert_eq!(got.as_slice(), &v);
-
-      let knn = idx.search_knn(&v, 1, None).unwrap();
-      assert_eq!(knn[0].0, label);
-      assert_relative_eq!(knn[0].1, 0.0);
-    }
-
-    idx.check_integrity().unwrap();
+  fn random_vec(rng: &mut StdRng, dim: usize) -> Vec<f32> {
+    (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect()
   }
 
   #[test]
-  fn parallel_mark_delete_is_thread_safe() {
-    use std::sync::Arc;
-    use std::thread;
+  fn serde_bincode_roundtrip_preserves_graph() {
+    let dim = 8;
+    let cfg = HnswConfig::new(dim, 1024)
+      .m(16)
+      .ef_construction(128)
+      .ef_search(64)
+      .seed(123);
+    let store = InMemoryVectorStore::new(dim, cfg.max_nodes);
+    let h = Hnsw::new(L2::new(), cfg);
 
-    let dim = 2;
-    let n = 128;
-    let threads = 8;
-    let space = L2Space::new(dim);
-    let idx = Arc::new(HnswIndex::new(space, n, 16, 200, 42, false));
-
-    for label in 0..n {
-      let v = [label as f32, 0.0];
-      idx.add_point(&v, label).unwrap();
+    let mut rng = StdRng::seed_from_u64(1);
+    for key in 0u64..200 {
+      let v = random_vec(&mut rng, dim);
+      h.insert(&store, key, &v).unwrap();
     }
-    idx.set_ef(n);
 
-    let mut handles = Vec::new();
-    for t in 0..threads {
-      let idx = idx.clone();
-      handles.push(thread::spawn(move || {
-        for label in (t..n).step_by(threads) {
-          if label % 2 == 0 {
-            idx.mark_delete(label).unwrap();
+    for key in 0u64..50 {
+      assert!(h.delete(&key).unwrap());
+    }
+
+    for key in 25u64..75 {
+      let v = random_vec(&mut rng, dim);
+      let _ = h.set(&store, key, &v).unwrap();
+    }
+
+    h.set_ef_search(123);
+
+    assert_integrity(&h);
+
+    let data = h.to_data().unwrap();
+    let bytes = bincode::serialize(&data).unwrap();
+    let decoded: HnswData<u64> = bincode::deserialize(&bytes).unwrap();
+    let h2 = Hnsw::from_data(L2::new(), decoded).unwrap();
+
+    assert_integrity(&h2);
+    assert_eq!(data, h2.to_data().unwrap());
+
+    let q = random_vec(&mut rng, dim);
+    let hits1 = h.search(&store, &q, 10, None).unwrap();
+    let hits2 = h2.search(&store, &q, 10, None).unwrap();
+    assert_eq!(hits1, hits2);
+  }
+
+  #[test]
+  fn from_data_rejects_unknown_version() {
+    let cfg = HnswConfig::new(4, 16).m(8);
+    let h: Hnsw<u64, _> = Hnsw::new(L2::new(), cfg);
+    let mut data = h.to_data().unwrap();
+    data.version += 1;
+    let err = match Hnsw::from_data(L2::new(), data) {
+      Ok(_) => panic!("expected version mismatch error"),
+      Err(err) => err,
+    };
+    assert!(matches!(err, Error::InvalidIndexFormat(_)));
+  }
+
+  #[test]
+  fn insert_delete_resurrect() {
+    let dim = 8;
+    let cfg = HnswConfig::new(dim, 128)
+      .m(8)
+      .ef_construction(64)
+      .ef_search(64)
+      .seed(123);
+    let store = InMemoryVectorStore::new(dim, cfg.max_nodes);
+    let h = Hnsw::new(L2::new(), cfg);
+
+    let mut rng = StdRng::seed_from_u64(1);
+    let a = random_vec(&mut rng, dim);
+    let b = random_vec(&mut rng, dim);
+    let c = random_vec(&mut rng, dim);
+
+    h.insert(&store, 1, &a).unwrap();
+    h.insert(&store, 2, &b).unwrap();
+    h.insert(&store, 3, &c).unwrap();
+    assert_integrity(&h);
+
+    assert!(h.delete(&2).unwrap());
+    assert!(h.is_deleted_key(&2).unwrap());
+    assert_integrity(&h);
+
+    let hits = h.search(&store, &b, 10, None).unwrap();
+    assert!(hits.iter().all(|hit| hit.key != 2));
+
+    let b2 = random_vec(&mut rng, dim);
+    assert_eq!(h.set(&store, 2, &b2).unwrap(), SetOutcome::Resurrected);
+    assert!(!h.is_deleted_key(&2).unwrap());
+    assert_integrity(&h);
+
+    let hits = h.search(&store, &b2, 10, None).unwrap();
+    assert!(hits.iter().any(|hit| hit.key == 2));
+  }
+
+  #[test]
+  fn set_updates_existing_key() {
+    let dim = 4;
+    let cfg = HnswConfig::new(dim, 64)
+      .m(8)
+      .ef_construction(64)
+      .ef_search(64)
+      .seed(42);
+    let store = InMemoryVectorStore::new(dim, cfg.max_nodes);
+    let h = Hnsw::new(L2::new(), cfg);
+
+    let v1 = vec![0.0, 0.0, 0.0, 0.0];
+    let v2 = vec![1.0, 1.0, 1.0, 1.0];
+
+    h.insert(&store, 7, &v1).unwrap();
+    assert_eq!(h.set(&store, 7, &v2).unwrap(), SetOutcome::Updated);
+    assert!(!h.is_deleted_key(&7).unwrap());
+
+    let id = h.node_id(&7).unwrap();
+    let stored = store.vector(id).unwrap();
+    assert_eq!(stored.as_f32_slice(), v2.as_slice());
+    assert_integrity(&h);
+  }
+
+  #[test]
+  fn search_respects_filter() {
+    let dim = 6;
+    let cfg = HnswConfig::new(dim, 256)
+      .m(16)
+      .ef_construction(128)
+      .ef_search(128)
+      .seed(999);
+    let store = InMemoryVectorStore::new(dim, cfg.max_nodes);
+    let h = Hnsw::new(L2::new(), cfg);
+
+    let mut rng = StdRng::seed_from_u64(99);
+    for key in 0u64..50 {
+      let v = random_vec(&mut rng, dim);
+      h.insert(&store, key, &v).unwrap();
+    }
+    assert_integrity(&h);
+
+    let q = random_vec(&mut rng, dim);
+    let hits = h
+      .search(&store, &q, 20, Some(&|k: &u64| k % 2 == 0))
+      .unwrap();
+    assert!(hits.iter().all(|hit| hit.key % 2 == 0));
+  }
+
+  #[test]
+  fn parallel_set_delete_search_smoke() {
+    let dim = 8;
+    let cfg = HnswConfig::new(dim, 10_000)
+      .m(16)
+      .ef_construction(128)
+      .ef_search(128)
+      .seed(7);
+    let store = Arc::new(InMemoryVectorStore::new(dim, cfg.max_nodes));
+    let h = Arc::new(Hnsw::new(L2::new(), cfg));
+
+    for key in 0u64..1000 {
+      let v = vec![key as f32; dim];
+      h.insert(&*store, key, &v).unwrap();
+    }
+
+    let mut threads = Vec::new();
+    for t in 0..8u64 {
+      let h = h.clone();
+      let store = store.clone();
+      threads.push(thread::spawn(move || {
+        let mut rng = StdRng::seed_from_u64(1000 + t);
+        for _ in 0..2000 {
+          let key = rng.gen_range(0u64..2000);
+          match rng.gen_range(0u8..3) {
+            0 => {
+              let v = random_vec(&mut rng, dim);
+              let _ = h.set(&*store, key, &v);
+            }
+            1 => {
+              let _ = h.delete(&key);
+            }
+            _ => {
+              let q = random_vec(&mut rng, dim);
+              let _ = h.search(&*store, &q, 10, None);
+            }
           }
         }
       }));
     }
-    for h in handles {
-      h.join().unwrap();
+    for t in threads {
+      t.join().unwrap();
     }
 
-    assert_eq!(idx.get_deleted_count(), n / 2);
+    assert_integrity(&h);
+  }
 
-    for label in 0..n {
-      let v = [label as f32, 0.0];
-      if label % 2 == 0 {
-        assert!(matches!(
-          idx.get_data_by_label(label),
-          Err(Error::LabelNotFound(l)) if l == label
-        ));
-        let got = idx.search_knn(&v, 1, None).unwrap();
-        assert_ne!(got[0].0, label);
-      } else {
-        assert!(idx.get_data_by_label(label).is_ok());
-        let got = idx.search_knn(&v, 1, None).unwrap();
-        assert_eq!(got[0].0, label);
-      }
-    }
+  #[derive(Clone, Debug)]
+  enum Op {
+    Insert { key: u64, vector: Vec<f32> },
+    Set { key: u64, vector: Vec<f32> },
+    Delete { key: u64 },
+    Search { query: Vec<f32>, k: usize },
+  }
 
-    idx.check_integrity().unwrap();
+  fn op_strategy(dim: usize) -> impl Strategy<Value = Op> {
+    let key = 0u64..64;
+    let vector = prop::collection::vec(-1000i16..1000, dim)
+      .prop_map(|v| v.into_iter().map(|x| x as f32 / 100.0).collect::<Vec<_>>());
+    prop_oneof![
+      (key.clone(), vector.clone())
+        .prop_map(|(key, vector)| Op::Insert { key, vector }),
+      (key.clone(), vector.clone()).prop_map(|(key, vector)| Op::Set { key, vector }),
+      key.clone().prop_map(|key| Op::Delete { key }),
+      (vector, 0usize..10).prop_map(|(query, k)| Op::Search { query, k }),
+    ]
   }
 
   proptest! {
     #[test]
-    fn prop_exact_knn_with_level0_only(
-      dim in 2usize..12,
-      n in 2usize..64,
-      k in 1usize..8,
-      seed in any::<u64>(),
-    ) {
-      let k = k.min(n);
-      let mut rng = StdRng::seed_from_u64(seed);
-      let space = L2Space::new(dim);
+    fn proptest_random_ops(ops in prop::collection::vec(op_strategy(4), 1..100)) {
+      let dim = 4;
+      let cfg = HnswConfig::new(dim, 10_000)
+        .m(16)
+        .ef_construction(128)
+        .ef_search(128)
+        .seed(123);
+      let store = InMemoryVectorStore::new(dim, cfg.max_nodes);
+      let h = Hnsw::new(L2::new(), cfg);
 
-      let idx = HnswIndex::new(space.clone(), n, n, n, seed, false);
-      idx.set_ef(n);
+      let mut model = std::collections::HashMap::<u64, bool>::new(); // key -> deleted
 
-      let mut points: Vec<(LabelType, Vec<f32>)> = Vec::with_capacity(n);
-      for label in 0..n {
-        let mut v = vec![0.0_f32; dim];
-        for x in &mut v {
-          *x = rng.gen_range(-1.0..1.0);
+      for op in ops {
+        match op {
+          Op::Insert { key, vector } => {
+            let res = h.insert(&store, key, &vector);
+            if model.contains_key(&key) {
+              prop_assert!(matches!(res, Err(Error::KeyAlreadyExists)));
+            } else {
+              prop_assert!(res.is_ok());
+              model.insert(key, false);
+            }
+          }
+          Op::Set { key, vector } => {
+            let existed = model.get(&key).copied();
+            let out = h.set(&store, key, &vector).unwrap();
+            match existed {
+              None => prop_assert_eq!(out, SetOutcome::Inserted),
+              Some(true) => prop_assert_eq!(out, SetOutcome::Resurrected),
+              Some(false) => prop_assert_eq!(out, SetOutcome::Updated),
+            }
+            model.insert(key, false);
+          }
+          Op::Delete { key } => {
+            let deleted = h.delete(&key).unwrap();
+            match model.get(&key).copied() {
+              None => prop_assert!(!deleted),
+              Some(true) => prop_assert!(!deleted),
+              Some(false) => {
+                prop_assert!(deleted);
+                model.insert(key, true);
+              }
+            }
+          }
+          Op::Search { query, k } => {
+            match h.search(&store, &query, k, None) {
+              Ok(hits) => {
+                prop_assert!(hits.len() <= k);
+                for w in hits.windows(2) {
+                  prop_assert!(w[0].distance <= w[1].distance + 1e-6);
+                  prop_assert_ne!(w[0].key, w[1].key);
+                }
+                for hit in hits {
+                  let Some(&is_deleted) = model.get(&hit.key) else {
+                    prop_assert!(false, "search returned unknown key");
+                    continue;
+                  };
+                  prop_assert!(!is_deleted);
+                }
+              }
+              Err(Error::EmptyIndex) => {
+                prop_assert!(model.is_empty());
+              }
+              Err(err) => {
+                prop_assert!(false, "unexpected search error: {err:?}");
+              }
+            }
+          }
         }
-        idx.add_point_at_level(&v, label as LabelType, Some(0)).unwrap();
-        points.push((label as LabelType, v));
-      }
 
-      let mut query = vec![0.0_f32; dim];
-      for x in &mut query {
-        *x = rng.gen_range(-1.0..1.0);
+        assert_integrity(&h);
       }
-
-      let brute = brute_force_knn(&space, &points, &query, k);
-      let mut got = idx.search_knn(&query, k, None).unwrap();
-      got.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1).unwrap().then_with(|| a.0.cmp(&b.0))
-      });
-      prop_assert_eq!(got, brute);
     }
   }
 }

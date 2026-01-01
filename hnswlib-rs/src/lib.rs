@@ -1,23 +1,24 @@
-pub mod bruteforce;
+pub mod legacy;
 pub mod error;
 pub mod hnsw;
-pub mod space;
-pub mod stop_condition;
-pub mod view;
-pub mod visited;
+pub mod id;
+pub mod metric;
+pub mod vectors;
+pub(crate) mod visited;
 
-pub use bruteforce::BruteforceIndex;
 pub use error::Error;
 pub use error::Result;
-pub use hnsw::HnswIndex;
-pub use space::InnerProductSpace;
-pub use space::L2Space;
-pub use space::Space;
-pub use stop_condition::EpsilonSearchStopCondition;
-pub use stop_condition::MultiVectorSearchStopCondition;
-pub use stop_condition::SearchStopCondition;
-pub use view::HnswIndexView;
-
-pub type TableInt = u32; // Internal ID.
-pub type LinkListSizeInt = u32;
-pub type LabelType = usize; // External ID.
+pub use hnsw::Hnsw;
+pub use hnsw::HnswConfig;
+pub use hnsw::HnswData;
+pub use hnsw::SearchHit;
+pub use hnsw::SetOutcome;
+pub use id::NodeId;
+pub use metric::Cosine;
+pub use metric::InnerProduct;
+pub use metric::L2;
+pub use metric::Metric;
+pub use vectors::InMemoryVectorStore;
+pub use vectors::VectorRef;
+pub use vectors::VectorStore;
+pub use vectors::VectorStoreMut;

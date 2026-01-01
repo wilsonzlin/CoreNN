@@ -1,7 +1,4 @@
-use crate::LabelType;
-
-pub trait Space: Clone + Send + Sync + 'static {
-  fn dim(&self) -> usize;
+pub trait Metric: Clone + Send + Sync + 'static {
   fn distance(&self, a: &[f32], b: &[f32]) -> f32;
 }
 
@@ -16,12 +13,16 @@ unsafe fn l2_scalar(a: *const f32, b: *const f32, dim: usize) -> f32 {
   res
 }
 
-unsafe fn ip_distance_scalar(a: *const f32, b: *const f32, dim: usize) -> f32 {
+unsafe fn dot_scalar(a: *const f32, b: *const f32, dim: usize) -> f32 {
   let mut dot = 0.0_f32;
   for i in 0..dim {
     dot += *a.add(i) * *b.add(i);
   }
-  1.0_f32 - dot
+  dot
+}
+
+unsafe fn ip_distance_scalar(a: *const f32, b: *const f32, dim: usize) -> f32 {
+  1.0_f32 - dot_scalar(a, b, dim)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -192,60 +193,89 @@ mod x86_simd {
 }
 
 #[derive(Clone, Debug)]
-pub struct L2Space {
-  dim: usize,
+pub struct L2 {
   dist_fn: DistanceFn,
 }
 
-impl L2Space {
-  pub fn new(dim: usize) -> Self {
+impl Default for L2 {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl L2 {
+  pub fn new() -> Self {
     let mut dist_fn: DistanceFn = l2_scalar;
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if let Some(f) = x86_simd::pick_l2() {
       dist_fn = f;
     }
-    Self { dim, dist_fn }
+    Self { dist_fn }
   }
 }
 
-impl Space for L2Space {
-  fn dim(&self) -> usize {
-    self.dim
-  }
-
+impl Metric for L2 {
   fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), self.dim);
-    debug_assert_eq!(b.len(), self.dim);
-    unsafe { (self.dist_fn)(a.as_ptr(), b.as_ptr(), self.dim) }
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { (self.dist_fn)(a.as_ptr(), b.as_ptr(), a.len()) }
   }
 }
 
 #[derive(Clone, Debug)]
-pub struct InnerProductSpace {
-  dim: usize,
+pub struct InnerProduct {
   dist_fn: DistanceFn,
 }
 
-impl InnerProductSpace {
-  pub fn new(dim: usize) -> Self {
+impl Default for InnerProduct {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl InnerProduct {
+  pub fn new() -> Self {
     let mut dist_fn: DistanceFn = ip_distance_scalar;
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if let Some(f) = x86_simd::pick_ip_distance() {
       dist_fn = f;
     }
-    Self { dim, dist_fn }
+    Self { dist_fn }
   }
 }
 
-impl Space for InnerProductSpace {
-  fn dim(&self) -> usize {
-    self.dim
-  }
-
+impl Metric for InnerProduct {
   fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), self.dim);
-    debug_assert_eq!(b.len(), self.dim);
-    unsafe { (self.dist_fn)(a.as_ptr(), b.as_ptr(), self.dim) }
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { (self.dist_fn)(a.as_ptr(), b.as_ptr(), a.len()) }
+  }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Cosine {
+  ip: InnerProduct,
+}
+
+impl Cosine {
+  pub fn new() -> Self {
+    Self { ip: InnerProduct::new() }
+  }
+}
+
+impl Metric for Cosine {
+  fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut norm_a = 0.0_f32;
+    let mut norm_b = 0.0_f32;
+    for i in 0..a.len() {
+      norm_a += a[i] * a[i];
+      norm_b += b[i] * b[i];
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+      return 1.0;
+    }
+    // InnerProduct distance is `1 - dot`, so dot = 1 - dist.
+    let dot = 1.0 - self.ip.distance(a, b);
+    1.0 - dot / (norm_a.sqrt() * norm_b.sqrt())
   }
 }
 
@@ -263,10 +293,6 @@ pub fn normalize_cosine_in_place(vector: &mut [f32]) {
   }
 }
 
-pub fn label_allowed(filter: Option<&dyn Fn(LabelType) -> bool>, label: LabelType) -> bool {
-  filter.map(|f| f(label)).unwrap_or(true)
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -275,7 +301,7 @@ mod tests {
   use rand::Rng;
   use rand::SeedableRng;
 
-  fn l2_scalar(a: &[f32], b: &[f32]) -> f32 {
+  fn l2_ref(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
       .zip(b.iter())
       .map(|(a, b)| {
@@ -285,43 +311,50 @@ mod tests {
       .sum()
   }
 
-  fn ip_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
+  fn ip_ref(a: &[f32], b: &[f32]) -> f32 {
     1.0 - a.iter().zip(b.iter()).map(|(a, b)| a * b).sum::<f32>()
   }
 
   #[test]
-  fn l2_distance_matches_scalar_with_simd_dispatch() {
+  fn l2_matches_scalar_across_dims() {
     let mut rng = StdRng::seed_from_u64(123);
     let dims = [
       1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255,
     ];
+    let metric = L2::new();
     for &dim in &dims {
-      let space = L2Space::new(dim);
       for _ in 0..100 {
         let a: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
         let b: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let expected = l2_scalar(&a, &b);
-        let got = space.distance(&a, &b);
-        assert_relative_eq!(got, expected, epsilon = 1e-3, max_relative = 1e-3);
+        assert_relative_eq!(
+          metric.distance(&a, &b),
+          l2_ref(&a, &b),
+          epsilon = 1e-3,
+          max_relative = 1e-3
+        );
       }
     }
   }
 
   #[test]
-  fn inner_product_distance_matches_scalar_with_simd_dispatch() {
+  fn inner_product_matches_scalar_across_dims() {
     let mut rng = StdRng::seed_from_u64(456);
     let dims = [
       1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255,
     ];
+    let metric = InnerProduct::new();
     for &dim in &dims {
-      let space = InnerProductSpace::new(dim);
       for _ in 0..100 {
         let a: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
         let b: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let expected = ip_distance_scalar(&a, &b);
-        let got = space.distance(&a, &b);
-        assert_relative_eq!(got, expected, epsilon = 1e-3, max_relative = 1e-3);
+        assert_relative_eq!(
+          metric.distance(&a, &b),
+          ip_ref(&a, &b),
+          epsilon = 1e-3,
+          max_relative = 1e-3
+        );
       }
     }
   }
 }
+

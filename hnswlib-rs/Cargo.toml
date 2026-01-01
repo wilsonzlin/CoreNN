@@ -1,6 +1,7 @@
 [package]
 name = "hnswlib-rs"
 description = "Pure-Rust port of hnswlib (HNSW approximate nearest neighbors)"
+readme = "README.md"
 license = "Apache-2.0"
 homepage = "https://github.com/wilsonzlin/corenn"
 repository = "https://github.com/wilsonzlin/corenn.git"
@@ -11,14 +12,19 @@ edition = "2021"
 ahash = "0.8.11"
 arc-swap = "1.7.1"
 bytemuck = "1.20.0"
+dashmap = "6.1.0"
+off64 = { version = "0.9.0", default-features = false }
 ordered-float = "4.5.0"
 parking_lot = "0.12.3"
 rand = "0.8.5"
+rayon = "1.10.0"
+serde = { version = "1.0.215", features = ["derive"] }
 thiserror = "2.0.9"
 tracing = "0.1.41"
 
 [dev-dependencies]
 approx = "0.5.1"
+bincode = "1.3.3"
 proptest = "1.5.0"
 rand = "0.8.5"
 tempfile = "3.14.0"

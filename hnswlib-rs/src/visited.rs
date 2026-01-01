@@ -44,10 +44,6 @@ impl VisitedListPool {
     }
   }
 
-  pub fn resize(&mut self, initial_pool_size: usize, num_elements: usize) {
-    *self = Self::new(initial_pool_size, num_elements);
-  }
-
   pub fn get(&self) -> VisitedListHandle<'_> {
     let mut pool = self.pool.lock();
     let mut list = pool

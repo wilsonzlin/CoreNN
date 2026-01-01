@@ -1,0 +1,120 @@
+# hnswlib-rs
+
+Pure-Rust HNSW (Hierarchical Navigable Small World) graph for approximate nearest-neighbor search, inspired by the original C++ `hnswlib`.
+
+This crate intentionally decouples the **graph** from **vector storage**:
+- `Hnsw<K, M>` owns the graph + a mapping from your external key `K` to an internal dense `NodeId`.
+- You provide a `VectorStore` keyed by `NodeId` to supply vectors on demand.
+
+## Quickstart
+
+```rust
+use hnswlib_rs::{Hnsw, HnswConfig, InMemoryVectorStore, L2, Result};
+
+fn main() -> Result<()> {
+  let dim = 128;
+  let max_nodes = 100_000;
+
+  let cfg = HnswConfig::new(dim, max_nodes)
+    .m(16)
+    .ef_construction(200)
+    .ef_search(50);
+
+  let hnsw = Hnsw::new(L2::new(), cfg);
+  let vectors = InMemoryVectorStore::new(dim, max_nodes);
+
+  let v = vec![0.0; dim];
+  hnsw.insert(&vectors, "doc-1".to_string(), &v)?;
+
+  let hits = hnsw.search(&vectors, &v, 10, None)?;
+  assert_eq!(hits[0].key, "doc-1");
+  Ok(())
+}
+```
+
+## Core concepts
+
+- **`NodeId`**: dense internal id allocated by the graph (stable for the lifetime of the index).
+- **`VectorStore`**: your vector backend keyed by `NodeId` (can return borrowed slices or owned buffers).
+- **`Metric`**: distance function (e.g. `L2`, `Cosine`, `InnerProduct`).
+
+If you want to fetch a vector by your external key, do:
+1) `let id = hnsw.node_id(&key)?;`
+2) `let v = vectors.vector(id).ok_or(Error::MissingVector)?;`
+
+## Why `NodeId`?
+
+HNSW’s hot path is graph traversal: iterating neighbor lists, tracking a visited set, and updating per-node link lists.
+Using your external key type `K` directly in those internals would force expensive and/or bulky representations (hashing, cloning, larger neighbor entries, non-dense visited/lock structures).
+
+`NodeId` exists to keep the core graph representation **dense, fast, and easy to make correct**:
+- Neighbor lists are compact (stored as `u32` IDs internally).
+- Per-node state is stored in contiguous arrays (levels, tombstones, locks, visited tags, linklists).
+- Your `VectorStore` can be implemented efficiently with dense storage (e.g. `Vec` indexed by `NodeId`), while still letting you keep vectors elsewhere if you want.
+- The legacy `hnswlib` format already uses dense internal IDs, so loading maps naturally onto `NodeId`.
+
+`NodeId`s are **not reused** for different keys: `delete` tombstones the node; `set` updates/resurrects the same `NodeId`. Reuse would invalidate stable `NodeId` handles held by a `VectorStore` (and by callers).
+
+## Mutation semantics
+
+- `insert(key, vector)`: fails if `key` already exists.
+- `set(key, vector)`: insert-or-update; if the key was deleted, it is resurrected and connections are repaired.
+- `delete(key)`: tombstones the node (keeps the key mapping; use `set` to resurrect).
+
+## Concurrency
+
+`Hnsw` is designed for concurrent search + concurrent mutation.
+
+The provided `InMemoryVectorStore` supports lock-free reads and parallel updates (per-`NodeId` atomic swap).
+
+## Persistence (serde)
+
+Use `Hnsw::to_data()` / `Hnsw::from_data()` to save/load the **graph + key mapping + config** via any `serde` format.
+
+Notes:
+- Vectors are **not** included; persist your `VectorStore` separately (keyed by `NodeId`).
+- The metric/space is not stored; you must provide the `Metric` when loading.
+- `to_data()` builds a snapshot in memory; for very large indexes, serialize to a writer (`serialize_into`) to avoid allocating a giant `Vec<u8>`.
+
+Example using `bincode`:
+
+```rust
+use hnswlib_rs::{Hnsw, HnswData, L2, Result};
+use std::io::{Read, Write};
+
+fn save_to<W: Write>(hnsw: &Hnsw<String, L2>, mut w: W) -> Result<()> {
+  let data: HnswData<String> = hnsw.to_data()?;
+  bincode::serialize_into(&mut w, &data).unwrap();
+  Ok(())
+}
+
+fn load_from<R: Read>(r: R) -> Result<Hnsw<String, L2>> {
+  let data: HnswData<String> = bincode::deserialize_from(r).unwrap();
+  Hnsw::from_data(L2::new(), data)
+}
+```
+
+## Legacy `hnswlib` loader (read-only)
+
+`legacy::load_hnswlib` loads the original C++ `hnswlib` on-disk format:
+
+```rust
+use hnswlib_rs::{legacy::load_hnswlib, L2, VectorStore};
+
+let bytes = std::fs::read("index.bin")?;
+let (graph, vectors) = load_hnswlib(L2::new(), 128, &bytes)?;
+
+let label: u64 = 123;
+let id = graph.node_id(&label)?;
+let v = vectors.vector(id).unwrap();
+```
+
+Notes:
+- The legacy format does not store the metric/space name; you must provide a `Metric`.
+- The loader is zero-copy over `&[u8]`.
+- For zero-copy `f32` casting, the input bytes must be aligned for `f32` (mmap’d files are fine).
+
+## Non-goals
+
+- API compatibility with the C++ `hnswlib` API.
+- Writing the legacy `hnswlib` format (loading is supported).

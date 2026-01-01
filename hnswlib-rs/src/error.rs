@@ -1,5 +1,3 @@
-use crate::LabelType;
-
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(thiserror::Error, Debug)]
@@ -7,14 +5,20 @@ pub enum Error {
   #[error("dimension mismatch: expected {expected}, got {actual}")]
   DimensionMismatch { expected: usize, actual: usize },
 
-  #[error("label not found: {0}")]
-  LabelNotFound(LabelType),
+  #[error("key not found")]
+  KeyNotFound,
 
-  #[error("index is full (max_elements={max_elements})")]
-  IndexFull { max_elements: usize },
+  #[error("key already exists")]
+  KeyAlreadyExists,
+
+  #[error("index is full (max_nodes={max_nodes})")]
+  IndexFull { max_nodes: usize },
 
   #[error("index is empty")]
   EmptyIndex,
+
+  #[error("missing vector")]
+  MissingVector,
 
   #[error("invalid index format: {0}")]
   InvalidIndexFormat(String),
