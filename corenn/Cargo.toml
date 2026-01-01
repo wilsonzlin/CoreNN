@@ -16,7 +16,7 @@ clap = { version = "4.5.21", features = ["derive"] }
 dashmap = "6.1.0"
 futures = "0.3.31"
 half = "2.4.1"
-hnswlib-rs = { version = "0.6.0", path = "../hnswlib-rs" }
+hnswlib-rs = { version = "0.7.0", path = "../hnswlib-rs" }
 indicatif = "0.17.9"
 itertools = "0.13.0"
 tikv-jemallocator = { version = "0.6.0", features = ["unprefixed_malloc_on_supported_platforms"] }
