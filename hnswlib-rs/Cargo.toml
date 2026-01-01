@@ -20,6 +20,7 @@ rand = "0.8.5"
 rayon = "1.10.0"
 serde = { version = "1.0.215", features = ["derive"] }
 thiserror = "2.0.9"
+tokio = { version = "1.41.1", features = ["rt", "fs", "io-util"] }
 tracing = "0.1.41"
 
 [dev-dependencies]

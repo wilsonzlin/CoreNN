@@ -94,6 +94,34 @@ fn load_from<R: Read>(r: R) -> Result<Hnsw<String, L2>> {
 }
 ```
 
+## Persisting vectors (`InMemoryVectorStore`)
+
+`InMemoryVectorStore` provides async save/load helpers for a raw dense on-disk matrix: row-major `f32` (little-endian), keyed by `NodeId` order, with **no header** (exactly `node_count * dim` floats). Writes/reads are split into `concurrency` contiguous chunks and run concurrently via `tokio::spawn`.
+
+```rust
+use hnswlib_rs::{Hnsw, HnswConfig, InMemoryVectorStore, L2, Result};
+use std::sync::Arc;
+
+async fn save_and_load() -> Result<()> {
+  let dim = 128;
+  let max_nodes = 100_000;
+
+  let hnsw = Hnsw::new(L2::new(), HnswConfig::new(dim, max_nodes));
+  let store = Arc::new(InMemoryVectorStore::new(dim, max_nodes));
+  hnsw.insert(&*store, "doc-1".to_string(), &vec![0.0; dim])?;
+  let node_count = hnsw.len();
+  let concurrency = 8;
+
+  store
+    .save_to_file("vectors.bin", node_count, concurrency)
+    .await?;
+  let (loaded, loaded_count) =
+    InMemoryVectorStore::load_from_file("vectors.bin", dim, max_nodes, concurrency).await?;
+  assert_eq!(loaded_count, node_count);
+  Ok(())
+}
+```
+
 ## Legacy `hnswlib` loader (read-only)
 
 `legacy::load_hnswlib` loads the original C++ `hnswlib` on-disk format:
