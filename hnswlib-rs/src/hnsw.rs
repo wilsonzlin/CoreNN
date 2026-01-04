@@ -2,9 +2,10 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::id::NodeId;
 use crate::metric::Metric;
+use crate::scalar::Dtype;
+use crate::scalar::Scalar;
 use crate::vectors::VectorStore;
 use crate::vectors::VectorStoreMut;
-use crate::vectors::VectorRef;
 use crate::visited::VisitedListPool;
 use ahash::HashSet;
 use ahash::HashSetExt;
@@ -34,11 +35,12 @@ use tracing::warn;
 
 const DEFAULT_LABEL_OPERATION_LOCKS: usize = 65_536;
 const NODE_ID_NONE: u32 = u32::MAX;
-const HNSW_FILE_VERSION: u32 = 1;
+const HNSW_FILE_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HnswHeader {
   version: u32,
+  dtype: Dtype,
   cfg: HnswConfig,
   entry_point: Option<u32>,
   max_level: i32,
@@ -495,11 +497,14 @@ where
       .ok_or_else(|| Error::InvalidIndexFormat("missing node key".to_string()))
   }
 
-  fn distance_between_nodes<V: VectorStore>(&self, vectors: &V, a: NodeId, b: NodeId) -> Result<f32> {
+  fn distance_between_nodes<V>(&self, vectors: &V, a: NodeId, b: NodeId) -> Result<f32>
+  where
+    V: VectorStore<Scalar = M::Scalar>,
+  {
     let va = vectors.vector(a).ok_or(Error::MissingVector)?;
     let vb = vectors.vector(b).ok_or(Error::MissingVector)?;
-    let va = va.as_f32_slice();
-    let vb = vb.as_f32_slice();
+    let va = va.as_ref();
+    let vb = vb.as_ref();
     if va.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
         expected: self.cfg.dim,
@@ -515,7 +520,10 @@ where
     Ok(self.metric.distance(va, vb))
   }
 
-  fn distance_query_to_node<V: VectorStore>(&self, vectors: &V, query: &[f32], node: NodeId) -> Result<f32> {
+  fn distance_query_to_node<V>(&self, vectors: &V, query: &[M::Scalar], node: NodeId) -> Result<f32>
+  where
+    V: VectorStore<Scalar = M::Scalar>,
+  {
     if query.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
         expected: self.cfg.dim,
@@ -523,7 +531,7 @@ where
       });
     }
     let v = vectors.vector(node).ok_or(Error::MissingVector)?;
-    let v = v.as_f32_slice();
+    let v = v.as_ref();
     if v.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
         expected: self.cfg.dim,
@@ -533,7 +541,7 @@ where
     Ok(self.metric.distance(query, v))
   }
 
-  fn get_neighbors_by_heuristic2<V: VectorStore>(
+  fn get_neighbors_by_heuristic2<V: VectorStore<Scalar = M::Scalar>>(
     &self,
     vectors: &V,
     top_candidates: &mut BinaryHeap<(OrderedFloat<f32>, NodeId)>,
@@ -575,11 +583,11 @@ where
     Ok(())
   }
 
-  fn search_base_layer<V: VectorStore>(
+  fn search_base_layer<V: VectorStore<Scalar = M::Scalar>>(
     &self,
     vectors: &V,
     ep: NodeId,
-    query: &[f32],
+    query: &[M::Scalar],
     layer: usize,
     ef: usize,
     filter: Option<&dyn Fn(&K) -> bool>,
@@ -644,7 +652,7 @@ where
     Ok(top_candidates)
   }
 
-  fn mutually_connect_new_element<V: VectorStore>(
+  fn mutually_connect_new_element<V: VectorStore<Scalar = M::Scalar>>(
     &self,
     vectors: &V,
     node: NodeId,
@@ -706,7 +714,7 @@ where
     Ok(next_entry)
   }
 
-  fn connect_backlinks<V: VectorStore>(
+  fn connect_backlinks<V: VectorStore<Scalar = M::Scalar>>(
     &self,
     vectors: &V,
     node: NodeId,
@@ -779,7 +787,12 @@ where
     Ok(())
   }
 
-  fn update_point<V: VectorStore>(&self, vectors: &V, node: NodeId, update_neighbor_probability: f32) -> Result<()> {
+  fn update_point<V: VectorStore<Scalar = M::Scalar>>(
+    &self,
+    vectors: &V,
+    node: NodeId,
+    update_neighbor_probability: f32,
+  ) -> Result<()> {
     let max_level_copy = self.max_level.load(Ordering::Acquire);
     let entry = self.entry_point_node().ok_or(Error::EmptyIndex)?;
 
@@ -871,7 +884,7 @@ where
     Ok(())
   }
 
-  fn repair_connections_for_update<V: VectorStore>(
+  fn repair_connections_for_update<V: VectorStore<Scalar = M::Scalar>>(
     &self,
     vectors: &V,
     entry: NodeId,
@@ -882,7 +895,7 @@ where
     let mut curr = entry;
     if node_level < max_level {
       let node_vec = vectors.vector(node).ok_or(Error::MissingVector)?;
-      let node_vec = node_vec.as_f32_slice();
+      let node_vec = node_vec.as_ref();
       let mut curdist = self.distance_query_to_node(vectors, node_vec, curr)?;
       for level in (node_level + 1..=max_level).rev() {
         let mut changed = true;
@@ -907,7 +920,7 @@ where
     }
 
     let node_vec = vectors.vector(node).ok_or(Error::MissingVector)?;
-    let node_vec = node_vec.as_f32_slice();
+    let node_vec = node_vec.as_ref();
 
     for level in (0..=node_level).rev() {
       let mut top_candidates = self.search_base_layer(vectors, curr, node_vec, level, self.ef_construction, None)?;
@@ -940,7 +953,7 @@ where
     Ok(self.neighbors_at_level(node, level)?.into_iter().collect())
   }
 
-  fn add_point_at_level<V: VectorStore>(
+  fn add_point_at_level<V: VectorStore<Scalar = M::Scalar>>(
     &self,
     vectors: &V,
     node: NodeId,
@@ -984,7 +997,7 @@ where
     };
 
     let node_vec = vectors.vector(node).ok_or(Error::MissingVector)?;
-    let node_vec = node_vec.as_f32_slice();
+    let node_vec = node_vec.as_ref();
 
     if max_level_copy >= 0 && cur_level < max_level_copy {
       let mut curdist = self.distance_query_to_node(vectors, node_vec, entry)?;
@@ -1249,6 +1262,7 @@ where
 
     let header = HnswHeader {
       version: HNSW_FILE_VERSION,
+      dtype: M::Scalar::DTYPE,
       cfg,
       entry_point,
       max_level,
@@ -1303,6 +1317,13 @@ where
       return Err(Error::InvalidIndexFormat(format!(
         "unsupported hnsw file version {}",
         header.version
+      )));
+    }
+    if header.dtype != M::Scalar::DTYPE {
+      return Err(Error::InvalidIndexFormat(format!(
+        "dtype mismatch: file has {:?}, but this Hnsw is {:?}",
+        header.dtype,
+        M::Scalar::DTYPE
       )));
     }
 
@@ -1417,7 +1438,12 @@ where
     Ok(h)
   }
 
-  pub fn insert<V: VectorStoreMut>(&self, vectors: &V, key: K, vector: &[f32]) -> Result<()> {
+  pub fn insert<V: VectorStoreMut<Scalar = M::Scalar>>(
+    &self,
+    vectors: &V,
+    key: K,
+    vector: &[M::Scalar],
+  ) -> Result<()> {
     if vector.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
         expected: self.cfg.dim,
@@ -1448,7 +1474,12 @@ where
     Ok(())
   }
 
-  pub fn set<V: VectorStoreMut>(&self, vectors: &V, key: K, vector: &[f32]) -> Result<SetOutcome> {
+  pub fn set<V: VectorStoreMut<Scalar = M::Scalar>>(
+    &self,
+    vectors: &V,
+    key: K,
+    vector: &[M::Scalar],
+  ) -> Result<SetOutcome> {
     if vector.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
         expected: self.cfg.dim,
@@ -1498,10 +1529,10 @@ where
     Ok(true)
   }
 
-  pub fn search<V: VectorStore>(
+  pub fn search<V: VectorStore<Scalar = M::Scalar>>(
     &self,
     vectors: &V,
-    query: &[f32],
+    query: &[M::Scalar],
     k: usize,
     filter: Option<&dyn Fn(&K) -> bool>,
   ) -> Result<Vec<SearchHit<K>>> {
@@ -1778,6 +1809,7 @@ mod tests {
       let mut f = std::fs::File::create(&path).unwrap();
       let header = HnswHeader {
         version: HNSW_FILE_VERSION + 1,
+        dtype: Dtype::F32,
         cfg: HnswConfig::new(4, 16).m(8),
         entry_point: None,
         max_level: -1,
@@ -1786,15 +1818,15 @@ mod tests {
       bincode::serialize_into(&mut f, &header).unwrap();
     }
 
-	    let err = {
-	      let mut f = std::fs::File::open(&path).unwrap();
-	      match Hnsw::<u64, _>::load_from(L2::new(), &mut f) {
-	        Ok(_) => panic!("expected version mismatch error"),
-	        Err(err) => err,
-	      }
-	    };
-	    assert!(matches!(err, Error::InvalidIndexFormat(_)));
-	  }
+    let err = {
+      let mut f = std::fs::File::open(&path).unwrap();
+      match Hnsw::<u64, _>::load_from(L2::<f32>::new(), &mut f) {
+        Ok(_) => panic!("expected version mismatch error"),
+        Err(err) => err,
+      }
+    };
+    assert!(matches!(err, Error::InvalidIndexFormat(_)));
+  }
 
   #[test]
   fn insert_delete_resurrect() {
@@ -1853,7 +1885,7 @@ mod tests {
 
     let id = h.node_id(&7).unwrap();
     let stored = store.vector(id).unwrap();
-    assert_eq!(stored.as_f32_slice(), v2.as_slice());
+    assert_eq!(stored.as_ref(), v2.as_slice());
     assert_integrity(&h);
   }
 

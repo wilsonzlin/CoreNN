@@ -6,6 +6,8 @@ This crate intentionally decouples the **graph** from **vector storage**:
 - `Hnsw<K, M>` owns the graph + a mapping from your external key `K` to an internal dense `NodeId`.
 - You provide a `VectorStore` keyed by `NodeId` to supply vectors on demand.
 
+Scalars: the graph/metric are generic over scalar type (`f32`, `f16`, `bf16`); distance computations accumulate in `f32`.
+
 ## Quickstart
 
 ```rust
@@ -21,7 +23,7 @@ fn main() -> Result<()> {
     .ef_search(50);
 
   let hnsw = Hnsw::new(L2::new(), cfg);
-  let vectors = InMemoryVectorStore::new(dim, max_nodes);
+  let vectors = InMemoryVectorStore::<f32>::new(dim, max_nodes);
 
   let v = vec![0.0; dim];
   hnsw.insert(&vectors, "doc-1".to_string(), &v)?;
@@ -74,6 +76,7 @@ Use `Hnsw::save_to()` / `Hnsw::load_from()` to save/load the **graph + key mappi
 Notes:
 - Vectors are **not** included; persist your `VectorStore` separately (keyed by `NodeId`).
 - The metric/space is not stored; you must provide the `Metric` when loading.
+- The graph file includes `dim` and `dtype`; `load_from` validates `dtype` against the `Metric`’s scalar type.
 
 ```rust
 use hnswlib_rs::{Hnsw, HnswConfig, InMemoryVectorStore, L2, Result};
@@ -83,7 +86,7 @@ fn save_and_load() -> Result<()> {
   let max_nodes = 100_000;
 
   let hnsw = Hnsw::new(L2::new(), HnswConfig::new(dim, max_nodes));
-  let vectors = InMemoryVectorStore::new(dim, max_nodes);
+  let vectors = InMemoryVectorStore::<f32>::new(dim, max_nodes);
   hnsw.insert(&vectors, "doc-1".to_string(), &vec![0.0; dim])?;
 
   let mut f = std::fs::File::create("hnsw.bin")?;
@@ -98,7 +101,7 @@ fn save_and_load() -> Result<()> {
 
 ## Persisting vectors (`InMemoryVectorStore`)
 
-`InMemoryVectorStore` provides `save_to` / `load_from` for a raw dense on-disk matrix: row-major `f32` (little-endian), keyed by `NodeId` order, with **no header** (exactly `node_count * dim` floats).
+`InMemoryVectorStore` provides `save_to` / `load_from` for a raw dense on-disk matrix: row-major `S` (little-endian), keyed by `NodeId` order, with **no header** (exactly `node_count * dim` scalars).
 
 ```rust
 use hnswlib_rs::{Hnsw, HnswConfig, InMemoryVectorStore, L2, Result};
@@ -108,7 +111,7 @@ fn save_and_load() -> Result<()> {
   let max_nodes = 100_000;
 
   let hnsw = Hnsw::new(L2::new(), HnswConfig::new(dim, max_nodes));
-  let store = InMemoryVectorStore::new(dim, max_nodes);
+  let store = InMemoryVectorStore::<f32>::new(dim, max_nodes);
   hnsw.insert(&store, "doc-1".to_string(), &vec![0.0; dim])?;
   let node_count = hnsw.len();
 
@@ -116,7 +119,7 @@ fn save_and_load() -> Result<()> {
   store.save_to(&mut f, node_count)?;
 
   let mut f = std::fs::File::open("vectors.bin")?;
-  let (loaded, loaded_count) = InMemoryVectorStore::load_from(&mut f, dim, max_nodes)?;
+  let (loaded, loaded_count) = InMemoryVectorStore::<f32>::load_from(&mut f, dim, max_nodes)?;
   assert_eq!(loaded_count, node_count);
   Ok(())
 }

@@ -12,6 +12,7 @@ ahash = { version = "0.8.11", features = ["serde"] }
 arbitrary-lock = "0.1.1"
 bytemuck = "1.20.0"
 byteorder = "1.5.0"
+corenn-kernels = { version = "0.1.0", path = "../corenn-kernels" }
 dashmap = { version = "6.1.0", features = ["rayon", "serde"] }
 data-encoding = "2.6.0"
 derive_more = { version = "2.0.1", features = ["from"] }

@@ -2,9 +2,9 @@ use ahash::HashMap;
 use clap::Args;
 use hnswlib_rs::legacy::load_hnswlib;
 use hnswlib_rs::Cosine;
+use hnswlib_rs::InnerProduct;
 use hnswlib_rs::L2;
 use hnswlib_rs::Metric;
-use hnswlib_rs::VectorRef;
 use hnswlib_rs::VectorStore;
 use libcorenn::cfg::Cfg;
 use libcorenn::metric::StdMetric;
@@ -22,13 +22,17 @@ use tokio::fs::read;
 #[derive(Clone)]
 enum LegacyMetric {
   L2(L2),
+  InnerProduct(InnerProduct),
   Cosine(Cosine),
 }
 
 impl Metric for LegacyMetric {
+  type Scalar = f32;
+
   fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
     match self {
       LegacyMetric::L2(m) => m.distance(a, b),
+      LegacyMetric::InnerProduct(m) => m.distance(a, b),
       LegacyMetric::Cosine(m) => m.distance(a, b),
     }
   }
@@ -57,8 +61,9 @@ impl MigrateHnswArgs {
   pub async fn exec(self: MigrateHnswArgs) {
     let hnsw_raw = read(&self.path).await.unwrap();
     let metric = match self.metric {
-      StdMetric::L2 => LegacyMetric::L2(L2::new()),
+      StdMetric::L2Sq => LegacyMetric::L2(L2::new()),
       StdMetric::Cosine => LegacyMetric::Cosine(Cosine::new()),
+      StdMetric::InnerProduct => LegacyMetric::InnerProduct(InnerProduct::new()),
     };
     let (graph, vectors) = load_hnswlib(metric, self.dim, &hnsw_raw).unwrap();
 
@@ -107,7 +112,7 @@ impl MigrateHnswArgs {
         version: 0,
         neighbors,
         // TODO Allow configuring dtype.
-        vector: Arc::new(vectors.vector(entry_node).unwrap().as_f32_slice().to_vec().into()),
+        vector: Arc::new(vectors.vector(entry_node).unwrap().to_vec().into()),
       });
       ADD_EDGES.put(db, 0, Vec::<usize>::new());
     };
@@ -133,7 +138,7 @@ impl MigrateHnswArgs {
       NODE.put(db, id, DbNodeData {
         version: 0,
         neighbors,
-        vector: Arc::new(vectors.vector(node).unwrap().as_f32_slice().to_vec().into()),
+        vector: Arc::new(vectors.vector(node).unwrap().to_vec().into()),
       });
       ADD_EDGES.put(db, id, Vec::<usize>::new());
     }

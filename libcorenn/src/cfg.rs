@@ -22,7 +22,7 @@ pub struct Cfg {
   pub compression_mode: CompressionMode,
   pub compression_threshold: usize,
   pub dim: usize,
-  pub distance_threshold: f64,
+  pub distance_threshold: f32,
   pub max_add_edges: usize,
   pub max_edges: usize,
   pub metric: StdMetric,
@@ -45,7 +45,7 @@ impl Default for Cfg {
       distance_threshold: 1.1,
       max_add_edges: max_edges,
       max_edges,
-      metric: StdMetric::L2,  // L2 is the safe bet.
+      metric: StdMetric::L2Sq, // L2 is the safe bet.
       pq_sample_size: 10_000, // Default: plenty, while fast to train.
       query_search_list_cap,
       update_search_list_cap: query_search_list_cap,

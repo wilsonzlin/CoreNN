@@ -1,287 +1,72 @@
+use crate::scalar::Scalar;
+use corenn_kernels::cosine_distance;
+use corenn_kernels::inner_product_distance;
+use corenn_kernels::Kernel;
+use std::marker::PhantomData;
+
 pub trait Metric: Clone + Send + Sync + 'static {
-  fn distance(&self, a: &[f32], b: &[f32]) -> f32;
+  type Scalar: Scalar;
+  fn distance(&self, a: &[Self::Scalar], b: &[Self::Scalar]) -> f32;
 }
 
-type DistanceFn = unsafe fn(*const f32, *const f32, usize) -> f32;
+#[derive(Clone, Debug, Default)]
+pub struct L2<S: Scalar = f32>(PhantomData<S>);
 
-unsafe fn l2_scalar(a: *const f32, b: *const f32, dim: usize) -> f32 {
-  let mut res = 0.0_f32;
-  for i in 0..dim {
-    let t = *a.add(i) - *b.add(i);
-    res += t * t;
-  }
-  res
-}
-
-unsafe fn dot_scalar(a: *const f32, b: *const f32, dim: usize) -> f32 {
-  let mut dot = 0.0_f32;
-  for i in 0..dim {
-    dot += *a.add(i) * *b.add(i);
-  }
-  dot
-}
-
-unsafe fn ip_distance_scalar(a: *const f32, b: *const f32, dim: usize) -> f32 {
-  1.0_f32 - dot_scalar(a, b, dim)
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-mod x86_simd {
-  use super::DistanceFn;
-  #[cfg(target_arch = "x86")]
-  use std::arch::x86::*;
-  #[cfg(target_arch = "x86_64")]
-  use std::arch::x86_64::*;
-
-  #[target_feature(enable = "sse")]
-  pub unsafe fn l2_sse(a: *const f32, b: *const f32, dim: usize) -> f32 {
-    let mut sum = _mm_setzero_ps();
-    let mut i = 0usize;
-    while i + 4 <= dim {
-      let va = _mm_loadu_ps(a.add(i));
-      let vb = _mm_loadu_ps(b.add(i));
-      let diff = _mm_sub_ps(va, vb);
-      sum = _mm_add_ps(sum, _mm_mul_ps(diff, diff));
-      i += 4;
-    }
-
-    let mut tmp = [0.0_f32; 4];
-    _mm_storeu_ps(tmp.as_mut_ptr(), sum);
-    let mut res = tmp.iter().sum::<f32>();
-
-    while i < dim {
-      let t = *a.add(i) - *b.add(i);
-      res += t * t;
-      i += 1;
-    }
-    res
-  }
-
-  #[target_feature(enable = "avx")]
-  pub unsafe fn l2_avx(a: *const f32, b: *const f32, dim: usize) -> f32 {
-    let mut sum = _mm256_setzero_ps();
-    let mut i = 0usize;
-    while i + 8 <= dim {
-      let va = _mm256_loadu_ps(a.add(i));
-      let vb = _mm256_loadu_ps(b.add(i));
-      let diff = _mm256_sub_ps(va, vb);
-      sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
-      i += 8;
-    }
-
-    let mut tmp = [0.0_f32; 8];
-    _mm256_storeu_ps(tmp.as_mut_ptr(), sum);
-    let mut res = tmp.iter().sum::<f32>();
-
-    while i < dim {
-      let t = *a.add(i) - *b.add(i);
-      res += t * t;
-      i += 1;
-    }
-    res
-  }
-
-  #[target_feature(enable = "avx512f")]
-  pub unsafe fn l2_avx512(a: *const f32, b: *const f32, dim: usize) -> f32 {
-    let mut sum = _mm512_setzero_ps();
-    let mut i = 0usize;
-    while i + 16 <= dim {
-      let va = _mm512_loadu_ps(a.add(i));
-      let vb = _mm512_loadu_ps(b.add(i));
-      let diff = _mm512_sub_ps(va, vb);
-      sum = _mm512_add_ps(sum, _mm512_mul_ps(diff, diff));
-      i += 16;
-    }
-
-    let mut res = _mm512_reduce_add_ps(sum);
-    while i < dim {
-      let t = *a.add(i) - *b.add(i);
-      res += t * t;
-      i += 1;
-    }
-    res
-  }
-
-  #[target_feature(enable = "sse")]
-  pub unsafe fn ip_distance_sse(a: *const f32, b: *const f32, dim: usize) -> f32 {
-    let mut sum = _mm_setzero_ps();
-    let mut i = 0usize;
-    while i + 4 <= dim {
-      let va = _mm_loadu_ps(a.add(i));
-      let vb = _mm_loadu_ps(b.add(i));
-      sum = _mm_add_ps(sum, _mm_mul_ps(va, vb));
-      i += 4;
-    }
-
-    let mut tmp = [0.0_f32; 4];
-    _mm_storeu_ps(tmp.as_mut_ptr(), sum);
-    let mut dot = tmp.iter().sum::<f32>();
-
-    while i < dim {
-      dot += *a.add(i) * *b.add(i);
-      i += 1;
-    }
-    1.0_f32 - dot
-  }
-
-  #[target_feature(enable = "avx")]
-  pub unsafe fn ip_distance_avx(a: *const f32, b: *const f32, dim: usize) -> f32 {
-    let mut sum = _mm256_setzero_ps();
-    let mut i = 0usize;
-    while i + 8 <= dim {
-      let va = _mm256_loadu_ps(a.add(i));
-      let vb = _mm256_loadu_ps(b.add(i));
-      sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
-      i += 8;
-    }
-
-    let mut tmp = [0.0_f32; 8];
-    _mm256_storeu_ps(tmp.as_mut_ptr(), sum);
-    let mut dot = tmp.iter().sum::<f32>();
-
-    while i < dim {
-      dot += *a.add(i) * *b.add(i);
-      i += 1;
-    }
-    1.0_f32 - dot
-  }
-
-  #[target_feature(enable = "avx512f")]
-  pub unsafe fn ip_distance_avx512(a: *const f32, b: *const f32, dim: usize) -> f32 {
-    let mut sum = _mm512_setzero_ps();
-    let mut i = 0usize;
-    while i + 16 <= dim {
-      let va = _mm512_loadu_ps(a.add(i));
-      let vb = _mm512_loadu_ps(b.add(i));
-      sum = _mm512_add_ps(sum, _mm512_mul_ps(va, vb));
-      i += 16;
-    }
-
-    let mut dot = _mm512_reduce_add_ps(sum);
-    while i < dim {
-      dot += *a.add(i) * *b.add(i);
-      i += 1;
-    }
-    1.0_f32 - dot
-  }
-
-  pub fn pick_l2() -> Option<DistanceFn> {
-    if std::is_x86_feature_detected!("avx512f") {
-      return Some(l2_avx512);
-    }
-    if std::is_x86_feature_detected!("avx") {
-      return Some(l2_avx);
-    }
-    if std::is_x86_feature_detected!("sse") {
-      return Some(l2_sse);
-    }
-    None
-  }
-
-  pub fn pick_ip_distance() -> Option<DistanceFn> {
-    if std::is_x86_feature_detected!("avx512f") {
-      return Some(ip_distance_avx512);
-    }
-    if std::is_x86_feature_detected!("avx") {
-      return Some(ip_distance_avx);
-    }
-    if std::is_x86_feature_detected!("sse") {
-      return Some(ip_distance_sse);
-    }
-    None
-  }
-}
-
-#[derive(Clone, Debug)]
-pub struct L2 {
-  dist_fn: DistanceFn,
-}
-
-impl Default for L2 {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
-impl L2 {
+impl<S: Scalar> L2<S> {
   pub fn new() -> Self {
-    let mut dist_fn: DistanceFn = l2_scalar;
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if let Some(f) = x86_simd::pick_l2() {
-      dist_fn = f;
-    }
-    Self { dist_fn }
+    Self(PhantomData)
   }
 }
 
-impl Metric for L2 {
-  fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
+impl<S: Scalar> Metric for L2<S> {
+  type Scalar = S;
+
+  fn distance(&self, a: &[S], b: &[S]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    unsafe { (self.dist_fn)(a.as_ptr(), b.as_ptr(), a.len()) }
-  }
-}
-
-#[derive(Clone, Debug)]
-pub struct InnerProduct {
-  dist_fn: DistanceFn,
-}
-
-impl Default for InnerProduct {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
-impl InnerProduct {
-  pub fn new() -> Self {
-    let mut dist_fn: DistanceFn = ip_distance_scalar;
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if let Some(f) = x86_simd::pick_ip_distance() {
-      dist_fn = f;
-    }
-    Self { dist_fn }
-  }
-}
-
-impl Metric for InnerProduct {
-  fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    unsafe { (self.dist_fn)(a.as_ptr(), b.as_ptr(), a.len()) }
+    <S as Kernel>::l2_sq(a, b)
   }
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Cosine {
-  ip: InnerProduct,
-}
+pub struct InnerProduct<S: Scalar = f32>(PhantomData<S>);
 
-impl Cosine {
+impl<S: Scalar> InnerProduct<S> {
   pub fn new() -> Self {
-    Self { ip: InnerProduct::new() }
+    Self(PhantomData)
   }
 }
 
-impl Metric for Cosine {
-  fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
+impl<S: Scalar> Metric for InnerProduct<S> {
+  type Scalar = S;
+
+  fn distance(&self, a: &[S], b: &[S]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    let mut norm_a = 0.0_f32;
-    let mut norm_b = 0.0_f32;
-    for i in 0..a.len() {
-      norm_a += a[i] * a[i];
-      norm_b += b[i] * b[i];
-    }
-    if norm_a == 0.0 || norm_b == 0.0 {
-      return 1.0;
-    }
-    // InnerProduct distance is `1 - dot`, so dot = 1 - dist.
-    let dot = 1.0 - self.ip.distance(a, b);
-    1.0 - dot / (norm_a.sqrt() * norm_b.sqrt())
+    inner_product_distance::<S>(a, b)
   }
 }
 
-pub fn normalize_cosine_in_place(vector: &mut [f32]) {
+#[derive(Clone, Debug, Default)]
+pub struct Cosine<S: Scalar = f32>(PhantomData<S>);
+
+impl<S: Scalar> Cosine<S> {
+  pub fn new() -> Self {
+    Self(PhantomData)
+  }
+}
+
+impl<S: Scalar> Metric for Cosine<S> {
+  type Scalar = S;
+
+  fn distance(&self, a: &[S], b: &[S]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    cosine_distance::<S>(a, b)
+  }
+}
+
+pub fn normalize_cosine_in_place<S: Scalar>(vector: &mut [S]) {
   let mut norm_sq = 0.0_f32;
   for &v in vector.iter() {
+    let v = v.to_f32();
     norm_sq += v * v;
   }
   if norm_sq == 0.0 {
@@ -289,7 +74,7 @@ pub fn normalize_cosine_in_place(vector: &mut [f32]) {
   }
   let inv_norm = norm_sq.sqrt().recip();
   for v in vector.iter_mut() {
-    *v *= inv_norm;
+    *v = S::from_f32(v.to_f32() * inv_norm);
   }
 }
 
@@ -321,7 +106,7 @@ mod tests {
     let dims = [
       1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255,
     ];
-    let metric = L2::new();
+    let metric = L2::<f32>::new();
     for &dim in &dims {
       for _ in 0..100 {
         let a: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
@@ -342,7 +127,7 @@ mod tests {
     let dims = [
       1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255,
     ];
-    let metric = InnerProduct::new();
+    let metric = InnerProduct::<f32>::new();
     for &dim in &dims {
       for _ in 0..100 {
         let a: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();

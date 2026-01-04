@@ -27,12 +27,11 @@ impl Compressor for TruncCompressor {
       VecData::BF16(mut a) => VecData::BF16(trunc!(a)),
       VecData::F16(mut a) => VecData::F16(trunc!(a)),
       VecData::F32(mut a) => VecData::F32(trunc!(a)),
-      VecData::F64(mut a) => VecData::F64(trunc!(a)),
     };
     Arc::new(v)
   }
 
-  fn dist(&self, metric: StdMetric, a: &CV, b: &CV) -> f64 {
+  fn dist(&self, metric: StdMetric, a: &CV, b: &CV) -> f32 {
     let a = a.downcast_ref::<VecData>().unwrap();
     let b = b.downcast_ref::<VecData>().unwrap();
     let f = metric.get_fn();

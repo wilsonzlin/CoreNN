@@ -3,6 +3,7 @@ pub mod error;
 pub mod hnsw;
 pub mod id;
 pub mod metric;
+pub mod scalar;
 pub mod vectors;
 pub(crate) mod visited;
 
@@ -17,7 +18,8 @@ pub use metric::Cosine;
 pub use metric::InnerProduct;
 pub use metric::L2;
 pub use metric::Metric;
+pub use scalar::Dtype;
+pub use scalar::Scalar;
 pub use vectors::InMemoryVectorStore;
-pub use vectors::VectorRef;
 pub use vectors::VectorStore;
 pub use vectors::VectorStoreMut;

@@ -22,7 +22,6 @@ pub enum Dtype {
   BF16,
   F16,
   F32,
-  F64,
 }
 
 #[derive(Args)]
@@ -50,12 +49,11 @@ struct Ctx {
 }
 
 impl Ctx {
-  pub fn vec(&self, vector: Vec<f64>) -> VecData {
+  pub fn vec(&self, vector: Vec<f32>) -> VecData {
     match self.dtype {
-      Dtype::BF16 => VecData::BF16(vector.into_iter().map(|x| bf16::from_f64(x)).collect()),
-      Dtype::F16 => VecData::F16(vector.into_iter().map(|x| f16::from_f64(x)).collect()),
-      Dtype::F32 => VecData::F32(vector.into_iter().map(|x| x as f32).collect()),
-      Dtype::F64 => VecData::F64(vector),
+      Dtype::BF16 => VecData::BF16(vector.into_iter().map(bf16::from_f32).collect()),
+      Dtype::F16 => VecData::F16(vector.into_iter().map(f16::from_f32).collect()),
+      Dtype::F32 => VecData::F32(vector),
     }
   }
 }
@@ -63,7 +61,7 @@ impl Ctx {
 #[derive(Deserialize)]
 struct PostInsertReqVector {
   key: String,
-  vector: Vec<f64>,
+  vector: Vec<f32>,
 }
 
 #[derive(Deserialize)]
@@ -80,13 +78,13 @@ async fn handle_post_insert(State(ctx): State<Arc<Ctx>>, Json(req): Json<PostIns
 
 #[derive(Deserialize)]
 struct PostQueryReq {
-  vector: Vec<f64>,
+  vector: Vec<f32>,
   k: usize,
 }
 
 #[derive(Serialize)]
 struct PostQueryRes {
-  results: Vec<(String, f64)>,
+  results: Vec<(String, f32)>,
 }
 
 async fn handle_post_query(

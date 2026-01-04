@@ -1,15 +1,9 @@
-#![feature(avx512_target_feature)]
 #![feature(duration_millis_float)]
 #![feature(f16)]
-#![feature(path_add_extension)]
 #![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_f16))]
 #![cfg_attr(
   any(target_arch = "x86", target_arch = "x86_64"),
   feature(stdarch_x86_avx512_f16)
-)]
-#![cfg_attr(
-  any(target_arch = "x86", target_arch = "x86_64"),
-  feature(stdarch_x86_avx512)
 )]
 
 use ahash::HashSet;
@@ -97,11 +91,11 @@ struct Point {
   metric_type: StdMetric,
   metric: Metric,
   // Optional convenient slot to store distance to something. Not set initially when getting node.
-  dist: OrderedFloat<f64>,
+  dist: OrderedFloat<f32>,
 }
 
 impl Point {
-  pub fn dist(&self, other: &Point) -> f64 {
+  pub fn dist(&self, other: &Point) -> f32 {
     match (&self.vec, &other.vec) {
       (PointVec::Uncompressed(a), PointVec::Uncompressed(b)) => (self.metric)(a, b),
       (PointVec::Compressed(c, a), PointVec::Compressed(_c, b)) => c.dist(self.metric_type, a, b),
@@ -112,7 +106,7 @@ impl Point {
     }
   }
 
-  pub fn dist_query(&self, query: &VecData) -> f64 {
+  pub fn dist_query(&self, query: &VecData) -> f32 {
     match &self.vec {
       PointVec::Uncompressed(v) => (self.metric)(v, query),
       PointVec::Compressed(c, cv) => c.dist(self.metric_type, cv, &c.compress(query)),
@@ -204,7 +198,7 @@ impl CoreNN {
         vec,
         metric: self.metric,
         metric_type: self.cfg.metric,
-        dist: OrderedFloat(f64::INFINITY),
+        dist: OrderedFloat(f32::INFINITY),
       };
       if let Some(q) = query {
         node.dist.0 = node.dist_query(q);
@@ -446,7 +440,7 @@ impl CoreNN {
     Self::new(None::<PathBuf>, Some(cfg), false, true)
   }
 
-  pub fn query<D>(&self, query: &[D], k: usize) -> Vec<(String, f64)>
+  pub fn query<D>(&self, query: &[D], k: usize) -> Vec<(String, f32)>
   where
     D: num::Float,
     VecData: From<Vec<D>>,
@@ -457,7 +451,7 @@ impl CoreNN {
 
   /// WARNING: `query` must not contain any NaN values.
   /// It's possible to get less than k results due to data changes during the query.
-  pub fn query_vec(&self, query: VecData, k: usize) -> Vec<(String, f64)> {
+  pub fn query_vec(&self, query: VecData, k: usize) -> Vec<(String, f32)> {
     let res = self
       .search(&query, k, max(k, self.cfg.query_search_list_cap))
       .0;

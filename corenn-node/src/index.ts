@@ -16,7 +16,7 @@ export type Cfg = {
   distanceThreshold: number;
   maxAddEdges: number;
   maxEdges: number;
-  metric: "l2" | "cosine";
+  metric: "l2" | "l2_sq" | "cosine" | "inner_product" | "ip";
   pqSampleSize: number;
   pqSubspaces: number;
   querySearchListCap: number;
@@ -42,11 +42,11 @@ export class CoreNN {
     return new CoreNN(db);
   }
 
-  insert(entries: Array<{key: string, vector: Float32Array | Float64Array}>) {
+  insert(entries: Array<{key: string, vector: Float32Array}>) {
     internal.insert(this.db, entries);
   }
 
-  query(query: Float32Array | Float64Array, k: number): Array<{ key: string; distance: number }> {
+  query(query: Float32Array, k: number): Array<{ key: string; distance: number }> {
     return internal.query(this.db, query, k);
   }
 }

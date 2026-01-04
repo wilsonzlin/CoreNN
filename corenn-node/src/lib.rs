@@ -39,8 +39,9 @@ fn compression_mode_from_str(
 fn metric_from_str(cx: &mut FunctionContext, s: Handle<JsString>) -> NeonResult<StdMetric> {
   let s = s.value(cx);
   match s.as_str() {
-    "l2" => Ok(StdMetric::L2),
+    "l2" | "l2_sq" => Ok(StdMetric::L2Sq),
     "cosine" => Ok(StdMetric::Cosine),
+    "inner_product" | "ip" => Ok(StdMetric::InnerProduct),
     _ => cx.throw_type_error("Invalid metric"),
   }
 }
@@ -72,7 +73,13 @@ fn cfg_from_js(cx: &mut FunctionContext, cfg_js: &JsObject) -> NeonResult<Cfg> {
   });
   prop!(compression_threshold, JsNumber, |cx, v| as_usize(cx, v));
   prop!(dim, JsNumber, |cx, v| as_usize(cx, v));
-  prop!(distance_threshold, JsNumber, |cx, v| Ok(v.value(cx)));
+  prop!(distance_threshold, JsNumber, |cx, v| {
+    let v = v.value(cx);
+    if !v.is_finite() {
+      return cx.throw_type_error("Expected a finite number");
+    }
+    Ok(v as f32)
+  });
   prop!(max_add_edges, JsNumber, |cx, v| as_usize(cx, v));
   prop!(max_edges, JsNumber, |cx, v| as_usize(cx, v));
   prop!(metric, JsString, |cx, v| metric_from_str(cx, v));
@@ -127,11 +134,8 @@ fn insert(mut cx: FunctionContext) -> NeonResult<Handle<JsUndefined>> {
     if let Ok(as_f32) = vector.downcast::<JsTypedArray<f32>, _>(&mut cx) {
       let vector = as_f32.as_slice(&mut cx);
       db.insert(&key, vector);
-    } else if let Ok(as_f64) = vector.downcast::<JsTypedArray<f64>, _>(&mut cx) {
-      let vector = as_f64.as_slice(&mut cx);
-      db.insert(&key, vector);
     } else {
-      cx.throw_type_error("Expected a Float32Array or Float64Array")?;
+      cx.throw_type_error("Expected a Float32Array")?;
     }
   }
   Ok(cx.undefined())
@@ -145,11 +149,8 @@ fn query(mut cx: FunctionContext) -> NeonResult<Handle<JsArray>> {
   let results = if let Ok(as_f32) = query.downcast::<JsTypedArray<f32>, _>(&mut cx) {
     let query = as_f32.as_slice(&mut cx);
     db.query(query, k)
-  } else if let Ok(as_f64) = query.downcast::<JsTypedArray<f64>, _>(&mut cx) {
-    let query = as_f64.as_slice(&mut cx);
-    db.query(query, k)
   } else {
-    return cx.throw_type_error("Expected a Float32Array or Float64Array");
+    return cx.throw_type_error("Expected a Float32Array");
   };
   let js_results = cx.empty_array();
   for (i, (key, dist)) in results.into_iter().enumerate() {

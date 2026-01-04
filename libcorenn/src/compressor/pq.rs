@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::min;
 use std::sync::Arc;
+use corenn_kernels::Kernel;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProductQuantizer<T: Float> {
@@ -130,7 +131,7 @@ impl Compressor for ProductQuantizer<f32> {
     Arc::new(self.encode(&view))
   }
 
-  fn dist(&self, metric: StdMetric, a: &CV, b: &CV) -> f64 {
+  fn dist(&self, metric: StdMetric, a: &CV, b: &CV) -> f32 {
     let a_codes = a.downcast_ref::<Vec<u8>>().unwrap();
     let b_codes = b.downcast_ref::<Vec<u8>>().unwrap();
     assert_eq!(a_codes.len(), b_codes.len());
@@ -138,10 +139,8 @@ impl Compressor for ProductQuantizer<f32> {
     let num_subspaces = a_codes.len();
 
     match metric {
-      StdMetric::L2 => {
-        // Calculate L2 distance: sqrt(sum_i(||centroid_a_i - centroid_b_i||^2))
-        // This is the sum of squared Euclidean distances between corresponding sub-centroids.
-        let mut total_dist_sq_f64 = 0.0_f64;
+      StdMetric::L2Sq => {
+        let mut total_dist_sq = 0.0_f32;
 
         for i in 0..num_subspaces {
           let codebook = &self.subspace_codebooks[i]; // KMeans<f32, L2Dist>
@@ -150,25 +149,19 @@ impl Compressor for ProductQuantizer<f32> {
           let centroid_a_sub = centroids.row(a_codes[i].into()); // ArrayView1<f32>
           let centroid_b_sub = centroids.row(b_codes[i].into()); // ArrayView1<f32>
 
-          let mut sub_dist_sq_f64 = 0.0_f64;
-          // Assuming centroid_a_sub and centroid_b_sub have the same length (subdims)
+          let mut sub_dist_sq = 0.0_f32;
           for k in 0..centroid_a_sub.len() {
-            let diff_f32 = centroid_a_sub[k] - centroid_b_sub[k];
-            let diff_f64: f64 = diff_f32.into(); // Promote to f64 for sum of squares
-            sub_dist_sq_f64 += diff_f64 * diff_f64;
+            let diff = centroid_a_sub[k] - centroid_b_sub[k];
+            sub_dist_sq += diff * diff;
           }
-          total_dist_sq_f64 += sub_dist_sq_f64;
+          total_dist_sq += sub_dist_sq;
         }
-        total_dist_sq_f64.sqrt()
+        total_dist_sq
       }
-      StdMetric::Cosine => {
-        // Calculate Cosine distance: 1 - (A_hat . B_hat) / (||A_hat|| * ||B_hat||)
-        // A_hat and B_hat are reconstructed vectors from centroids.
-        // A_hat . B_hat = sum_i (centroid_a_sub_i . centroid_b_sub_i)
-        // ||A_hat||^2 = sum_i ||centroid_a_sub_i||^2
-        let mut total_dot_product_f64 = 0.0_f64;
-        let mut total_norm_sq_a_f64 = 0.0_f64;
-        let mut total_norm_sq_b_f64 = 0.0_f64;
+      StdMetric::Cosine | StdMetric::InnerProduct => {
+        let mut total_dot = 0.0_f32;
+        let mut total_norm_sq_a = 0.0_f32;
+        let mut total_norm_sq_b = 0.0_f32;
 
         for i in 0..num_subspaces {
           let codebook = &self.subspace_codebooks[i];
@@ -176,40 +169,33 @@ impl Compressor for ProductQuantizer<f32> {
           let centroid_a_sub = centroids.row(a_codes[i] as usize);
           let centroid_b_sub = centroids.row(b_codes[i] as usize);
 
-          // .dot() on ArrayView1<f32> returns f32. Cast to f64 for accumulation.
-          total_dot_product_f64 += (centroid_a_sub.dot(&centroid_b_sub)) as f64;
-          total_norm_sq_a_f64 += (centroid_a_sub.dot(&centroid_a_sub)) as f64; // ||ca_j||^2
-          total_norm_sq_b_f64 += (centroid_b_sub.dot(&centroid_b_sub)) as f64; // ||cb_j||^2
+          let a_slice = centroid_a_sub.as_slice().unwrap();
+          let b_slice = centroid_b_sub.as_slice().unwrap();
+          let (dot, norm_sq_a, norm_sq_b) = <f32 as Kernel>::dot_and_norms(a_slice, b_slice);
+          total_dot += dot;
+          total_norm_sq_a += norm_sq_a;
+          total_norm_sq_b += norm_sq_b;
         }
 
-        // Handle cases with zero vectors using a small epsilon for squared norms.
-        // A squared norm being less than EPSILON_SQ_NORM means the norm itself is very small.
-        const EPSILON_SQ_NORM: f64 = 1e-12;
-
-        if total_norm_sq_a_f64 < EPSILON_SQ_NORM && total_norm_sq_b_f64 < EPSILON_SQ_NORM {
-          return 0.0; // Both reconstructed vectors are effectively zero. Cosine distance is 0.
+        match metric {
+          StdMetric::InnerProduct => 1.0 - total_dot,
+          StdMetric::Cosine => {
+            const EPSILON_SQ_NORM: f32 = 1e-12;
+            if total_norm_sq_a < EPSILON_SQ_NORM && total_norm_sq_b < EPSILON_SQ_NORM {
+              return 0.0;
+            }
+            if total_norm_sq_a < EPSILON_SQ_NORM || total_norm_sq_b < EPSILON_SQ_NORM {
+              return 1.0;
+            }
+            let denom = (total_norm_sq_a * total_norm_sq_b).sqrt();
+            if denom == 0.0 {
+              return 1.0;
+            }
+            let cosine_similarity = total_dot / denom;
+            1.0 - cosine_similarity.clamp(-1.0, 1.0)
+          }
+          StdMetric::L2Sq => unreachable!(),
         }
-        if total_norm_sq_a_f64 < EPSILON_SQ_NORM || total_norm_sq_b_f64 < EPSILON_SQ_NORM {
-          // One vector is effectively zero, the other is not. Cosine similarity is 0, distance is 1.
-          return 1.0;
-        }
-
-        let norm_a_f64 = total_norm_sq_a_f64.sqrt();
-        let norm_b_f64 = total_norm_sq_b_f64.sqrt();
-
-        // It's highly unlikely norm_a_f64 or norm_b_f64 are zero if total_norm_sq_... were not,
-        // but as a robust step, ensure denominator is not zero.
-        // Using a slightly larger epsilon for norms themselves (sqrt of EPSILON_SQ_NORM).
-        const EPSILON_NORM: f64 = 1e-6; // sqrt(1e-12)
-        if norm_a_f64 < EPSILON_NORM || norm_b_f64 < EPSILON_NORM {
-          return 1.0; // Denominator is effectively zero.
-        }
-
-        let cosine_similarity = total_dot_product_f64 / (norm_a_f64 * norm_b_f64);
-
-        // Clamp cosine_similarity to [-1.0, 1.0] due to potential floating point inaccuracies.
-        let clamped_similarity = cosine_similarity.max(-1.0).min(1.0);
-        1.0 - clamped_similarity
       }
     }
   }

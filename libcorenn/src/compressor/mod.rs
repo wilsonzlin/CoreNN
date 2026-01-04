@@ -17,7 +17,7 @@ pub trait Compressor: Debug + Send + Sync {
   fn compress(&self, v: &VecData) -> CV {
     self.into_compressed(v.clone())
   }
-  fn dist(&self, metric: StdMetric, a: &CV, b: &CV) -> f64;
+  fn dist(&self, metric: StdMetric, a: &CV, b: &CV) -> f32;
 }
 
 impl CacheableTransformer<CV> for Arc<dyn Compressor> {

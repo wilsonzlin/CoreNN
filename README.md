@@ -17,13 +17,12 @@ fn main() {
     ...Default::default()
   });
   let key = "my_entry".to_string();
-  // This can be bf16, f16, f32, or f64.
-  let vec = vec![0.3, 0.6, 0.9];
+  let vec: Vec<f32> = vec![0.3, 0.6, 0.9];
   db.insert(&key, &vec);
 
   // Later...
   let db = CoreNN::open("/path/to/db");
-  let query = vec![1.0, 1.3, 1.7];
+  let query: Vec<f32> = vec![1.0, 1.3, 1.7];
   // Returns Vec of (key, distance) pairs.
   let k100 = db.query(&query, 100);
   assert_eq!(k100[0].0.as_str(), "my_entry");
@@ -48,7 +47,7 @@ vectors = np.array([
   [0.3, 0.6, 0.9],
   [0.4, 1.1, 0.0],
 ])
-# Or insert_bf16, insert_f16, insert_f64
+# Or insert_bf16, insert_f16
 db.insert_f32(keys, vectors)
 
 # Later...

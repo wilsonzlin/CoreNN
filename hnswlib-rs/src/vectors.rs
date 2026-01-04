@@ -1,36 +1,25 @@
 use crate::error::Error;
 use crate::error::Result;
 use crate::id::NodeId;
+use crate::scalar::Scalar;
 use arc_swap::ArcSwapOption;
 use std::io::Read;
 use std::io::Write;
 use std::mem::size_of;
 use std::sync::Arc;
 
-pub trait VectorRef {
-  fn as_f32_slice(&self) -> &[f32];
-}
-
-impl<T> VectorRef for T
-where
-  T: AsRef<[f32]>,
-{
-  fn as_f32_slice(&self) -> &[f32] {
-    self.as_ref()
-  }
-}
-
 #[derive(Clone)]
-pub struct ArcVector(Arc<Box<[f32]>>);
+pub struct ArcVector<S: Scalar>(Arc<Box<[S]>>);
 
-impl AsRef<[f32]> for ArcVector {
-  fn as_ref(&self) -> &[f32] {
+impl<S: Scalar> AsRef<[S]> for ArcVector<S> {
+  fn as_ref(&self) -> &[S] {
     self.0.as_ref().as_ref()
   }
 }
 
 pub trait VectorStore: Send + Sync {
-  type Vector<'a>: VectorRef
+  type Scalar: Scalar;
+  type Vector<'a>: AsRef<[Self::Scalar]>
   where
     Self: 'a;
 
@@ -39,15 +28,15 @@ pub trait VectorStore: Send + Sync {
 }
 
 pub trait VectorStoreMut: VectorStore {
-  fn set(&self, id: NodeId, vector: &[f32]) -> Result<()>;
+  fn set(&self, id: NodeId, vector: &[Self::Scalar]) -> Result<()>;
 }
 
-pub struct InMemoryVectorStore {
+pub struct InMemoryVectorStore<S: Scalar> {
   dim: usize,
-  vectors: Vec<ArcSwapOption<Box<[f32]>>>,
+  vectors: Vec<ArcSwapOption<Box<[S]>>>,
 }
 
-impl InMemoryVectorStore {
+impl<S: Scalar> InMemoryVectorStore<S> {
   pub fn new(dim: usize, max_nodes: usize) -> Self {
     let mut vectors = Vec::with_capacity(max_nodes);
     vectors.resize_with(max_nodes, ArcSwapOption::empty);
@@ -81,7 +70,7 @@ impl InMemoryVectorStore {
         .get(internal_id)
         .and_then(|slot| slot.load_full())
         .ok_or(Error::MissingVector)?;
-      let slice: &[f32] = v.as_ref().as_ref();
+      let slice: &[S] = v.as_ref().as_ref();
       if slice.len() != self.dim {
         return Err(Error::DimensionMismatch {
           expected: self.dim,
@@ -94,11 +83,7 @@ impl InMemoryVectorStore {
     Ok(())
   }
 
-  pub fn load_from<R: Read>(
-    r: &mut R,
-    dim: usize,
-    max_nodes: usize,
-  ) -> Result<(Self, usize)> {
+  pub fn load_from<R: Read>(r: &mut R, dim: usize, max_nodes: usize) -> Result<(Self, usize)> {
     #[cfg(not(target_endian = "little"))]
     {
       return Err(Error::InvalidIndexFormat(
@@ -116,13 +101,13 @@ impl InMemoryVectorStore {
     }
 
     let bytes_per_vector = dim
-      .checked_mul(size_of::<f32>())
+      .checked_mul(size_of::<S>())
       .ok_or_else(|| Error::InvalidIndexFormat("vector byte size overflow".to_string()))?;
 
     let store = InMemoryVectorStore::new(dim, max_nodes);
     let mut node_count = 0usize;
     loop {
-      let mut v = vec![0f32; dim];
+      let mut v = vec![S::from_f32(0.0); dim];
       let bytes = bytemuck::cast_slice_mut(&mut v);
       debug_assert_eq!(bytes.len(), bytes_per_vector);
 
@@ -133,9 +118,7 @@ impl InMemoryVectorStore {
           if read == 0 {
             return Ok((store, node_count));
           }
-          return Err(Error::InvalidIndexFormat(
-            "vector data truncated".to_string(),
-          ));
+          return Err(Error::InvalidIndexFormat("vector data truncated".to_string()));
         }
         read += n;
       }
@@ -151,8 +134,9 @@ impl InMemoryVectorStore {
   }
 }
 
-impl VectorStore for InMemoryVectorStore {
-  type Vector<'a> = ArcVector where Self: 'a;
+impl<S: Scalar> VectorStore for InMemoryVectorStore<S> {
+  type Scalar = S;
+  type Vector<'a> = ArcVector<S> where Self: 'a;
 
   fn dim(&self) -> usize {
     self.dim
@@ -167,8 +151,8 @@ impl VectorStore for InMemoryVectorStore {
   }
 }
 
-impl VectorStoreMut for InMemoryVectorStore {
-  fn set(&self, id: NodeId, vector: &[f32]) -> Result<()> {
+impl<S: Scalar> VectorStoreMut for InMemoryVectorStore<S> {
+  fn set(&self, id: NodeId, vector: &[S]) -> Result<()> {
     if vector.len() != self.dim {
       return Err(Error::DimensionMismatch {
         expected: self.dim,
@@ -190,54 +174,54 @@ mod tests {
   use tempfile::tempdir;
 
   #[test]
-	  fn in_memory_vector_store_save_load_roundtrip() {
-	    let dir = tempdir().unwrap();
-	    let path = dir.path().join("vectors.bin");
+  fn in_memory_vector_store_save_load_roundtrip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vectors.bin");
 
     let dim = 8;
     let max_nodes = 100;
     let node_count = 25;
 
-    let store = InMemoryVectorStore::new(dim, max_nodes);
-	    for i in 0..node_count {
-	      let v = (0..dim).map(|j| (i * 100 + j) as f32).collect::<Vec<_>>();
-	      store.set(NodeId::new(off64::u32!(i)), &v).unwrap();
-	    }
+    let store = InMemoryVectorStore::<f32>::new(dim, max_nodes);
+    for i in 0..node_count {
+      let v = (0..dim).map(|j| (i * 100 + j) as f32).collect::<Vec<_>>();
+      store.set(NodeId::new(off64::u32!(i)), &v).unwrap();
+    }
 
-	    {
-	      let mut f = std::fs::File::create(&path).unwrap();
-	      store.save_to(&mut f, node_count).unwrap();
-	    }
+    {
+      let mut f = std::fs::File::create(&path).unwrap();
+      store.save_to(&mut f, node_count).unwrap();
+    }
 
-	    let (loaded, loaded_count) = {
-	      let mut f = std::fs::File::open(&path).unwrap();
-	      InMemoryVectorStore::load_from(&mut f, dim, max_nodes).unwrap()
-	    };
-	    assert_eq!(loaded_count, node_count);
-	    assert_eq!(loaded.dim(), dim);
-	    assert_eq!(loaded.max_nodes(), max_nodes);
+    let (loaded, loaded_count) = {
+      let mut f = std::fs::File::open(&path).unwrap();
+      InMemoryVectorStore::<f32>::load_from(&mut f, dim, max_nodes).unwrap()
+    };
+    assert_eq!(loaded_count, node_count);
+    assert_eq!(loaded.dim(), dim);
+    assert_eq!(loaded.max_nodes(), max_nodes);
 
     for i in 0..node_count {
       let got = loaded.vector(NodeId::new(off64::u32!(i))).unwrap();
-      let got = got.as_f32_slice();
+      let got: &[f32] = got.as_ref();
       let expected = (0..dim).map(|j| (i * 100 + j) as f32).collect::<Vec<_>>();
       assert_eq!(got, expected.as_slice());
     }
   }
 
   #[test]
-	  fn save_errors_on_missing_vector() {
-	    let dir = tempdir().unwrap();
-	    let path = dir.path().join("vectors.bin");
+  fn save_errors_on_missing_vector() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vectors.bin");
 
-	    let dim = 4;
-	    let max_nodes = 10;
-	    let store = InMemoryVectorStore::new(dim, max_nodes);
-	    store.set(NodeId::new(0), &[1.0, 2.0, 3.0, 4.0]).unwrap();
-	    let err = {
-	      let mut f = std::fs::File::create(&path).unwrap();
-	      store.save_to(&mut f, 2).unwrap_err()
-	    };
-	    assert!(matches!(err, Error::MissingVector));
-	  }
+    let dim = 4;
+    let max_nodes = 10;
+    let store = InMemoryVectorStore::<f32>::new(dim, max_nodes);
+    store.set(NodeId::new(0), &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let err = {
+      let mut f = std::fs::File::create(&path).unwrap();
+      store.save_to(&mut f, 2).unwrap_err()
+    };
+    assert!(matches!(err, Error::MissingVector));
+  }
 }
