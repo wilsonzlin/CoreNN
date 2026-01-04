@@ -27,6 +27,10 @@ impl Compressor for TruncCompressor {
       VecData::BF16(mut a) => VecData::BF16(trunc!(a)),
       VecData::F16(mut a) => VecData::F16(trunc!(a)),
       VecData::F32(mut a) => VecData::F32(trunc!(a)),
+      VecData::QI8(mut a) => {
+        a.data.truncate(self.dim);
+        VecData::QI8(a)
+      }
     };
     Arc::new(v)
   }

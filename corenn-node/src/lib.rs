@@ -54,6 +54,25 @@ fn as_usize(cx: &mut FunctionContext, v: Handle<JsNumber>) -> NeonResult<usize> 
   Ok(v as usize)
 }
 
+fn as_f32(cx: &mut FunctionContext, v: Handle<JsNumber>) -> NeonResult<f32> {
+  let v = v.value(cx);
+  if !v.is_finite() {
+    return cx.throw_type_error("Expected a finite number");
+  }
+  Ok(v as f32)
+}
+
+fn as_i8(cx: &mut FunctionContext, v: Handle<JsNumber>) -> NeonResult<i8> {
+  let v = v.value(cx);
+  if !v.is_finite() || v.fract() != 0.0 {
+    return cx.throw_type_error("Expected an integer");
+  }
+  if v < i8::MIN as f64 || v > i8::MAX as f64 {
+    return cx.throw_type_error("Expected an int8");
+  }
+  Ok(v as i8)
+}
+
 fn cfg_from_js(cx: &mut FunctionContext, cfg_js: &JsObject) -> NeonResult<Cfg> {
   let mut cfg = Cfg::default();
   macro_rules! prop {
@@ -73,13 +92,7 @@ fn cfg_from_js(cx: &mut FunctionContext, cfg_js: &JsObject) -> NeonResult<Cfg> {
   });
   prop!(compression_threshold, JsNumber, |cx, v| as_usize(cx, v));
   prop!(dim, JsNumber, |cx, v| as_usize(cx, v));
-  prop!(distance_threshold, JsNumber, |cx, v| {
-    let v = v.value(cx);
-    if !v.is_finite() {
-      return cx.throw_type_error("Expected a finite number");
-    }
-    Ok(v as f32)
-  });
+  prop!(distance_threshold, JsNumber, |cx, v| as_f32(cx, v));
   prop!(max_add_edges, JsNumber, |cx, v| as_usize(cx, v));
   prop!(max_edges, JsNumber, |cx, v| as_usize(cx, v));
   prop!(metric, JsString, |cx, v| metric_from_str(cx, v));
@@ -135,7 +148,19 @@ fn insert(mut cx: FunctionContext) -> NeonResult<Handle<JsUndefined>> {
       let vector = as_f32.as_slice(&mut cx);
       db.insert(&key, vector);
     } else {
-      cx.throw_type_error("Expected a Float32Array")?;
+      let data = vector.get::<JsObject, _, _>(&mut cx, "data")?;
+      let data = data.downcast_or_throw::<JsTypedArray<i8>, _>(&mut cx)?;
+      let scale = {
+        let scale = vector.get::<JsNumber, _, _>(&mut cx, "scale")?;
+        as_f32(&mut cx, scale)?
+      };
+      let zero_point = if let Some(z) = vector.get_opt::<JsNumber, _, _>(&mut cx, "zeroPoint")? {
+        as_i8(&mut cx, z)?
+      } else {
+        0
+      };
+      let data = data.as_slice(&mut cx);
+      db.insert_qi8(&key, data, scale, zero_point);
     }
   }
   Ok(cx.undefined())
@@ -150,7 +175,19 @@ fn query(mut cx: FunctionContext) -> NeonResult<Handle<JsArray>> {
     let query = as_f32.as_slice(&mut cx);
     db.query(query, k)
   } else {
-    return cx.throw_type_error("Expected a Float32Array");
+    let data = query.get::<JsObject, _, _>(&mut cx, "data")?;
+    let data = data.downcast_or_throw::<JsTypedArray<i8>, _>(&mut cx)?;
+    let scale = {
+      let scale = query.get::<JsNumber, _, _>(&mut cx, "scale")?;
+      as_f32(&mut cx, scale)?
+    };
+    let zero_point = if let Some(z) = query.get_opt::<JsNumber, _, _>(&mut cx, "zeroPoint")? {
+      as_i8(&mut cx, z)?
+    } else {
+      0
+    };
+    let data = data.as_slice(&mut cx);
+    db.query_qi8(data, scale, zero_point, k)
   };
   let js_results = cx.empty_array();
   for (i, (key, dist)) in results.into_iter().enumerate() {

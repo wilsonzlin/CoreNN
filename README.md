@@ -19,6 +19,7 @@ fn main() {
   let key = "my_entry".to_string();
   let vec: Vec<f32> = vec![0.3, 0.6, 0.9];
   db.insert(&key, &vec);
+  // For per-vector quantized int8: `db.insert_qi8(&key, &qvec_i8, scale, zero_point)`.
 
   // Later...
   let db = CoreNN::open("/path/to/db");
@@ -48,6 +49,7 @@ vectors = np.array([
   [0.4, 1.1, 0.0],
 ])
 # Or insert_bf16, insert_f16
+# Or insert_i8 (per-vector quantized int8 + scale/zero_point arrays)
 db.insert_f32(keys, vectors)
 
 # Later...
@@ -76,6 +78,8 @@ db.insert([
   {
     key: "my_entry_1",
     vector: new Float32Array([0.5, 4.1, 2.2]),
+    // Or per-vector quantized int8:
+    // vector: { data: new Int8Array([..]), scale: 0.01, zeroPoint: 0 },
   },
   {
     key: "my_entry_2",

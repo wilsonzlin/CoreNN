@@ -9,3 +9,6 @@ edition = "2021"
 
 [dependencies]
 half = { version = "2.4.1", features = ["bytemuck"] }
+
+[dev-dependencies]
+rand = "0.8.5"

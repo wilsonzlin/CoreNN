@@ -24,6 +24,14 @@ export type Cfg = {
   updateSearchListCap: number;
 }>;
 
+export type QuantizedI8Vector = {
+  data: Int8Array;
+  scale: number;
+  zeroPoint: number;
+};
+
+export type Vector = Float32Array | QuantizedI8Vector;
+
 export class CoreNN {
   private constructor(private readonly db: any) {}
 
@@ -42,11 +50,11 @@ export class CoreNN {
     return new CoreNN(db);
   }
 
-  insert(entries: Array<{key: string, vector: Float32Array}>) {
+  insert(entries: Array<{key: string, vector: Vector}>) {
     internal.insert(this.db, entries);
   }
 
-  query(query: Float32Array, k: number): Array<{ key: string; distance: number }> {
+  query(query: Vector, k: number): Array<{ key: string; distance: number }> {
     return internal.query(this.db, query, k);
   }
 }

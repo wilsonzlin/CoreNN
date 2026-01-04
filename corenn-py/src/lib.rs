@@ -2,6 +2,7 @@ use half::bf16;
 use half::f16;
 use libcorenn::cfg::Cfg;
 use libcorenn::CoreNN as CoreNNNative;
+use numpy::PyReadonlyArray1;
 use numpy::PyReadonlyArray2;
 use pyo3::pyclass;
 use pyo3::pymethods;
@@ -67,6 +68,23 @@ impl CoreNN {
       });
   }
 
+  pub fn insert_i8(
+    &self,
+    keys: Vec<String>,
+    vectors: PyReadonlyArray2<i8>,
+    scales: PyReadonlyArray1<f32>,
+    zero_points: PyReadonlyArray1<i8>,
+  ) {
+    let scales = scales.as_slice().unwrap();
+    let zero_points = zero_points.as_slice().unwrap();
+    zip(keys, vectors.as_array().rows())
+      .enumerate()
+      .par_bridge()
+      .for_each(|(i, (k, v))| {
+        self.0.insert_qi8(&k, v.as_slice().unwrap(), scales[i], zero_points[i]);
+      });
+  }
+
   pub fn query_bf16(&self, queries: PyReadonlyArray2<bf16>, k: usize) -> Vec<Vec<(String, f32)>> {
     queries
       .as_array()
@@ -94,6 +112,25 @@ impl CoreNN {
       .into_iter()
       .par_bridge()
       .map(|q| self.0.query(q.as_slice().unwrap(), k))
+      .collect()
+  }
+
+  pub fn query_i8(
+    &self,
+    queries: PyReadonlyArray2<i8>,
+    scales: PyReadonlyArray1<f32>,
+    zero_points: PyReadonlyArray1<i8>,
+    k: usize,
+  ) -> Vec<Vec<(String, f32)>> {
+    let scales = scales.as_slice().unwrap();
+    let zero_points = zero_points.as_slice().unwrap();
+    queries
+      .as_array()
+      .rows()
+      .into_iter()
+      .enumerate()
+      .par_bridge()
+      .map(|(i, q)| self.0.query_qi8(q.as_slice().unwrap(), scales[i], zero_points[i], k))
       .collect()
   }
 }

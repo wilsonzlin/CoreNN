@@ -53,6 +53,7 @@ use store::Store;
 use tracing::debug;
 use util::AtomUsz;
 use vec::VecData;
+use vec::QuantizedI8Vec;
 
 pub mod cache;
 pub mod cfg;
@@ -449,6 +450,23 @@ impl CoreNN {
     self.query_vec(query, k)
   }
 
+  pub fn query_qi8(
+    &self,
+    data: &[i8],
+    scale: f32,
+    zero_point: i8,
+    k: usize,
+  ) -> Vec<(String, f32)> {
+    self.query_vec(
+      VecData::QI8(QuantizedI8Vec {
+        data: data.to_vec(),
+        scale,
+        zero_point,
+      }),
+      k,
+    )
+  }
+
   /// WARNING: `query` must not contain any NaN values.
   /// It's possible to get less than k results due to data changes during the query.
   pub fn query_vec(&self, query: VecData, k: usize) -> Vec<(String, f32)> {
@@ -526,6 +544,17 @@ impl CoreNN {
     // NaN values cause infinite loops while PQ training and vector querying, amongst other things. This replaces NaN values with 0 and +/- infinity with min/max finite values.
     let vec = VecData::from(nan_to_num(vec));
     self.insert_vec(key, vec)
+  }
+
+  pub fn insert_qi8(&self, key: &String, data: &[i8], scale: f32, zero_point: i8) {
+    self.insert_vec(
+      key,
+      VecData::QI8(QuantizedI8Vec {
+        data: data.to_vec(),
+        scale,
+        zero_point,
+      }),
+    )
   }
 
   /// WARNING: `vec` must not contain any NaN values.

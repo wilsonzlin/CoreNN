@@ -5,6 +5,13 @@ use ndarray::Array1;
 use serde::Deserialize;
 use serde::Serialize;
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct QuantizedI8Vec {
+  pub data: Vec<i8>,
+  pub scale: f32,
+  pub zero_point: i8,
+}
+
 // We don't use ndarray because it doesn't support .trunc without copying.
 // It's fine, as ArrayView can be created from a slice without copying.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -12,6 +19,7 @@ pub enum VecData {
   BF16(Vec<bf16>),
   F16(Vec<f16>),
   F32(Vec<f32>),
+  QI8(QuantizedI8Vec),
 }
 
 impl VecData {
@@ -20,6 +28,7 @@ impl VecData {
       VecData::BF16(v) => v.len(),
       VecData::F16(v) => v.len(),
       VecData::F32(v) => v.len(),
+      VecData::QI8(v) => v.data.len(),
     }
   }
 
@@ -29,6 +38,7 @@ impl VecData {
       VecData::BF16(v) => cast_slice(v),
       VecData::F16(v) => cast_slice(v),
       VecData::F32(v) => cast_slice(v),
+      VecData::QI8(v) => cast_slice(&v.data),
     }
   }
 
@@ -37,6 +47,11 @@ impl VecData {
       VecData::BF16(v) => v.into_iter().map(|x| x.to_f32()).collect(),
       VecData::F16(v) => v.into_iter().map(|x| x.to_f32()).collect(),
       VecData::F32(v) => v,
+      VecData::QI8(v) => v
+        .data
+        .into_iter()
+        .map(|x| (x as i32 - v.zero_point as i32) as f32 * v.scale)
+        .collect(),
     };
     Array1::from_vec(v)
   }
