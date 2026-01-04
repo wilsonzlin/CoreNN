@@ -9,4 +9,3 @@ edition = "2021"
 
 [dependencies]
 half = { version = "2.4.1", features = ["bytemuck"] }
-

@@ -76,9 +76,10 @@ fn parse_header(dim: usize, bytes: &[u8]) -> Result<LegacyHeader> {
       Err(e) => last_err = Some(e),
     }
   }
-  Err(last_err.unwrap_or_else(|| {
-    Error::InvalidIndexFormat("failed to parse legacy header".to_string())
-  }))
+  Err(
+    last_err
+      .unwrap_or_else(|| Error::InvalidIndexFormat("failed to parse legacy header".to_string())),
+  )
 }
 
 fn parse_header_with_width(dim: usize, bytes: &[u8], usize_width: usize) -> Result<LegacyHeader> {
@@ -187,14 +188,10 @@ fn parse_header_with_width(dim: usize, bytes: &[u8], usize_width: usize) -> Resu
   }
 
   if !mult.is_finite() || mult <= 0.0 {
-    return Err(Error::InvalidIndexFormat(
-      "invalid mult".to_string(),
-    ));
+    return Err(Error::InvalidIndexFormat("invalid mult".to_string()));
   }
   if ef_construction < m {
-    return Err(Error::InvalidIndexFormat(
-      "ef_construction < M".to_string(),
-    ));
+    return Err(Error::InvalidIndexFormat("ef_construction < M".to_string()));
   }
   if max_m != m {
     return Err(Error::InvalidIndexFormat(
@@ -255,7 +252,10 @@ impl<'a> LegacyVectors<'a> {
 
 impl VectorStore for LegacyVectors<'_> {
   type Scalar = f32;
-  type Vector<'a> = &'a [f32] where Self: 'a;
+  type Vector<'a>
+    = &'a [f32]
+  where
+    Self: 'a;
 
   fn dim(&self) -> usize {
     self.dim
@@ -341,7 +341,9 @@ pub fn load_hnswlib<'a, M: Metric<Scalar = f32>>(
       0usize
     } else {
       if link_list_size % size_links_per_element != 0 {
-        return Err(Error::InvalidIndexFormat("invalid linkListSize".to_string()));
+        return Err(Error::InvalidIndexFormat(
+          "invalid linkListSize".to_string(),
+        ));
       }
       link_list_size / size_links_per_element
     };
@@ -354,7 +356,8 @@ pub fn load_hnswlib<'a, M: Metric<Scalar = f32>>(
 
     // Level 0 neighbors (in the base layer memory block).
     {
-      let block = &data_level0[elem_off + header.offset_level0..elem_off + header.offset_level0 + header.offset_data];
+      let block = &data_level0
+        [elem_off + header.offset_level0..elem_off + header.offset_level0 + header.offset_data];
       let cnt = off64::usz!(u16::from_le_bytes(block[..2].try_into().unwrap()));
       if cnt > header.max_m0 {
         return Err(Error::InvalidIndexFormat("linklist0 too large".to_string()));

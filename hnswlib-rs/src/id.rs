@@ -17,4 +17,3 @@ impl NodeId {
     Self(raw)
   }
 }
-

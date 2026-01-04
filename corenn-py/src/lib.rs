@@ -96,7 +96,6 @@ impl CoreNN {
       .map(|q| self.0.query(q.as_slice().unwrap(), k))
       .collect()
   }
-
 }
 
 #[pymodule]

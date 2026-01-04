@@ -4,6 +4,7 @@ use crate::metric::StdMetric;
 use crate::vec::VecData;
 use crate::CoreNN;
 use crate::Mode;
+use corenn_kernels::Kernel;
 use itertools::Itertools;
 use linfa::traits::FitWith;
 use linfa::traits::Predict;
@@ -25,7 +26,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::min;
 use std::sync::Arc;
-use corenn_kernels::Kernel;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProductQuantizer<T: Float> {

@@ -130,7 +130,9 @@ fn neighbors_count(header: u32) -> usize {
 
 fn pack_neighbors_count(cnt: usize) -> Result<u32> {
   if cnt > u16::MAX as usize {
-    return Err(Error::InvalidIndexFormat("neighbor list too large".to_string()));
+    return Err(Error::InvalidIndexFormat(
+      "neighbor list too large".to_string(),
+    ));
   }
   Ok(cnt as u32)
 }
@@ -149,8 +151,8 @@ struct NeighborList<'a> {
 }
 
 impl<'a> IntoIterator for NeighborList<'a> {
-  type Item = NodeId;
   type IntoIter = NeighborIter<'a>;
+  type Item = NodeId;
 
   fn into_iter(self) -> Self::IntoIter {
     NeighborIter {
@@ -447,11 +449,7 @@ where
 
   fn upper_block(&self, node: NodeId, level: usize) -> Result<&[AtomicU32]> {
     debug_assert!(level > 0);
-    let Some(raw) = self
-      .upper_links
-      .get(node.as_usize())
-      .and_then(|c| c.get())
-    else {
+    let Some(raw) = self.upper_links.get(node.as_usize()).and_then(|c| c.get()) else {
       return Err(Error::InvalidIndexFormat("missing linklist".to_string()));
     };
     let words_per_level = 1 + self.max_m;
@@ -475,7 +473,9 @@ where
     let cnt = neighbors_count(header);
     let cap = if level == 0 { self.max_m0 } else { self.max_m };
     if cnt > cap {
-      return Err(Error::InvalidIndexFormat("neighbor list too large".to_string()));
+      return Err(Error::InvalidIndexFormat(
+        "neighbor list too large".to_string(),
+      ));
     }
     Ok(NeighborList {
       data: &block[1..],
@@ -708,7 +708,9 @@ where
     self.connect_backlinks(vectors, node, &selected, level, is_update)?;
 
     if selected.len() > cap {
-      return Err(Error::InvalidIndexFormat("too many selected neighbors".to_string()));
+      return Err(Error::InvalidIndexFormat(
+        "too many selected neighbors".to_string(),
+      ));
     }
 
     Ok(next_entry)
@@ -879,7 +881,13 @@ where
       }
     }
 
-    self.repair_connections_for_update(vectors, entry, node, elem_level as usize, max_level_copy.max(0) as usize)?;
+    self.repair_connections_for_update(
+      vectors,
+      entry,
+      node,
+      elem_level as usize,
+      max_level_copy.max(0) as usize,
+    )?;
 
     Ok(())
   }
@@ -923,7 +931,8 @@ where
     let node_vec = node_vec.as_ref();
 
     for level in (0..=node_level).rev() {
-      let mut top_candidates = self.search_base_layer(vectors, curr, node_vec, level, self.ef_construction, None)?;
+      let mut top_candidates =
+        self.search_base_layer(vectors, curr, node_vec, level, self.ef_construction, None)?;
 
       let mut filtered: BinaryHeap<(OrderedFloat<f32>, NodeId)> = BinaryHeap::new();
       while let Some(cand) = top_candidates.pop() {
@@ -1028,7 +1037,14 @@ where
 
     // Phase 1: fill `node`'s own neighbor lists, but do NOT publish backlinks yet.
     for level in (0..=max_conn_level).rev() {
-      let mut top_candidates = self.search_base_layer(vectors, curr_obj, node_vec, level, self.ef_construction, None)?;
+      let mut top_candidates = self.search_base_layer(
+        vectors,
+        curr_obj,
+        node_vec,
+        level,
+        self.ef_construction,
+        None,
+      )?;
       if entry_deleted {
         let dist = self.distance_query_to_node(vectors, node_vec, entry)?;
         top_candidates.push((OrderedFloat(dist), entry));
@@ -1692,10 +1708,10 @@ mod tests {
   use crate::metric::L2;
   use crate::vectors::InMemoryVectorStore;
   use crate::vectors::VectorStore;
+  use proptest::prelude::*;
   use rand::rngs::StdRng;
   use rand::Rng;
   use rand::SeedableRng;
-  use proptest::prelude::*;
   use std::sync::Arc;
   use std::thread;
   use tempfile::tempdir;
@@ -1779,18 +1795,18 @@ mod tests {
 
     h.set_ef_search(123);
 
-	    assert_integrity(&h);
+    assert_integrity(&h);
 
-	    let dir = tempdir().unwrap();
-	    let path = dir.path().join("hnsw.bin");
-	    {
-	      let mut f = std::fs::File::create(&path).unwrap();
-	      h.save_to(&mut f).unwrap();
-	    }
-	    let h2 = {
-	      let mut f = std::fs::File::open(&path).unwrap();
-	      Hnsw::load_from(L2::new(), &mut f).unwrap()
-	    };
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("hnsw.bin");
+    {
+      let mut f = std::fs::File::create(&path).unwrap();
+      h.save_to(&mut f).unwrap();
+    }
+    let h2 = {
+      let mut f = std::fs::File::open(&path).unwrap();
+      Hnsw::load_from(L2::new(), &mut f).unwrap()
+    };
 
     assert_integrity(&h2);
     assert_eq!(h2.ef_search(), 123);
@@ -1974,8 +1990,7 @@ mod tests {
     let vector = prop::collection::vec(-1000i16..1000, dim)
       .prop_map(|v| v.into_iter().map(|x| x as f32 / 100.0).collect::<Vec<_>>());
     prop_oneof![
-      (key.clone(), vector.clone())
-        .prop_map(|(key, vector)| Op::Insert { key, vector }),
+      (key.clone(), vector.clone()).prop_map(|(key, vector)| Op::Insert { key, vector }),
       (key.clone(), vector.clone()).prop_map(|(key, vector)| Op::Set { key, vector }),
       key.clone().prop_map(|key| Op::Delete { key }),
       (vector, 0usize..10).prop_map(|(query, k)| Op::Search { query, k }),

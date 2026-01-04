@@ -46,7 +46,7 @@ impl Default for Cfg {
       max_add_edges: max_edges,
       max_edges,
       metric: StdMetric::L2Sq, // L2 is the safe bet.
-      pq_sample_size: 10_000, // Default: plenty, while fast to train.
+      pq_sample_size: 10_000,  // Default: plenty, while fast to train.
       query_search_list_cap,
       update_search_list_cap: query_search_list_cap,
       // These defaults are completely arbitrary, they should be set manually.

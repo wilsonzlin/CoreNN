@@ -32,4 +32,3 @@ pub fn dist_cosine(a: &VecData, b: &VecData) -> f32 {
     _ => panic!("differing dtypes"),
   }
 }
-

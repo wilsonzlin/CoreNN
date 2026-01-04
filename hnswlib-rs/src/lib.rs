@@ -1,7 +1,7 @@
-pub mod legacy;
 pub mod error;
 pub mod hnsw;
 pub mod id;
+pub mod legacy;
 pub mod metric;
 pub mod scalar;
 pub mod vectors;
@@ -16,8 +16,8 @@ pub use hnsw::SetOutcome;
 pub use id::NodeId;
 pub use metric::Cosine;
 pub use metric::InnerProduct;
-pub use metric::L2;
 pub use metric::Metric;
+pub use metric::L2;
 pub use scalar::Dtype;
 pub use scalar::Scalar;
 pub use vectors::InMemoryVectorStore;

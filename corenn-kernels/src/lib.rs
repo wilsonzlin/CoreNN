@@ -292,7 +292,6 @@ fn dot_and_norms_f16_scalar(a: &[f16], b: &[f16]) -> (f32, f32, f32) {
 mod x86 {
   use half::bf16;
   use half::f16;
-
   #[cfg(target_arch = "x86")]
   use std::arch::x86::*;
   #[cfg(target_arch = "x86_64")]

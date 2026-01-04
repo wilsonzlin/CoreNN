@@ -118,7 +118,9 @@ impl<S: Scalar> InMemoryVectorStore<S> {
           if read == 0 {
             return Ok((store, node_count));
           }
-          return Err(Error::InvalidIndexFormat("vector data truncated".to_string()));
+          return Err(Error::InvalidIndexFormat(
+            "vector data truncated".to_string(),
+          ));
         }
         read += n;
       }
@@ -136,18 +138,17 @@ impl<S: Scalar> InMemoryVectorStore<S> {
 
 impl<S: Scalar> VectorStore for InMemoryVectorStore<S> {
   type Scalar = S;
-  type Vector<'a> = ArcVector<S> where Self: 'a;
+  type Vector<'a>
+    = ArcVector<S>
+  where
+    Self: 'a;
 
   fn dim(&self) -> usize {
     self.dim
   }
 
   fn vector<'a>(&'a self, id: NodeId) -> Option<Self::Vector<'a>> {
-    self
-      .vectors
-      .get(id.as_usize())?
-      .load_full()
-      .map(ArcVector)
+    self.vectors.get(id.as_usize())?.load_full().map(ArcVector)
   }
 }
 
