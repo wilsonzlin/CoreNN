@@ -67,56 +67,56 @@ Using your external key type `K` directly in those internals would force expensi
 
 The provided `InMemoryVectorStore` supports lock-free reads and parallel updates (per-`NodeId` atomic swap).
 
-## Persistence (serde)
+## Persistence
 
-Use `Hnsw::to_data()` / `Hnsw::from_data()` to save/load the **graph + key mapping + config** via any `serde` format.
+Use `Hnsw::save_to()` / `Hnsw::load_from()` to save/load the **graph + key mapping + config** via `std::io::Write` / `std::io::Read` (sequential `bincode`).
 
 Notes:
 - Vectors are **not** included; persist your `VectorStore` separately (keyed by `NodeId`).
 - The metric/space is not stored; you must provide the `Metric` when loading.
-- `to_data()` builds a snapshot in memory; for very large indexes, serialize to a writer (`serialize_into`) to avoid allocating a giant `Vec<u8>`.
-
-Example using `bincode`:
 
 ```rust
-use hnswlib_rs::{Hnsw, HnswData, L2, Result};
-use std::io::{Read, Write};
+use hnswlib_rs::{Hnsw, HnswConfig, InMemoryVectorStore, L2, Result};
 
-fn save_to<W: Write>(hnsw: &Hnsw<String, L2>, mut w: W) -> Result<()> {
-  let data: HnswData<String> = hnsw.to_data()?;
-  bincode::serialize_into(&mut w, &data).unwrap();
+fn save_and_load() -> Result<()> {
+  let dim = 128;
+  let max_nodes = 100_000;
+
+  let hnsw = Hnsw::new(L2::new(), HnswConfig::new(dim, max_nodes));
+  let vectors = InMemoryVectorStore::new(dim, max_nodes);
+  hnsw.insert(&vectors, "doc-1".to_string(), &vec![0.0; dim])?;
+
+  let mut f = std::fs::File::create("hnsw.bin")?;
+  hnsw.save_to(&mut f)?;
+
+  let mut f = std::fs::File::open("hnsw.bin")?;
+  let loaded = Hnsw::load_from(L2::new(), &mut f)?;
+  assert_eq!(loaded.len(), hnsw.len());
   Ok(())
-}
-
-fn load_from<R: Read>(r: R) -> Result<Hnsw<String, L2>> {
-  let data: HnswData<String> = bincode::deserialize_from(r).unwrap();
-  Hnsw::from_data(L2::new(), data)
 }
 ```
 
 ## Persisting vectors (`InMemoryVectorStore`)
 
-`InMemoryVectorStore` provides async save/load helpers for a raw dense on-disk matrix: row-major `f32` (little-endian), keyed by `NodeId` order, with **no header** (exactly `node_count * dim` floats). Writes/reads are split into `concurrency` contiguous chunks and run concurrently via `tokio::spawn`.
+`InMemoryVectorStore` provides `save_to` / `load_from` for a raw dense on-disk matrix: row-major `f32` (little-endian), keyed by `NodeId` order, with **no header** (exactly `node_count * dim` floats).
 
 ```rust
 use hnswlib_rs::{Hnsw, HnswConfig, InMemoryVectorStore, L2, Result};
-use std::sync::Arc;
 
-async fn save_and_load() -> Result<()> {
+fn save_and_load() -> Result<()> {
   let dim = 128;
   let max_nodes = 100_000;
 
   let hnsw = Hnsw::new(L2::new(), HnswConfig::new(dim, max_nodes));
-  let store = Arc::new(InMemoryVectorStore::new(dim, max_nodes));
-  hnsw.insert(&*store, "doc-1".to_string(), &vec![0.0; dim])?;
+  let store = InMemoryVectorStore::new(dim, max_nodes);
+  hnsw.insert(&store, "doc-1".to_string(), &vec![0.0; dim])?;
   let node_count = hnsw.len();
-  let concurrency = 8;
 
-  store
-    .save_to_file("vectors.bin", node_count, concurrency)
-    .await?;
-  let (loaded, loaded_count) =
-    InMemoryVectorStore::load_from_file("vectors.bin", dim, max_nodes, concurrency).await?;
+  let mut f = std::fs::File::create("vectors.bin")?;
+  store.save_to(&mut f, node_count)?;
+
+  let mut f = std::fs::File::open("vectors.bin")?;
+  let (loaded, loaded_count) = InMemoryVectorStore::load_from(&mut f, dim, max_nodes)?;
   assert_eq!(loaded_count, node_count);
   Ok(())
 }

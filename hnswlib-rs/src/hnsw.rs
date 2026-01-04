@@ -16,13 +16,14 @@ use parking_lot::RwLock;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use rayon::prelude::*;
 use std::cmp::max;
 use std::collections::BinaryHeap;
 use std::f64;
 use std::hash::BuildHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::io::Read;
+use std::io::Write;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU8;
@@ -33,7 +34,30 @@ use tracing::warn;
 
 const DEFAULT_LABEL_OPERATION_LOCKS: usize = 65_536;
 const NODE_ID_NONE: u32 = u32::MAX;
-const HNSW_DATA_VERSION: u32 = 1;
+const HNSW_FILE_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HnswHeader {
+  version: u32,
+  cfg: HnswConfig,
+  entry_point: Option<u32>,
+  max_level: i32,
+  node_count: u32,
+}
+
+#[derive(serde::Serialize)]
+struct NodeRecord<'a, K> {
+  key: &'a K,
+  deleted: u8,
+  level: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct NodeRecordOwned<K> {
+  key: K,
+  deleted: u8,
+  level: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HnswConfig {
@@ -98,24 +122,6 @@ pub struct SearchHit<K> {
   pub distance: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct HnswData<K> {
-  pub version: u32,
-  pub cfg: HnswConfig,
-  pub entry_point: Option<u32>,
-  pub max_level: i32,
-  /// Node keys in `NodeId` order.
-  pub keys: Vec<K>,
-  /// Per-node tombstone flag (0/1), in `NodeId` order.
-  pub deleted: Vec<u8>,
-  /// Per-node max level, in `NodeId` order.
-  pub levels: Vec<u32>,
-  /// For each node, for each level `0..=levels[node]` (in that order), the neighbor list length.
-  pub neighbor_counts: Vec<u16>,
-  /// Concatenated neighbor ids for all lists described by `neighbor_counts`.
-  pub neighbors: Vec<u32>,
-}
-
 fn neighbors_count(header: u32) -> usize {
   (header & 0xffff) as usize
 }
@@ -125,6 +131,13 @@ fn pack_neighbors_count(cnt: usize) -> Result<u32> {
     return Err(Error::InvalidIndexFormat("neighbor list too large".to_string()));
   }
   Ok(cnt as u32)
+}
+
+fn bincode_err(err: Box<bincode::ErrorKind>) -> Error {
+  match *err {
+    bincode::ErrorKind::Io(io) => Error::Io(io),
+    other => Error::InvalidIndexFormat(format!("bincode: {other}")),
+  }
 }
 
 #[derive(Clone, Copy)]
@@ -1185,7 +1198,10 @@ where
     Ok(())
   }
 
-  pub fn to_data(&self) -> Result<HnswData<K>> {
+  pub fn save_to<W: Write>(&self, w: &mut W) -> Result<()>
+  where
+    K: serde::Serialize,
+  {
     let _mutation_guard = self.mutation_lock.write();
 
     let len = self.len();
@@ -1227,344 +1243,177 @@ where
     cfg.m = self.max_m;
     cfg.ef_construction = self.ef_construction;
 
-    #[derive(Debug)]
-    struct Chunk<K> {
-      keys: Vec<K>,
-      deleted: Vec<u8>,
-      levels: Vec<u32>,
-      neighbor_counts: Vec<u16>,
-      neighbors: Vec<u32>,
-      max_level: i32,
-    }
+    let node_count: u32 = len
+      .try_into()
+      .map_err(|_| Error::InvalidIndexFormat("node count exceeds u32::MAX".to_string()))?;
 
-    let threads = rayon::current_num_threads();
-    let desired_chunks = threads.saturating_mul(8).max(1);
-    let min_chunk = 16_384usize;
-    let chunk_size = (len / desired_chunks).max(min_chunk).max(1);
-    let chunk_count = len.div_ceil(chunk_size);
-
-    let chunks: Result<Vec<Chunk<K>>> = (0..chunk_count)
-      .into_par_iter()
-      .map(|chunk_idx| -> Result<Chunk<K>> {
-        let start = chunk_idx * chunk_size;
-        let end = (start + chunk_size).min(len);
-        let range_len = end - start;
-
-        let mut keys = Vec::with_capacity(range_len);
-        let mut deleted = Vec::with_capacity(range_len);
-        let mut levels = Vec::with_capacity(range_len);
-
-        let mut neighbor_counts = Vec::new();
-        let mut neighbors = Vec::new();
-
-        let mut max_level = -1i32;
-
-        for internal_id in start..end {
-          let node = NodeId::new(internal_id as u32);
-          keys.push(self.node_key(node)?.clone());
-
-          let is_deleted = self.is_deleted(node);
-          deleted.push(if is_deleted { 1 } else { 0 });
-
-          let level_i32 = self.node_level[internal_id].load(Ordering::Acquire);
-          if level_i32 < 0 {
-            return Err(Error::InvalidIndexFormat("node level < 0".to_string()));
-          }
-          max_level = max(max_level, level_i32);
-          let level_u32 = level_i32 as u32;
-          levels.push(level_u32);
-
-          for l in 0..=level_u32 as usize {
-            let list = self.neighbors_at_level(node, l)?;
-            let cnt: u16 = list
-              .len
-              .try_into()
-              .map_err(|_| Error::InvalidIndexFormat("neighbor list too large".to_string()))?;
-            neighbor_counts.push(cnt);
-            for neighbor in list {
-              neighbors.push(neighbor.as_u32());
-            }
-          }
-        }
-
-        Ok(Chunk {
-          keys,
-          deleted,
-          levels,
-          neighbor_counts,
-          neighbors,
-          max_level,
-        })
-      })
-      .collect();
-    let chunks = chunks?;
-
-    let total_neighbor_counts: usize = chunks.iter().map(|c| c.neighbor_counts.len()).sum();
-    let total_neighbors: usize = chunks.iter().map(|c| c.neighbors.len()).sum();
-
-    let mut keys = Vec::with_capacity(len);
-    let mut deleted = Vec::with_capacity(len);
-    let mut levels = Vec::with_capacity(len);
-    let mut neighbor_counts = Vec::with_capacity(total_neighbor_counts);
-    let mut neighbors = Vec::with_capacity(total_neighbors);
-
-    let mut computed_max_level = -1i32;
-    for chunk in chunks {
-      computed_max_level = max(computed_max_level, chunk.max_level);
-      keys.extend(chunk.keys);
-      deleted.extend(chunk.deleted);
-      levels.extend(chunk.levels);
-      neighbor_counts.extend(chunk.neighbor_counts);
-      neighbors.extend(chunk.neighbors);
-    }
-
-    if computed_max_level != max_level {
-      return Err(Error::InvalidIndexFormat(
-        "max_level does not match node levels".to_string(),
-      ));
-    }
-
-    if keys.len() != len || deleted.len() != len || levels.len() != len {
-      return Err(Error::InvalidIndexFormat(
-        "serialized node arrays have mismatched lengths".to_string(),
-      ));
-    }
-
-    let expected_neighbor_count_entries: usize = levels
-      .iter()
-      .try_fold(0usize, |acc, &level| acc.checked_add(level as usize + 1))
-      .ok_or_else(|| Error::InvalidIndexFormat("neighbor counts overflow".to_string()))?;
-    if neighbor_counts.len() != expected_neighbor_count_entries {
-      return Err(Error::InvalidIndexFormat(
-        "neighbor list counts length mismatch".to_string(),
-      ));
-    }
-
-    let expected_neighbors_len: usize = neighbor_counts
-      .iter()
-      .try_fold(0usize, |acc, &cnt| acc.checked_add(cnt as usize))
-      .ok_or_else(|| Error::InvalidIndexFormat("neighbors overflow".to_string()))?;
-    if neighbors.len() != expected_neighbors_len {
-      return Err(Error::InvalidIndexFormat(
-        "neighbor ids length mismatch".to_string(),
-      ));
-    }
-
-    Ok(HnswData {
-      version: HNSW_DATA_VERSION,
+    let header = HnswHeader {
+      version: HNSW_FILE_VERSION,
       cfg,
       entry_point,
       max_level,
-      keys,
-      deleted,
-      levels,
-      neighbor_counts,
-      neighbors,
-    })
+      node_count,
+    };
+    bincode::serialize_into(&mut *w, &header).map_err(bincode_err)?;
+
+    for internal_id in 0..len {
+      let node = NodeId::new(off64::u32!(internal_id));
+      let level_i32 = self.node_level[internal_id].load(Ordering::Acquire);
+      if level_i32 < 0 {
+        return Err(Error::InvalidIndexFormat("node level < 0".to_string()));
+      }
+
+      let record = NodeRecord {
+        key: self.node_key(node)?,
+        deleted: if self.is_deleted(node) { 1 } else { 0 },
+        level: level_i32 as u32,
+      };
+      bincode::serialize_into(&mut *w, &record).map_err(bincode_err)?;
+    }
+
+    for internal_id in 0..len {
+      let node = NodeId::new(off64::u32!(internal_id));
+      let level_i32 = self.node_level[internal_id].load(Ordering::Acquire);
+      if level_i32 < 0 {
+        return Err(Error::InvalidIndexFormat("node level < 0".to_string()));
+      }
+      for level in 0..=level_i32 as usize {
+        let list = self.neighbors_at_level(node, level)?;
+        let cnt: u16 = list
+          .len
+          .try_into()
+          .map_err(|_| Error::InvalidIndexFormat("neighbor list too large".to_string()))?;
+        bincode::serialize_into(&mut *w, &cnt).map_err(bincode_err)?;
+        for neighbor in list {
+          bincode::serialize_into(&mut *w, &neighbor.as_u32()).map_err(bincode_err)?;
+        }
+      }
+    }
+
+    w.flush()?;
+    Ok(())
   }
 
-  pub fn from_data(metric: M, data: HnswData<K>) -> Result<Self> {
-    if data.version != HNSW_DATA_VERSION {
+  pub fn load_from<R: Read>(metric: M, r: &mut R) -> Result<Self>
+  where
+    K: serde::de::DeserializeOwned,
+  {
+    let header: HnswHeader = bincode::deserialize_from(&mut *r).map_err(bincode_err)?;
+    if header.version != HNSW_FILE_VERSION {
       return Err(Error::InvalidIndexFormat(format!(
-        "unsupported hnsw data version {}",
-        data.version
+        "unsupported hnsw file version {}",
+        header.version
       )));
     }
-    if data.cfg.dim == 0 {
+
+    let cfg = header.cfg;
+    let entry_point = header.entry_point;
+    let max_level = header.max_level;
+    let node_count = header.node_count;
+
+    if cfg.dim == 0 {
       return Err(Error::InvalidIndexFormat("dim must be > 0".to_string()));
     }
-    if data.cfg.m < 2 {
+    if cfg.m < 2 {
       return Err(Error::InvalidIndexFormat("m must be >= 2".to_string()));
     }
-    if data.keys.len() > data.cfg.max_nodes {
-      return Err(Error::InvalidIndexFormat(
-        "node count > max_nodes".to_string(),
-      ));
-    }
-    if data.cfg.max_nodes > u32::MAX as usize {
+    if cfg.max_nodes > off64::usz!(u32::MAX) {
       return Err(Error::InvalidIndexFormat(
         "max_nodes exceeds u32::MAX".to_string(),
       ));
     }
-
-    let node_count = data.keys.len();
-    if data.deleted.len() != node_count || data.levels.len() != node_count {
+    if node_count as usize > cfg.max_nodes {
       return Err(Error::InvalidIndexFormat(
-        "serialized node arrays have mismatched lengths".to_string(),
+        "node count > max_nodes".to_string(),
       ));
     }
-    for &d in &data.deleted {
-      if d > 1 {
-        return Err(Error::InvalidIndexFormat(
-          "deleted flag is not 0/1".to_string(),
-        ));
-      }
-    }
 
-    if node_count == 0 {
-      if data.entry_point.is_some() || data.max_level != -1 {
+    let node_count_usize = node_count as usize;
+
+    if node_count_usize == 0 {
+      if entry_point.is_some() || max_level != -1 {
         return Err(Error::InvalidIndexFormat(
           "empty index has non-empty entry point/maxlevel".to_string(),
         ));
       }
-      if !data.neighbor_counts.is_empty() || !data.neighbors.is_empty() {
-        return Err(Error::InvalidIndexFormat(
-          "empty index has non-empty neighbor data".to_string(),
-        ));
-      }
     } else {
-      let Some(ep) = data.entry_point else {
+      let Some(entry) = entry_point else {
         return Err(Error::InvalidIndexFormat(
           "non-empty index missing entry point".to_string(),
         ));
       };
-      if ep as usize >= node_count {
+      if entry as usize >= node_count_usize {
         return Err(Error::InvalidIndexFormat(
           "entry point out of bounds".to_string(),
         ));
       }
-      if data.max_level < 0 {
+      if max_level < 0 {
         return Err(Error::InvalidIndexFormat(
           "non-empty index has maxlevel < 0".to_string(),
         ));
       }
     }
 
-    let mut max_node_level: i32 = -1;
-    for &level in &data.levels {
-      if level > i32::MAX as u32 {
+    let h = Self::new(metric, cfg);
+    h.legacy_start_loading(node_count_usize)?;
+
+    let mut levels = Vec::<u32>::with_capacity(node_count_usize);
+    let mut deleted_count = 0usize;
+    for internal_id in 0..node_count_usize {
+      let record: NodeRecordOwned<K> = bincode::deserialize_from(&mut *r).map_err(bincode_err)?;
+      if record.deleted > 1 {
+        return Err(Error::InvalidIndexFormat(
+          "deleted flag is not 0/1".to_string(),
+        ));
+      }
+      if record.deleted != 0 {
+        deleted_count += 1;
+      }
+
+      let level_u32 = record.level;
+      if level_u32 > off64::u32!(i32::MAX) {
         return Err(Error::InvalidIndexFormat(
           "node level too large".to_string(),
         ));
       }
-      max_node_level = max(max_node_level, level as i32);
+      levels.push(level_u32);
+
+      h.legacy_set_node_key(off64::u32!(internal_id), record.key)?;
+      h.legacy_set_node_level(off64::u32!(internal_id), level_u32 as i32)?;
+      h.legacy_set_node_deleted(off64::u32!(internal_id), record.deleted != 0)?;
     }
 
-    if node_count > 0 && data.max_level != max_node_level {
+    let mut max_node_level = -1i32;
+    for &level_u32 in &levels {
+      max_node_level = max(max_node_level, level_u32 as i32);
+    }
+    if node_count_usize > 0 && max_node_level != max_level {
       return Err(Error::InvalidIndexFormat(
         "max_level does not match node levels".to_string(),
       ));
     }
-    if let Some(ep) = data.entry_point {
-      if data.levels[ep as usize] as i32 != data.max_level {
+    if let Some(ep) = entry_point {
+      if levels[ep as usize] as i32 != max_level {
         return Err(Error::InvalidIndexFormat(
           "entry point level != max_level".to_string(),
         ));
       }
     }
 
-    let m_capped = data.cfg.m.min(10_000);
-    let max_m = m_capped;
-    let max_m0 = m_capped
-      .checked_mul(2)
-      .ok_or_else(|| Error::InvalidIndexFormat("max_m0 overflow".to_string()))?;
-
-    let expected_neighbor_count_entries: usize = data
-      .levels
-      .iter()
-      .try_fold(0usize, |acc, &level| acc.checked_add(level as usize + 1))
-      .ok_or_else(|| Error::InvalidIndexFormat("neighbor counts overflow".to_string()))?;
-    if data.neighbor_counts.len() != expected_neighbor_count_entries {
-      return Err(Error::InvalidIndexFormat(
-        "neighbor list counts length mismatch".to_string(),
-      ));
-    }
-
-    let expected_neighbors_len: usize = data
-      .neighbor_counts
-      .iter()
-      .try_fold(0usize, |acc, &cnt| acc.checked_add(cnt as usize))
-      .ok_or_else(|| Error::InvalidIndexFormat("neighbors overflow".to_string()))?;
-    if data.neighbors.len() != expected_neighbors_len {
-      return Err(Error::InvalidIndexFormat(
-        "neighbor ids length mismatch".to_string(),
-      ));
-    }
-
-    let mut list_idx = 0usize;
-    let mut neighbor_idx = 0usize;
-    let mut seen = HashSet::<u32>::new();
-
-    for (internal_id, &level_u32) in data.levels.iter().enumerate() {
-      for level in 0..=level_u32 as usize {
-        let cnt = data
-          .neighbor_counts
-          .get(list_idx)
-          .copied()
-          .ok_or_else(|| Error::InvalidIndexFormat("neighbor counts out of bounds".to_string()))?
-          as usize;
-        list_idx += 1;
-
-        let cap = if level == 0 { max_m0 } else { max_m };
-        if cnt > cap {
-          return Err(Error::InvalidIndexFormat(
-            "neighbor list too large".to_string(),
-          ));
+    for internal_id in 0..node_count_usize {
+      let level = levels[internal_id] as usize;
+      for l in 0..=level {
+        let cnt: u16 = bincode::deserialize_from(&mut *r).map_err(bincode_err)?;
+        let mut neighbors = Vec::with_capacity(cnt as usize);
+        for _ in 0..cnt {
+          let neighbor: u32 = bincode::deserialize_from(&mut *r).map_err(bincode_err)?;
+          neighbors.push(neighbor);
         }
-
-        let slice = data
-          .neighbors
-          .get(neighbor_idx..neighbor_idx + cnt)
-          .ok_or_else(|| Error::InvalidIndexFormat("neighbor ids out of bounds".to_string()))?;
-        neighbor_idx += cnt;
-
-        seen.clear();
-        for &neighbor in slice {
-          if neighbor == internal_id as u32 {
-            return Err(Error::InvalidIndexFormat(
-              "self edge in neighbor list".to_string(),
-            ));
-          }
-          if neighbor as usize >= node_count {
-            return Err(Error::InvalidIndexFormat(
-              "neighbor id out of bounds".to_string(),
-            ));
-          }
-          if data.levels[neighbor as usize] < level as u32 {
-            return Err(Error::InvalidIndexFormat(
-              "neighbor does not exist at level".to_string(),
-            ));
-          }
-          if !seen.insert(neighbor) {
-            return Err(Error::InvalidIndexFormat(
-              "duplicate neighbor in list".to_string(),
-            ));
-          }
-        }
+        h.legacy_set_neighbors(off64::u32!(internal_id), l, &neighbors)?;
       }
     }
-    debug_assert_eq!(list_idx, data.neighbor_counts.len());
-    debug_assert_eq!(neighbor_idx, data.neighbors.len());
 
-    let h = Self::new(metric, data.cfg);
-    h.legacy_start_loading(node_count)?;
-
-    let mut deleted_count = 0usize;
-    for internal_id in 0..node_count {
-      let deleted = data.deleted[internal_id] != 0;
-      if deleted {
-        deleted_count += 1;
-      }
-      h.legacy_set_node_key(internal_id as u32, data.keys[internal_id].clone())?;
-      h.legacy_set_node_level(internal_id as u32, data.levels[internal_id] as i32)?;
-      h.legacy_set_node_deleted(internal_id as u32, deleted)?;
-    }
-
-    let mut list_idx = 0usize;
-    let mut neighbor_idx = 0usize;
-    for internal_id in 0..node_count {
-      for level in 0..=data.levels[internal_id] as usize {
-        let cnt = data.neighbor_counts[list_idx] as usize;
-        list_idx += 1;
-        let slice = &data.neighbors[neighbor_idx..neighbor_idx + cnt];
-        neighbor_idx += cnt;
-        h.legacy_set_neighbors(internal_id as u32, level, slice)?;
-      }
-    }
-    debug_assert_eq!(list_idx, data.neighbor_counts.len());
-    debug_assert_eq!(neighbor_idx, data.neighbors.len());
-
-    h.legacy_finish_loading(data.max_level, data.entry_point, deleted_count)?;
+    h.legacy_finish_loading(max_level, entry_point, deleted_count)?;
     Ok(h)
   }
 
@@ -1818,6 +1667,7 @@ mod tests {
   use proptest::prelude::*;
   use std::sync::Arc;
   use std::thread;
+  use tempfile::tempdir;
 
   fn assert_integrity<K: Eq + Hash + Clone + Send + Sync + 'static, M: Metric>(h: &Hnsw<K, M>) {
     let len = h.len();
@@ -1871,7 +1721,7 @@ mod tests {
   }
 
   #[test]
-  fn serde_bincode_roundtrip_preserves_graph() {
+  fn file_roundtrip_preserves_graph() {
     let dim = 8;
     let cfg = HnswConfig::new(dim, 1024)
       .m(16)
@@ -1898,15 +1748,21 @@ mod tests {
 
     h.set_ef_search(123);
 
-    assert_integrity(&h);
+	    assert_integrity(&h);
 
-    let data = h.to_data().unwrap();
-    let bytes = bincode::serialize(&data).unwrap();
-    let decoded: HnswData<u64> = bincode::deserialize(&bytes).unwrap();
-    let h2 = Hnsw::from_data(L2::new(), decoded).unwrap();
+	    let dir = tempdir().unwrap();
+	    let path = dir.path().join("hnsw.bin");
+	    {
+	      let mut f = std::fs::File::create(&path).unwrap();
+	      h.save_to(&mut f).unwrap();
+	    }
+	    let h2 = {
+	      let mut f = std::fs::File::open(&path).unwrap();
+	      Hnsw::load_from(L2::new(), &mut f).unwrap()
+	    };
 
     assert_integrity(&h2);
-    assert_eq!(data, h2.to_data().unwrap());
+    assert_eq!(h2.ef_search(), 123);
 
     let q = random_vec(&mut rng, dim);
     let hits1 = h.search(&store, &q, 10, None).unwrap();
@@ -1915,17 +1771,30 @@ mod tests {
   }
 
   #[test]
-  fn from_data_rejects_unknown_version() {
-    let cfg = HnswConfig::new(4, 16).m(8);
-    let h: Hnsw<u64, _> = Hnsw::new(L2::new(), cfg);
-    let mut data = h.to_data().unwrap();
-    data.version += 1;
-    let err = match Hnsw::from_data(L2::new(), data) {
-      Ok(_) => panic!("expected version mismatch error"),
-      Err(err) => err,
-    };
-    assert!(matches!(err, Error::InvalidIndexFormat(_)));
-  }
+  fn load_rejects_unknown_version() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("hnsw.bin");
+    {
+      let mut f = std::fs::File::create(&path).unwrap();
+      let header = HnswHeader {
+        version: HNSW_FILE_VERSION + 1,
+        cfg: HnswConfig::new(4, 16).m(8),
+        entry_point: None,
+        max_level: -1,
+        node_count: 0,
+      };
+      bincode::serialize_into(&mut f, &header).unwrap();
+    }
+
+	    let err = {
+	      let mut f = std::fs::File::open(&path).unwrap();
+	      match Hnsw::<u64, _>::load_from(L2::new(), &mut f) {
+	        Ok(_) => panic!("expected version mismatch error"),
+	        Err(err) => err,
+	      }
+	    };
+	    assert!(matches!(err, Error::InvalidIndexFormat(_)));
+	  }
 
   #[test]
   fn insert_delete_resurrect() {

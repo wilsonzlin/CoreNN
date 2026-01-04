@@ -10,7 +10,6 @@ pub use error::Error;
 pub use error::Result;
 pub use hnsw::Hnsw;
 pub use hnsw::HnswConfig;
-pub use hnsw::HnswData;
 pub use hnsw::SearchHit;
 pub use hnsw::SetOutcome;
 pub use id::NodeId;
