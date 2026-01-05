@@ -6,6 +6,7 @@ use hnswlib_rs::InnerProduct;
 use hnswlib_rs::Metric;
 use hnswlib_rs::VectorStore;
 use hnswlib_rs::L2;
+use hnswlib_rs::vector::Dense;
 use libcorenn::cfg::Cfg;
 use libcorenn::metric::StdMetric;
 use libcorenn::store::schema::DbNodeData;
@@ -27,9 +28,9 @@ enum LegacyMetric {
 }
 
 impl Metric for LegacyMetric {
-  type Scalar = f32;
+  type Family = Dense<f32>;
 
-  fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
+  fn distance<'a, 'b>(&self, a: &'a [f32], b: &'b [f32]) -> f32 {
     match self {
       LegacyMetric::L2(m) => m.distance(a, b),
       LegacyMetric::InnerProduct(m) => m.distance(a, b),

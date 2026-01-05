@@ -6,7 +6,9 @@ This crate intentionally decouples the **graph** from **vector storage**:
 - `Hnsw<K, M>` owns the graph + a mapping from your external key `K` to an internal dense `NodeId`.
 - You provide a `VectorStore` keyed by `NodeId` to supply vectors on demand.
 
-Scalars: the graph/metric are generic over scalar type (`f32`, `f16`, `bf16`); distance computations accumulate in `f32`.
+Vector types:
+- Dense floating point: `f32`, `f16`, `bf16` (distance computation accumulates in `f32`).
+- Per-vector quantized int8: `Qi8Ref { data: &[i8], scale: f32, zero_point: i8 }`.
 
 ## Quickstart
 
@@ -76,7 +78,7 @@ Use `Hnsw::save_to()` / `Hnsw::load_from()` to save/load the **graph + key mappi
 Notes:
 - Vectors are **not** included; persist your `VectorStore` separately (keyed by `NodeId`).
 - The metric/space is not stored; you must provide the `Metric` when loading.
-- The graph file includes `dim` and `dtype`; `load_from` validates `dtype` against the `Metric`’s scalar type.
+- The graph file includes `dim` and `dtype`; `load_from` validates `dtype` against the `Metric`’s vector type.
 
 ```rust
 use hnswlib_rs::{Hnsw, HnswConfig, InMemoryVectorStore, L2, Result};
@@ -101,7 +103,9 @@ fn save_and_load() -> Result<()> {
 
 ## Persisting vectors (`InMemoryVectorStore`)
 
-`InMemoryVectorStore` provides `save_to` / `load_from` for a raw dense on-disk matrix: row-major `S` (little-endian), keyed by `NodeId` order, with **no header** (exactly `node_count * dim` scalars).
+`InMemoryVectorStore` provides `save_to` / `load_from` for a dense matrix keyed by `NodeId` order.
+
+The on-disk format includes a small `bincode` header (`dtype`, `dim`, `max_nodes`, `node_count`), followed by raw row-major scalar bytes (little-endian).
 
 ```rust
 use hnswlib_rs::{Hnsw, HnswConfig, InMemoryVectorStore, L2, Result};
@@ -119,8 +123,32 @@ fn save_and_load() -> Result<()> {
   store.save_to(&mut f, node_count)?;
 
   let mut f = std::fs::File::open("vectors.bin")?;
-  let (loaded, loaded_count) = InMemoryVectorStore::<f32>::load_from(&mut f, dim, max_nodes)?;
+  let (loaded, loaded_count) = InMemoryVectorStore::<f32>::load_from(&mut f)?;
   assert_eq!(loaded_count, node_count);
+  Ok(())
+}
+```
+
+## Per-vector QI8 (quantized int8) vectors
+
+Use `InMemoryQi8VectorStore` with `L2Qi8`, `CosineQi8`, or `InnerProductQi8`.
+
+```rust
+use hnswlib_rs::{Hnsw, HnswConfig, InMemoryQi8VectorStore, L2Qi8, Qi8Ref, Result};
+
+fn qi8_example() -> Result<()> {
+  let dim = 128;
+  let max_nodes = 100_000;
+
+  let hnsw = Hnsw::new(L2Qi8::new(), HnswConfig::new(dim, max_nodes));
+  let store = InMemoryQi8VectorStore::new(dim, max_nodes);
+
+  let v = vec![0i8; dim];
+  let q = Qi8Ref { data: &v, scale: 0.02, zero_point: 0 };
+  hnsw.insert(&store, 1u64, q)?;
+
+  let hits = hnsw.search(&store, q, 10, None)?;
+  assert_eq!(hits[0].key, 1u64);
   Ok(())
 }
 ```

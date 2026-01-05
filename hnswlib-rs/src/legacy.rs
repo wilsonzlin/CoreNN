@@ -8,6 +8,7 @@ use crate::hnsw::Hnsw;
 use crate::hnsw::HnswConfig;
 use crate::id::NodeId;
 use crate::metric::Metric;
+use crate::vector::Dense;
 use crate::vectors::VectorStore;
 use std::mem::size_of;
 
@@ -251,7 +252,7 @@ impl<'a> LegacyVectors<'a> {
 }
 
 impl VectorStore for LegacyVectors<'_> {
-  type Scalar = f32;
+  type Family = Dense<f32>;
   type Vector<'a>
     = &'a [f32]
   where
@@ -275,7 +276,7 @@ impl VectorStore for LegacyVectors<'_> {
 /// IDs (dense `0..cur_element_count`) for maximal fidelity.
 ///
 /// The returned `LegacyVectors` is keyed by `NodeId` (the internal IDs).
-pub fn load_hnswlib<'a, M: Metric<Scalar = f32>>(
+pub fn load_hnswlib<'a, M: Metric<Family = Dense<f32>>>(
   metric: M,
   dim: usize,
   bytes: &'a [u8],

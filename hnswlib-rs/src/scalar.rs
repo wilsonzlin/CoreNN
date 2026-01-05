@@ -9,6 +9,7 @@ pub enum Dtype {
   F32 = 0,
   F16 = 1,
   BF16 = 2,
+  QI8 = 3,
 }
 
 pub trait Scalar: Kernel + Pod {

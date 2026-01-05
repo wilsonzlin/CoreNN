@@ -3,7 +3,9 @@ use crate::error::Result;
 use crate::id::NodeId;
 use crate::metric::Metric;
 use crate::scalar::Dtype;
-use crate::scalar::Scalar;
+use crate::vector::VectorFamily;
+use crate::vector::VectorRef;
+use crate::vector::VectorView;
 use crate::vectors::VectorStore;
 use crate::vectors::VectorStoreMut;
 use crate::visited::VisitedListPool;
@@ -499,12 +501,12 @@ where
 
   fn distance_between_nodes<V>(&self, vectors: &V, a: NodeId, b: NodeId) -> Result<f32>
   where
-    V: VectorStore<Scalar = M::Scalar>,
+    V: VectorStore<Family = M::Family>,
   {
     let va = vectors.vector(a).ok_or(Error::MissingVector)?;
     let vb = vectors.vector(b).ok_or(Error::MissingVector)?;
-    let va = va.as_ref();
-    let vb = vb.as_ref();
+    let va = va.view();
+    let vb = vb.view();
     if va.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
         expected: self.cfg.dim,
@@ -520,9 +522,14 @@ where
     Ok(self.metric.distance(va, vb))
   }
 
-  fn distance_query_to_node<V>(&self, vectors: &V, query: &[M::Scalar], node: NodeId) -> Result<f32>
+  fn distance_query_to_node<V>(
+    &self,
+    vectors: &V,
+    query: <M::Family as VectorFamily>::Ref<'_>,
+    node: NodeId,
+  ) -> Result<f32>
   where
-    V: VectorStore<Scalar = M::Scalar>,
+    V: VectorStore<Family = M::Family>,
   {
     if query.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
@@ -531,7 +538,7 @@ where
       });
     }
     let v = vectors.vector(node).ok_or(Error::MissingVector)?;
-    let v = v.as_ref();
+    let v = v.view();
     if v.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
         expected: self.cfg.dim,
@@ -541,7 +548,7 @@ where
     Ok(self.metric.distance(query, v))
   }
 
-  fn get_neighbors_by_heuristic2<V: VectorStore<Scalar = M::Scalar>>(
+  fn get_neighbors_by_heuristic2<V: VectorStore<Family = M::Family>>(
     &self,
     vectors: &V,
     top_candidates: &mut BinaryHeap<(OrderedFloat<f32>, NodeId)>,
@@ -583,11 +590,11 @@ where
     Ok(())
   }
 
-  fn search_base_layer<V: VectorStore<Scalar = M::Scalar>>(
+  fn search_base_layer<V: VectorStore<Family = M::Family>>(
     &self,
     vectors: &V,
     ep: NodeId,
-    query: &[M::Scalar],
+    query: <M::Family as VectorFamily>::Ref<'_>,
     layer: usize,
     ef: usize,
     filter: Option<&dyn Fn(&K) -> bool>,
@@ -652,7 +659,7 @@ where
     Ok(top_candidates)
   }
 
-  fn mutually_connect_new_element<V: VectorStore<Scalar = M::Scalar>>(
+  fn mutually_connect_new_element<V: VectorStore<Family = M::Family>>(
     &self,
     vectors: &V,
     node: NodeId,
@@ -716,7 +723,7 @@ where
     Ok(next_entry)
   }
 
-  fn connect_backlinks<V: VectorStore<Scalar = M::Scalar>>(
+  fn connect_backlinks<V: VectorStore<Family = M::Family>>(
     &self,
     vectors: &V,
     node: NodeId,
@@ -789,7 +796,7 @@ where
     Ok(())
   }
 
-  fn update_point<V: VectorStore<Scalar = M::Scalar>>(
+  fn update_point<V: VectorStore<Family = M::Family>>(
     &self,
     vectors: &V,
     node: NodeId,
@@ -892,7 +899,7 @@ where
     Ok(())
   }
 
-  fn repair_connections_for_update<V: VectorStore<Scalar = M::Scalar>>(
+  fn repair_connections_for_update<V: VectorStore<Family = M::Family>>(
     &self,
     vectors: &V,
     entry: NodeId,
@@ -903,7 +910,7 @@ where
     let mut curr = entry;
     if node_level < max_level {
       let node_vec = vectors.vector(node).ok_or(Error::MissingVector)?;
-      let node_vec = node_vec.as_ref();
+      let node_vec = node_vec.view();
       let mut curdist = self.distance_query_to_node(vectors, node_vec, curr)?;
       for level in (node_level + 1..=max_level).rev() {
         let mut changed = true;
@@ -928,7 +935,7 @@ where
     }
 
     let node_vec = vectors.vector(node).ok_or(Error::MissingVector)?;
-    let node_vec = node_vec.as_ref();
+    let node_vec = node_vec.view();
 
     for level in (0..=node_level).rev() {
       let mut top_candidates =
@@ -962,7 +969,7 @@ where
     Ok(self.neighbors_at_level(node, level)?.into_iter().collect())
   }
 
-  fn add_point_at_level<V: VectorStore<Scalar = M::Scalar>>(
+  fn add_point_at_level<V: VectorStore<Family = M::Family>>(
     &self,
     vectors: &V,
     node: NodeId,
@@ -1006,7 +1013,7 @@ where
     };
 
     let node_vec = vectors.vector(node).ok_or(Error::MissingVector)?;
-    let node_vec = node_vec.as_ref();
+    let node_vec = node_vec.view();
 
     if max_level_copy >= 0 && cur_level < max_level_copy {
       let mut curdist = self.distance_query_to_node(vectors, node_vec, entry)?;
@@ -1278,7 +1285,7 @@ where
 
     let header = HnswHeader {
       version: HNSW_FILE_VERSION,
-      dtype: M::Scalar::DTYPE,
+      dtype: <M::Family as VectorFamily>::DTYPE,
       cfg,
       entry_point,
       max_level,
@@ -1335,11 +1342,11 @@ where
         header.version
       )));
     }
-    if header.dtype != M::Scalar::DTYPE {
+    if header.dtype != <M::Family as VectorFamily>::DTYPE {
       return Err(Error::InvalidIndexFormat(format!(
         "dtype mismatch: file has {:?}, but this Hnsw is {:?}",
         header.dtype,
-        M::Scalar::DTYPE
+        <M::Family as VectorFamily>::DTYPE
       )));
     }
 
@@ -1454,12 +1461,15 @@ where
     Ok(h)
   }
 
-  pub fn insert<V: VectorStoreMut<Scalar = M::Scalar>>(
+  pub fn insert<V>(
     &self,
     vectors: &V,
     key: K,
-    vector: &[M::Scalar],
-  ) -> Result<()> {
+    vector: <M::Family as VectorFamily>::Ref<'_>,
+  ) -> Result<()>
+  where
+    V: VectorStoreMut<Family = M::Family>,
+  {
     if vector.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
         expected: self.cfg.dim,
@@ -1490,12 +1500,15 @@ where
     Ok(())
   }
 
-  pub fn set<V: VectorStoreMut<Scalar = M::Scalar>>(
+  pub fn set<V>(
     &self,
     vectors: &V,
     key: K,
-    vector: &[M::Scalar],
-  ) -> Result<SetOutcome> {
+    vector: <M::Family as VectorFamily>::Ref<'_>,
+  ) -> Result<SetOutcome>
+  where
+    V: VectorStoreMut<Family = M::Family>,
+  {
     if vector.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
         expected: self.cfg.dim,
@@ -1545,13 +1558,16 @@ where
     Ok(true)
   }
 
-  pub fn search<V: VectorStore<Scalar = M::Scalar>>(
+  pub fn search<V>(
     &self,
     vectors: &V,
-    query: &[M::Scalar],
+    query: <M::Family as VectorFamily>::Ref<'_>,
     k: usize,
     filter: Option<&dyn Fn(&K) -> bool>,
-  ) -> Result<Vec<SearchHit<K>>> {
+  ) -> Result<Vec<SearchHit<K>>>
+  where
+    V: VectorStore<Family = M::Family>,
+  {
     if query.len() != self.cfg.dim {
       return Err(Error::DimensionMismatch {
         expected: self.cfg.dim,
@@ -1901,7 +1917,7 @@ mod tests {
 
     let id = h.node_id(&7).unwrap();
     let stored = store.vector(id).unwrap();
-    assert_eq!(stored.as_ref(), v2.as_slice());
+    assert_eq!(stored.view(), v2.as_slice());
     assert_integrity(&h);
   }
 

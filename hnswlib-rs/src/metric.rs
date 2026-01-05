@@ -1,12 +1,23 @@
 use crate::scalar::Scalar;
+use crate::vector::Dense;
+use crate::vector::Qi8;
+use crate::vector::Qi8Ref;
+use crate::vector::VectorFamily;
 use corenn_kernels::cosine_distance;
+use corenn_kernels::cosine_distance_qi8;
 use corenn_kernels::inner_product_distance;
+use corenn_kernels::inner_product_distance_qi8;
+use corenn_kernels::l2_sq_qi8;
 use corenn_kernels::Kernel;
 use std::marker::PhantomData;
 
 pub trait Metric: Clone + Send + Sync + 'static {
-  type Scalar: Scalar;
-  fn distance(&self, a: &[Self::Scalar], b: &[Self::Scalar]) -> f32;
+  type Family: VectorFamily;
+  fn distance<'a, 'b>(
+    &self,
+    a: <Self::Family as VectorFamily>::Ref<'a>,
+    b: <Self::Family as VectorFamily>::Ref<'b>,
+  ) -> f32;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -19,9 +30,9 @@ impl<S: Scalar> L2<S> {
 }
 
 impl<S: Scalar> Metric for L2<S> {
-  type Scalar = S;
+  type Family = Dense<S>;
 
-  fn distance(&self, a: &[S], b: &[S]) -> f32 {
+  fn distance<'a, 'b>(&self, a: &'a [S], b: &'b [S]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     <S as Kernel>::l2_sq(a, b)
   }
@@ -37,9 +48,9 @@ impl<S: Scalar> InnerProduct<S> {
 }
 
 impl<S: Scalar> Metric for InnerProduct<S> {
-  type Scalar = S;
+  type Family = Dense<S>;
 
-  fn distance(&self, a: &[S], b: &[S]) -> f32 {
+  fn distance<'a, 'b>(&self, a: &'a [S], b: &'b [S]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     inner_product_distance::<S>(a, b)
   }
@@ -55,11 +66,62 @@ impl<S: Scalar> Cosine<S> {
 }
 
 impl<S: Scalar> Metric for Cosine<S> {
-  type Scalar = S;
+  type Family = Dense<S>;
 
-  fn distance(&self, a: &[S], b: &[S]) -> f32 {
+  fn distance<'a, 'b>(&self, a: &'a [S], b: &'b [S]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     cosine_distance::<S>(a, b)
+  }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct L2Qi8;
+
+impl L2Qi8 {
+  pub fn new() -> Self {
+    Self
+  }
+}
+
+impl Metric for L2Qi8 {
+  type Family = Qi8;
+
+  fn distance<'a, 'b>(&self, a: Qi8Ref<'a>, b: Qi8Ref<'b>) -> f32 {
+    l2_sq_qi8(a.data, a.scale, a.zero_point, b.data, b.scale, b.zero_point)
+  }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InnerProductQi8;
+
+impl InnerProductQi8 {
+  pub fn new() -> Self {
+    Self
+  }
+}
+
+impl Metric for InnerProductQi8 {
+  type Family = Qi8;
+
+  fn distance<'a, 'b>(&self, a: Qi8Ref<'a>, b: Qi8Ref<'b>) -> f32 {
+    inner_product_distance_qi8(a.data, a.scale, a.zero_point, b.data, b.scale, b.zero_point)
+  }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CosineQi8;
+
+impl CosineQi8 {
+  pub fn new() -> Self {
+    Self
+  }
+}
+
+impl Metric for CosineQi8 {
+  type Family = Qi8;
+
+  fn distance<'a, 'b>(&self, a: Qi8Ref<'a>, b: Qi8Ref<'b>) -> f32 {
+    cosine_distance_qi8(a.data, a.scale, a.zero_point, b.data, b.scale, b.zero_point)
   }
 }
 
